@@ -1,0 +1,57 @@
+# Grafana datasource provisioning for the enact LGTM stack.
+#
+# Wires the three backends together so a single click moves between signals:
+#   Loki log line (trace_id) -> Tempo trace -> Mimir RED metrics + service map.
+
+apiVersion: 1
+
+datasources:
+  - name: Mimir
+    type: prometheus
+    uid: mimir
+    access: proxy
+    url: http://mimir:9009/prometheus
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      # Exemplars link metric samples to their originating trace in Tempo.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # The OTLP log bridge stores trace_id as structured metadata; turn it
+      # into a clickable link to the matching Tempo trace.
+      derivedFields:
+        - name: trace_id
+          matcherType: label
+          matcherRegex: trace_id
+          datasourceUid: tempo
+          url: "${__value.raw}"
+          urlDisplayLabel: View trace
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      # From a span, jump to the correlated logs in Loki filtered by trace ID.
+      tracesToLogsV2:
+        datasourceUid: loki
+        filterByTraceID: true
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"
+      # From a span, jump to RED metrics in Mimir.
+      tracesToMetrics:
+        datasourceUid: mimir
+      # Service graph built from Tempo's metrics-generator output in Mimir.
+      serviceMap:
+        datasourceUid: mimir
+      nodeGraph:
+        enabled: true

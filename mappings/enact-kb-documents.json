@@ -1,0 +1,23 @@
+{
+  "index_patterns": ["enact-kb-documents"],
+  "priority": 100,
+  "_meta": {
+    "description": "Extracted full-text documents of knowledge bases, loaded into agent context at inference time."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "user_id":     { "type": "keyword" },
+        "kb_id":       { "type": "keyword" },
+        "document_id": { "type": "keyword" },
+        "filename":    { "type": "keyword" },
+        "text":        { "type": "text" },
+        "uploaded_at": { "type": "date" }
+      }
+    }
+  }
+}

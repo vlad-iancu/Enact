@@ -1,25 +1,72 @@
-package enactmodelinference
+// Package bedrock wraps Amazon Bedrock's Converse / ConverseStream APIs
+// with a small Go-friendly client. It owns the AWS SDK setup, including
+// bridging Bedrock API keys into the SDK's AWS_BEARER_TOKEN_BEDROCK env var.
+package bedrock
 
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
-type bedrockClient struct {
+// Client is a thin wrapper around bedrockruntime.Client exposing Converse /
+// ConverseStream over a small, JSON-friendly request shape.
+type Client struct {
 	api *bedrockruntime.Client
 }
 
-func newBedrockClient(ctx context.Context, region string) (*bedrockClient, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
-	if err != nil {
-		return nil, fmt.Errorf("load aws config: %w", err)
+// NewClient initialises an AWS SDK client for Bedrock Runtime using cfg. If
+// cfg.APIKey is set and AWS_BEARER_TOKEN_BEDROCK is not already in the
+// environment, the API key is exported there so the SDK picks it up as the
+// Bedrock bearer token.
+func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
+	if cfg.APIKey != "" && os.Getenv("AWS_BEARER_TOKEN_BEDROCK") == "" {
+		_ = os.Setenv("AWS_BEARER_TOKEN_BEDROCK", cfg.APIKey)
 	}
-	return &bedrockClient{api: bedrockruntime.NewFromConfig(cfg)}, nil
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
+	if err != nil {
+		return nil, fmt.Errorf("bedrock: load aws config: %w", err)
+	}
+	return &Client{api: bedrockruntime.NewFromConfig(awsCfg)}, nil
+}
+
+// Message is a single conversational turn passed to Converse.
+type Message struct {
+	Role    string // "user" or "assistant"
+	Content string
+}
+
+// ConverseRequest is the high-level input to Converse / ConverseStream.
+type ConverseRequest struct {
+	Model        string
+	Messages     []Message
+	SystemPrompt string
+	MaxTokens    int32
+	Temperature  *float32
+	TopP         *float32
+}
+
+// ConverseResponse is the high-level output from Converse.
+type ConverseResponse struct {
+	Content      string
+	StopReason   string
+	InputTokens  int32
+	OutputTokens int32
+}
+
+// StreamChunk is a single event emitted on a streaming Converse call. JSON
+// tags are provided so callers can forward chunks straight to an SSE stream.
+type StreamChunk struct {
+	Delta        string `json:"delta,omitempty"`
+	StopReason   string `json:"stop_reason,omitempty"`
+	InputTokens  int32  `json:"input_tokens,omitempty"`
+	OutputTokens int32  `json:"output_tokens,omitempty"`
+	Done         bool   `json:"done,omitempty"`
 }
 
 type converseParams struct {
@@ -29,7 +76,7 @@ type converseParams struct {
 	inferenceConfig *types.InferenceConfiguration
 }
 
-func buildConverseParams(req *InferenceRequest) converseParams {
+func buildConverseParams(req *ConverseRequest) converseParams {
 	msgs := make([]types.Message, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		role := types.ConversationRoleUser
@@ -70,9 +117,10 @@ func buildConverseParams(req *InferenceRequest) converseParams {
 	return p
 }
 
-func (b *bedrockClient) Converse(ctx context.Context, req *InferenceRequest) (*InferenceResponse, error) {
+// Converse runs a non-streaming Bedrock conversation turn.
+func (c *Client) Converse(ctx context.Context, req *ConverseRequest) (*ConverseResponse, error) {
 	p := buildConverseParams(req)
-	out, err := b.api.Converse(ctx, &bedrockruntime.ConverseInput{
+	out, err := c.api.Converse(ctx, &bedrockruntime.ConverseInput{
 		ModelId:         p.modelID,
 		Messages:        p.messages,
 		System:          p.system,
@@ -82,10 +130,7 @@ func (b *bedrockClient) Converse(ctx context.Context, req *InferenceRequest) (*I
 		return nil, err
 	}
 
-	resp := &InferenceResponse{
-		Model:      req.Model,
-		StopReason: string(out.StopReason),
-	}
+	resp := &ConverseResponse{StopReason: string(out.StopReason)}
 	if outputMsg, ok := out.Output.(*types.ConverseOutputMemberMessage); ok {
 		for _, block := range outputMsg.Value.Content {
 			if textBlock, ok := block.(*types.ContentBlockMemberText); ok {
@@ -104,9 +149,12 @@ func (b *bedrockClient) Converse(ctx context.Context, req *InferenceRequest) (*I
 	return resp, nil
 }
 
-func (b *bedrockClient) ConverseStream(ctx context.Context, req *InferenceRequest, onChunk func(StreamChunk) error) error {
+// ConverseStream runs a streaming Bedrock conversation turn, invoking onChunk
+// for each event. A final chunk with Done=true is emitted after the upstream
+// stream closes cleanly.
+func (c *Client) ConverseStream(ctx context.Context, req *ConverseRequest, onChunk func(StreamChunk) error) error {
 	p := buildConverseParams(req)
-	out, err := b.api.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
+	out, err := c.api.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
 		ModelId:         p.modelID,
 		Messages:        p.messages,
 		System:          p.system,

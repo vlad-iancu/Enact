@@ -1,0 +1,20 @@
+{
+  "index_patterns": ["enact-knowledge-bases"],
+  "priority": 100,
+  "_meta": {
+    "description": "Knowledge-base metadata records (id only; no friendly name)."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id":         { "type": "keyword" },
+        "user_id":    { "type": "keyword" },
+        "created_at": { "type": "date" }
+      }
+    }
+  }
+}

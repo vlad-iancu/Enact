@@ -1,0 +1,32 @@
+{
+  "index_patterns": ["enact-agent-rag-chunks"],
+  "priority": 100,
+  "_meta": {
+    "description": "Embedded document chunks of agent RAG configurations, retrieved via k-NN at inference time."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index": { "knn": true }
+    },
+    "mappings": {
+      "properties": {
+        "user_id":     { "type": "keyword" },
+        "agent_id":    { "type": "keyword" },
+        "document_id": { "type": "keyword" },
+        "chunk_index": { "type": "integer" },
+        "text":        { "type": "text" },
+        "embedding": {
+          "type": "knn_vector",
+          "dimension": ${BEDROCK_EMBEDDING_DIM},
+          "method": {
+            "name": "hnsw",
+            "space_type": "cosinesimil",
+            "engine": "lucene"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,34 +1,74 @@
 // Package enactmodelinference exposes the Bedrock-backed model inference
-// service. Build is a service.Builder suitable to hand straight to
-// service.Run from a cmd's main().
+// service.
+//
+// Typical wiring from a cmd's main():
+//
+//	var cfg enactmodelinference.Config
+//	service.Run(ctx, &cfg, enactmodelinference.Build(&cfg))
 package enactmodelinference
 
 import (
 	"context"
-	"os"
 
 	restful "github.com/emicklei/go-restful/v3"
 
-	"enact/internal"
+	"enact/internal/agents"
+	"enact/internal/bedrock"
+	"enact/internal/kb"
+	"enact/internal/logging"
+	"enact/internal/opensearch"
 	"enact/internal/service"
 )
 
-// Build constructs the inference web service. It loads BedrockConfig from the
-// environment, bridges BEDROCK_API_KEY into AWS_BEARER_TOKEN_BEDROCK for the
-// AWS SDK, initialises the Bedrock client, and returns the WebService.
-func Build(ctx context.Context) ([]*restful.WebService, error) {
-	var cfg internal.BedrockConfig
-	if err := service.Load(&cfg); err != nil {
-		return nil, err
-	}
-	// The AWS SDK reads bedrock bearer-token credentials from this variable.
-	if os.Getenv("AWS_BEARER_TOKEN_BEDROCK") == "" {
-		_ = os.Setenv("AWS_BEARER_TOKEN_BEDROCK", cfg.BedrockAPIKey)
-	}
+// Config combines the generic service runtime settings with the Bedrock
+// connection settings and the OpenSearch/embedding settings required for the
+// agent (RAG) flow. service.Run loads the whole thing in one pass; the
+// resulting struct is shared with the Builder via closure capture.
+//
+// OpenSearch and embedding settings are only exercised when a request carries
+// an agent_id; plain (model-only) inference works without a reachable
+// OpenSearch cluster.
+type Config struct {
+	service.Config
+	bedrock.ClientConfig
+	OpenSearch     opensearch.Config
+	Agents         agents.Config
+	AgentAPI       agents.ClientConfig
+	KBAPI          kb.ClientConfig
+	EmbeddingModel string `env:"BEDROCK_EMBEDDING_MODEL, default=amazon.titan-embed-text-v2:0"`
+}
 
-	client, err := newBedrockClient(ctx, cfg.Region)
-	if err != nil {
-		return nil, err
+// Build returns a service.Builder that constructs the inference web service
+// from the already-populated Config. Callers should declare the Config first,
+// pass it to service.Run (which populates it from env), and pass the same
+// pointer here.
+func Build(cfg *Config) service.Builder {
+	return func(ctx context.Context) ([]*restful.WebService, error) {
+		logger := logging.New().WithFields("service", cfg.Name)
+		client, err := bedrock.NewClient(ctx, cfg.ClientConfig)
+		if err != nil {
+			logger.Error("failed to create bedrock client", "err", err)
+			return nil, err
+		}
+		// Constructing the OpenSearch client does not open a connection, so
+		// this is safe even when agents/RAG are not in use.
+		osClient, err := opensearch.NewClient(cfg.OpenSearch)
+		if err != nil {
+			logger.Error("failed to create opensearch client", "err", err)
+			return nil, err
+		}
+		rags := agents.NewRAGRepository(osClient, cfg.Agents)
+		// Agent records and KB context documents come from their owning
+		// services over HTTP; this service reads no agent or KB indices
+		// directly. Only the RAG chunk index (vector retrieval) is local.
+		agentClient := agents.NewClient(cfg.AgentAPI)
+		kbClient := kb.NewClient(cfg.KBAPI)
+		logger.Info("inference api initialized",
+			"embedding_model", cfg.EmbeddingModel,
+			"agent_api", cfg.AgentAPI.BaseURL,
+			"kb_api", cfg.KBAPI.BaseURL,
+		)
+		api := newInferenceAPI(client, agentClient, rags, kbClient, cfg.EmbeddingModel, logger)
+		return []*restful.WebService{api.WebService()}, nil
 	}
-	return []*restful.WebService{newInferenceAPI(client).WebService()}, nil
 }

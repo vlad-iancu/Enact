@@ -1,0 +1,47 @@
+# Loki single-binary config for local dev.
+#
+# auth_enabled: false -> a single implicit tenant, so services can push over
+# OTLP (/otlp/v1/logs) with no X-Scope-OrgID header. TSDB + filesystem storage
+# keeps everything on a local volume. Structured metadata is enabled so the
+# trace_id/span_id emitted by the OTLP log bridge are queryable and can link
+# to Tempo.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  allow_structured_metadata: true
+  retention_period: 24h   # local dev only
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100

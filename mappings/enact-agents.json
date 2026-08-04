@@ -1,0 +1,24 @@
+{
+  "index_patterns": ["enact-agents"],
+  "priority": 100,
+  "_meta": {
+    "description": "Agent records: model (friendly name), system prompt, knowledge base ids."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id":                 { "type": "keyword" },
+        "user_id":            { "type": "keyword" },
+        "model":              { "type": "keyword" },
+        "system_prompt":      { "type": "text", "index": false },
+        "knowledge_base_ids": { "type": "keyword" },
+        "created_at":         { "type": "date" },
+        "updated_at":         { "type": "date" }
+      }
+    }
+  }
+}
