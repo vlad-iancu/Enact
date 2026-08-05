@@ -38,10 +38,15 @@ type Client struct {
 	baseURL string
 }
 
-// NewClient returns a Client for the agent service at cfg.BaseURL.
-func NewClient(cfg ClientConfig) *Client {
-	httpClient := requesthelper.Client()
-	httpClient.Timeout = cfg.Timeout
+// NewClient returns a Client for the agent service at cfg.BaseURL. base is
+// the innermost RoundTripper — in practice the caller's S2S signing
+// transport — wrapped by the tracing transport; nil means plain
+// http.DefaultTransport.
+func NewClient(cfg ClientConfig, base http.RoundTripper) *Client {
+	httpClient := &http.Client{
+		Transport: requesthelper.NewTransport(base),
+		Timeout:   cfg.Timeout,
+	}
 	return &Client{http: httpClient, baseURL: strings.TrimRight(cfg.BaseURL, "/")}
 }
 

@@ -1,2 +1,5 @@
 dist/
 .env
+# S2S private keys — only the public jwks.yaml and the ACLs are committed.
+s2s/keys/
+s2s/jwks.yaml

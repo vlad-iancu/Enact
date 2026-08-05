@@ -14,6 +14,7 @@ import (
 	"enact/internal/logging"
 	"enact/internal/opensearch"
 	"enact/internal/queue"
+	"enact/internal/s2s"
 	"enact/internal/service"
 )
 
@@ -29,12 +30,13 @@ type Config struct {
 	OpenSearch opensearch.Config
 	Queue      queue.Config
 	KB         kb.Config
+	S2S        s2s.Config
 }
 
 // Build constructs the KB API, verifying the backing indices exist (they are
 // created by `make infrastructure-up`). Both knowledge-base domain
-// repositories are used: KB metadata for the CRUD and chunks so deleting a
-// KB can cascade to its indexed chunks.
+// repositories are used: KB metadata for the CRUD and documents so deleting
+// a KB can cascade to the documents stored under it.
 func Build(cfg *Config) service.Builder {
 	return func(ctx context.Context) ([]*restful.WebService, error) {
 		logger := logging.New().WithFields("service", cfg.Name)
@@ -53,8 +55,17 @@ func Build(cfg *Config) service.Builder {
 			logger.Error("failed to verify kb documents index", "err", err)
 			return nil, err
 		}
+		s2sRuntime, err := s2s.Load(cfg.S2S, logger)
+		if err != nil {
+			logger.Error("failed to load s2s configuration", "err", err)
+			return nil, err
+		}
 		producer := queue.NewProducer(cfg.Queue)
-		logger.Info("kb api initialized", "stream", cfg.Queue.Stream)
-		return []*restful.WebService{newKBAPI(kbs, documents, producer, logger).WebService()}, nil
+		logger.Info("kb api initialized", "stream", cfg.Queue.Stream, "s2s_key_id", cfg.S2S.KeyID)
+		ws := newKBAPI(kbs, documents, producer, logger).WebService()
+		if s2sRuntime.Enabled() {
+			ws.Filter(s2sRuntime.Filter)
+		}
+		return []*restful.WebService{ws}, nil
 	}
 }

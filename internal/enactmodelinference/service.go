@@ -17,6 +17,7 @@ import (
 	"enact/internal/kb"
 	"enact/internal/logging"
 	"enact/internal/opensearch"
+	"enact/internal/s2s"
 	"enact/internal/service"
 )
 
@@ -35,6 +36,7 @@ type Config struct {
 	Agents         agents.Config
 	AgentAPI       agents.ClientConfig
 	KBAPI          kb.ClientConfig
+	S2S            s2s.Config
 	EmbeddingModel string `env:"BEDROCK_EMBEDDING_MODEL, default=amazon.titan-embed-text-v2:0"`
 }
 
@@ -58,17 +60,27 @@ func Build(cfg *Config) service.Builder {
 			return nil, err
 		}
 		rags := agents.NewRAGRepository(osClient, cfg.Agents)
+		s2sRuntime, err := s2s.Load(cfg.S2S, logger)
+		if err != nil {
+			logger.Error("failed to load s2s configuration", "err", err)
+			return nil, err
+		}
 		// Agent records and KB context documents come from their owning
 		// services over HTTP; this service reads no agent or KB indices
 		// directly. Only the RAG chunk index (vector retrieval) is local.
-		agentClient := agents.NewClient(cfg.AgentAPI)
-		kbClient := kb.NewClient(cfg.KBAPI)
+		agentClient := agents.NewClient(cfg.AgentAPI, s2sRuntime.Transport(nil, "enact-agent-management-api"))
+		kbClient := kb.NewClient(cfg.KBAPI, s2sRuntime.Transport(nil, "enact-kb-api"))
 		logger.Info("inference api initialized",
 			"embedding_model", cfg.EmbeddingModel,
 			"agent_api", cfg.AgentAPI.BaseURL,
 			"kb_api", cfg.KBAPI.BaseURL,
+			"s2s_key_id", cfg.S2S.KeyID,
 		)
 		api := newInferenceAPI(client, agentClient, rags, kbClient, cfg.EmbeddingModel, logger)
-		return []*restful.WebService{api.WebService()}, nil
+		ws := api.WebService()
+		if s2sRuntime.Enabled() {
+			ws.Filter(s2sRuntime.Filter)
+		}
+		return []*restful.WebService{ws}, nil
 	}
 }

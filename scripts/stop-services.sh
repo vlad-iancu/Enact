@@ -19,6 +19,7 @@ SERVICES=(
   enact-kb-document-indexer
   enact-model-inference
   enact-model-management
+  enact-tests
 )
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

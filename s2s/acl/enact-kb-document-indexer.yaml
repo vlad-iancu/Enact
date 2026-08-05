@@ -1,0 +1,6 @@
+# Access control list for enact-kb-document-indexer.
+# The indexer consumes the Redis queue and exposes no business routes, so
+# there is nothing to allow — everything (beyond the unfiltered health/home
+# endpoints) is denied by default.
+service: enact-kb-document-indexer
+rules: []

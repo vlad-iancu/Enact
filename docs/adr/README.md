@@ -15,3 +15,5 @@ See [template.md](template.md) to add one manually.
 | [0008](0008-verbose-logging-on-all-code-paths.md) | All code paths log all non-sensitive parameters and relevant intermediary results | accepted | 2026-08-02 |
 | [0009](0009-one-domain-per-service.md) | Each service owns exactly one domain and does not trespass | accepted | 2026-08-02 |
 | [0010](0010-titan-v2-embeddings.md) | Amazon Titan Text Embeddings v2 as the embedding model | accepted | 2026-08-02 |
+| [0011](0011-s2s-authentication.md) | Service-to-service authentication with per-service Ed25519 JWTs and YAML-distributed JWKS/ACLs | accepted | 2026-08-04 |
+| [0012](0012-integration-tests-as-a-service.md) | Integration tests as a platform service with lifecycle-structured cases | accepted | 2026-08-05 |

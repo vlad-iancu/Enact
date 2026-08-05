@@ -20,6 +20,7 @@ import (
 	"enact/internal/opensearch"
 	"enact/internal/queue"
 	"enact/internal/rag"
+	"enact/internal/s2s"
 	"enact/internal/service"
 	"enact/internal/tika"
 )
@@ -33,6 +34,7 @@ type Config struct {
 	Tika           tika.Config
 	KB             kb.Config
 	Agents         agents.Config
+	S2S            s2s.Config
 	EmbeddingModel string `env:"BEDROCK_EMBEDDING_MODEL, default=amazon.titan-embed-text-v2:0"`
 	ChunkSize      int    `env:"RAG_CHUNK_SIZE, default=1000"`
 	ChunkOverlap   int    `env:"RAG_CHUNK_OVERLAP, default=150"`
@@ -44,6 +46,13 @@ type Config struct {
 func Build(cfg *Config) service.Builder {
 	return func(ctx context.Context) ([]*restful.WebService, error) {
 		logger := logging.New().WithFields("service", cfg.Name)
+		// The indexer exposes no business routes and calls no enact service,
+		// but loading validates its key material so a fleet-wide rotation
+		// cannot silently leave it misconfigured.
+		if _, err := s2s.Load(cfg.S2S, logger); err != nil {
+			logger.Error("failed to load s2s configuration", "err", err)
+			return nil, err
+		}
 		embedder, err := bedrock.NewClient(ctx, cfg.Bedrock)
 		if err != nil {
 			logger.Error("failed to create bedrock client", "err", err)

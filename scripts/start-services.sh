@@ -25,6 +25,7 @@ DIST_DIR="$ROOT_DIR/dist"
 PID_DIR="$DIST_DIR/run"
 LOG_DIR="/tmp"
 DEBUG="${DEBUG:-0}"
+S2S_DIR="$ROOT_DIR/s2s"
 
 SERVICES=(
   enact-agent-management-api
@@ -32,6 +33,7 @@ SERVICES=(
   enact-kb-document-indexer
   enact-model-inference
   enact-model-management
+  enact-tests
 )
 
 # Delve listen ports per service, index-aligned with SERVICES.
@@ -41,7 +43,19 @@ DEBUG_PORTS=(
   40003
   40004
   40005
+  40006
 )
+
+# assemble_private_keys emits a YAML document with every service's private
+# key (the counterpart of the JWKS) for the enact-tests impersonation fleet.
+assemble_private_keys() {
+  echo "keys:"
+  for f in "$S2S_DIR"/keys/*.key; do
+    [ -f "$f" ] || continue
+    printf '  - kid: %s\n    private_key: |\n' "$(basename "$f" .key)"
+    sed 's/^/      /' "$f"
+  done
+}
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
@@ -51,6 +65,27 @@ if [ "$DEBUG" = "1" ] && ! command -v dlv >/dev/null 2>&1; then
   err "  go install github.com/go-delve/delve/cmd/dlv@latest"
   exit 1
 fi
+
+# S2S material: every service receives the shared JWKS, its own ACL, and its
+# own private key as environment variables holding the YAML/PEM content
+# verbatim (services never read these files themselves). With
+# S2S_ENABLED=false no material is needed — the services skip enforcement.
+#
+# Precedence: shell > dist/.env > default true. The explicit fallback to
+# dist/.env matters because this script EXPORTS the resolved value — and an
+# exported variable would otherwise beat dist/.env inside the services
+# (godotenv.Load never overrides existing env).
+if [ -z "${S2S_ENABLED:-}" ] && [ -f "$DIST_DIR/.env" ]; then
+  S2S_ENABLED="$(sed -n 's/^S2S_ENABLED=//p' "$DIST_DIR/.env" | tail -1 | sed "s/[\"']//g")"
+fi
+S2S_ENABLED="${S2S_ENABLED:-true}"
+if [ "$S2S_ENABLED" = "true" ] && [ ! -f "$S2S_DIR/jwks.yaml" ]; then
+  err "s2s/jwks.yaml not found; generate the key material with: make s2s-keygen"
+  err "(or start with S2S_ENABLED=false to run without service authentication)"
+  exit 1
+fi
+S2S_JWKS_CONTENT=""
+[ -f "$S2S_DIR/jwks.yaml" ] && S2S_JWKS_CONTENT="$(cat "$S2S_DIR/jwks.yaml")"
 
 mkdir -p "$PID_DIR"
 cd "$DIST_DIR"
@@ -71,6 +106,27 @@ for i in "${!SERVICES[@]}"; do
   fi
   rm -f "$pidfile"
   logfile="$LOG_DIR/$svc.log"
+
+  export S2S_ENABLED
+  if [ "$S2S_ENABLED" = "true" ]; then
+    for f in "$S2S_DIR/acl/$svc.yaml" "$S2S_DIR/keys/$svc.key"; do
+      if [ ! -f "$f" ]; then
+        err "$svc: missing $f (run 'make s2s-keygen' for keys; ACLs live in s2s/acl/)"
+        continue 2
+      fi
+    done
+    export S2S_JWKS="$S2S_JWKS_CONTENT"
+    export S2S_ACL="$(cat "$S2S_DIR/acl/$svc.yaml")"
+    export S2S_PRIVATE_KEY="$(cat "$S2S_DIR/keys/$svc.key")"
+    export S2S_KEY_ID="$svc"
+    # The tests service impersonates every other service and therefore
+    # receives the whole fleet's private keys.
+    if [ "$svc" = "enact-tests" ]; then
+      export S2S_PRIVATE_KEYS="$(assemble_private_keys)"
+    else
+      unset S2S_PRIVATE_KEYS
+    fi
+  fi
   if [ "$DEBUG" = "1" ]; then
     port="${DEBUG_PORTS[$i]}"
     # --continue starts the service immediately instead of waiting for a

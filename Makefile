@@ -23,7 +23,7 @@ INFRA := ./scripts/infrastructure.sh
 START := ./scripts/start-services.sh
 STOP  := ./scripts/stop-services.sh
 
-.PHONY: all build clean test vet tidy infrastructure-up infrastructure-down infrastructure-clean observability-up observability-down start stop restart FORCE
+.PHONY: all build clean test vet tidy infrastructure-up infrastructure-down infrastructure-clean observability-up observability-down start stop restart s2s-keygen FORCE
 
 LGTM := docker compose -f deploy/docker-compose.lgtm.yml
 
@@ -94,3 +94,8 @@ stop:
 # Stop running services, rebuild the binaries, then start them again.
 # `make restart DEBUG=1` rebuilds debug binaries and starts them under Delve.
 restart: stop build start
+
+# Generate the local S2S key material: one Ed25519 keypair per service under
+# s2s/keys/ (gitignored) and the public JWKS at s2s/jwks.yaml. Idempotent.
+s2s-keygen:
+	go run ./scripts/s2s-keygen

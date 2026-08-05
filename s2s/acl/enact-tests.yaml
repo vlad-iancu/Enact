@@ -1,0 +1,11 @@
+# Access control list for enact-tests.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# The tests service is a developer tool: launching and inspecting test
+# executions is open to untokened callers (curl/Bruno) and to services.
+service: enact-tests
+rules:
+  - route: "POST /v1/execution"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/execution"
+    allow: [anonymous, "*"]

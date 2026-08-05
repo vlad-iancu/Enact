@@ -13,6 +13,7 @@ import (
 	"enact/internal/logging"
 	"enact/internal/opensearch"
 	"enact/internal/queue"
+	"enact/internal/s2s"
 	"enact/internal/service"
 )
 
@@ -25,6 +26,7 @@ type Config struct {
 	Queue      queue.Config
 	Agents     agents.Config
 	KBAPI      kb.ClientConfig
+	S2S        s2s.Config
 }
 
 // Build constructs the agent management API, verifying the backing indices
@@ -49,9 +51,18 @@ func Build(cfg *Config) service.Builder {
 			logger.Error("failed to verify agent rag chunk index", "err", err)
 			return nil, err
 		}
-		kbClient := kb.NewClient(cfg.KBAPI)
+		s2sRuntime, err := s2s.Load(cfg.S2S, logger)
+		if err != nil {
+			logger.Error("failed to load s2s configuration", "err", err)
+			return nil, err
+		}
+		kbClient := kb.NewClient(cfg.KBAPI, s2sRuntime.Transport(nil, "enact-kb-api"))
 		producer := queue.NewProducer(cfg.Queue)
-		logger.Info("agent api initialized", "stream", cfg.Queue.Stream, "kb_api", cfg.KBAPI.BaseURL)
-		return []*restful.WebService{newAgentAPI(agentRepo, rags, kbClient, producer, logger).WebService()}, nil
+		logger.Info("agent api initialized", "stream", cfg.Queue.Stream, "kb_api", cfg.KBAPI.BaseURL, "s2s_key_id", cfg.S2S.KeyID)
+		ws := newAgentAPI(agentRepo, rags, kbClient, producer, logger).WebService()
+		if s2sRuntime.Enabled() {
+			ws.Filter(s2sRuntime.Filter)
+		}
+		return []*restful.WebService{ws}, nil
 	}
 }

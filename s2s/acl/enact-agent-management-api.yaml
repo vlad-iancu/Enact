@@ -1,0 +1,19 @@
+# Access control list for enact-agent-management-api.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# Agent management is a user-facing entry point, so its routes admit
+# anonymous (untokened) callers.
+service: enact-agent-management-api
+rules:
+  - route: "POST /v1/agents"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/agents"
+    allow: [anonymous, "*"]
+  - route: "PUT /v1/agents/{id}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /v1/agents/{id}"
+    allow: [anonymous, "*"]
+  - route: "POST /v1/agents/{id}/rag/documents"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/agents/{id}"
+    allow: [anonymous, "*"]

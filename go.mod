@@ -9,6 +9,7 @@ require (
 	github.com/emicklei/go-restful-openapi/v2 v2.12.0
 	github.com/emicklei/go-restful/v3 v3.13.0
 	github.com/go-openapi/spec v0.22.2
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-tika v0.3.1
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
@@ -26,6 +27,7 @@ require (
 	go.opentelemetry.io/otel/sdk/log v0.11.0
 	go.opentelemetry.io/otel/sdk/metric v1.35.0
 	go.opentelemetry.io/otel/trace v1.35.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

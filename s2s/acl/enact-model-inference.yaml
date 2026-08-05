@@ -1,0 +1,8 @@
+# Access control list for enact-model-inference.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# Inference is a user-facing entry point.
+service: enact-model-inference
+rules:
+  - route: "POST /v1/inference"
+    allow: [anonymous, "*"]

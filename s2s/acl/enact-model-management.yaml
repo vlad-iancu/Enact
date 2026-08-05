@@ -1,0 +1,8 @@
+# Access control list for enact-model-management.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# The model catalogue is public read-only information.
+service: enact-model-management
+rules:
+  - route: "GET /v1/models"
+    allow: [anonymous, "*"]
