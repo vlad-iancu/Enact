@@ -135,6 +135,26 @@ func (r *DocumentRepository) ListMetaByKB(ctx context.Context, userID, kbID stri
 	return out, nil
 }
 
+// DeleteByDocument removes one document, scoped to its knowledge base: the
+// kb_id filter makes deleting another KB's document by guessed id
+// structurally impossible. Idempotent — zero matches is success.
+func (r *DocumentRepository) DeleteByDocument(ctx context.Context, kbID, documentID string) error {
+	body, err := json.Marshal(map[string]any{
+		"query": map[string]any{
+			"bool": map[string]any{
+				"filter": []any{
+					map[string]any{"term": map[string]any{"kb_id": kbID}},
+					map[string]any{"term": map[string]any{"document_id": documentID}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("kb: marshal delete document query: %w", err)
+	}
+	return r.os.DeleteByQuery(ctx, r.index, body)
+}
+
 // DeleteByKB removes every document stored under the given knowledge base.
 func (r *DocumentRepository) DeleteByKB(ctx context.Context, kbID string) error {
 	body, err := json.Marshal(map[string]any{

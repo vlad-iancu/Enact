@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	restful "github.com/emicklei/go-restful/v3"
@@ -44,6 +45,7 @@ func newAgentAPI(agentRepo *agents.Repository, rags *agents.RAGRepository, kbs *
 }
 
 type agentRequest struct {
+	Name             string   `json:"name"`
 	Model            string   `json:"model"`
 	SystemPrompt     string   `json:"system_prompt"`
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
@@ -54,6 +56,7 @@ type agentRequest struct {
 // including explicit clears ("" for the prompt, [] for the KB list). A JSON
 // null is indistinguishable from an absent field and also means "unchanged".
 type agentUpdateRequest struct {
+	Name             *string   `json:"name"`
 	Model            *string   `json:"model"`
 	SystemPrompt     *string   `json:"system_prompt"`
 	KnowledgeBaseIDs *[]string `json:"knowledge_base_ids"`
@@ -62,6 +65,7 @@ type agentUpdateRequest struct {
 type agentResponse struct {
 	ID               string    `json:"id"`
 	UserID           string    `json:"user_id"`
+	Name             string    `json:"name"`
 	Model            string    `json:"model"`
 	SystemPrompt     string    `json:"system_prompt"`
 	KnowledgeBaseIDs []string  `json:"knowledge_base_ids"`
@@ -83,6 +87,25 @@ type uploadRAGDocumentResponse struct {
 type queuedDocument struct {
 	DocumentID string `json:"document_id"`
 	Filename   string `json:"filename,omitempty"`
+	Status     string `json:"status"`
+}
+
+// ragDocumentResponse is one distinct document of an agent's RAG collection.
+type ragDocumentResponse struct {
+	DocumentID string `json:"document_id"`
+	Filename   string `json:"filename,omitempty"`
+	Chunks     int    `json:"chunks"`
+}
+
+type listRAGDocumentsResponse struct {
+	AgentID   string                `json:"agent_id"`
+	Documents []ragDocumentResponse `json:"documents"`
+}
+
+// deleteRAGDocumentResponse acknowledges an asynchronous document deletion.
+type deleteRAGDocumentResponse struct {
+	AgentID    string `json:"agent_id"`
+	DocumentID string `json:"document_id"`
 	Status     string `json:"status"`
 }
 
@@ -131,6 +154,21 @@ func (a *AgentAPI) WebService() *restful.WebService {
 		Returns(http.StatusNoContent, "Deleted", nil).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
+	ws.Route(ws.GET("/{id}/rag/documents").
+		To(a.listRAGDocuments).
+		Param(ws.PathParameter("id", "agent id")).
+		Doc("List the distinct documents of the agent's RAG collection (document id, filename, chunk count)").
+		Returns(http.StatusOK, "OK", listRAGDocumentsResponse{}).
+		Returns(http.StatusNotFound, "Agent not found", errorResponse{}))
+
+	ws.Route(ws.DELETE("/{id}/rag/documents/{docId}").
+		To(a.deleteRAGDocument).
+		Param(ws.PathParameter("id", "agent id")).
+		Param(ws.PathParameter("docId", "document id")).
+		Doc("Queue the removal of one RAG document's chunks; deletion is asynchronous (a nonexistent document id is still accepted)").
+		Returns(http.StatusAccepted, "Accepted for deletion", deleteRAGDocumentResponse{}).
+		Returns(http.StatusNotFound, "Agent not found", errorResponse{}))
+
 	ws.Route(ws.POST("/{id}/rag/documents").
 		To(a.uploadRAGDocument).
 		Consumes("multipart/form-data").
@@ -155,6 +193,10 @@ func (a *AgentAPI) validate(req *restful.Request, logger *logging.Logger, body a
 	if _, ok := models.Resolve(body.Model); !ok {
 		logger.Warn("agent validation failed: unknown model", "model", body.Model)
 		return fmt.Sprintf("unknown model %q; see GET /v1/models", body.Model), false
+	}
+	if strings.TrimSpace(body.Name) == "" {
+		logger.Warn("agent validation failed: name is required")
+		return "name is required", false
 	}
 	return a.validateKBs(req, logger, body.KnowledgeBaseIDs)
 }
@@ -194,6 +236,7 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 	agent := agents.Agent{
 		ID:               uuid.NewString(),
 		UserID:           userID,
+		Name:             strings.TrimSpace(body.Name),
 		Model:            body.Model,
 		SystemPrompt:     body.SystemPrompt,
 		KnowledgeBaseIDs: normalizeIDs(body.KnowledgeBaseIDs),
@@ -205,7 +248,7 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 		writeError(req, resp, http.StatusInternalServerError, "failed to create agent")
 		return
 	}
-	logger.Info("agent created", "agent_id", agent.ID, "model", agent.Model, "knowledge_base_ids", agent.KnowledgeBaseIDs)
+	logger.Info("agent created", "agent_id", agent.ID, "name", agent.Name, "model", agent.Model, "knowledge_base_ids", agent.KnowledgeBaseIDs)
 	requesthelper.WriteJSON(req, resp, http.StatusCreated, toAgentResponse(agent))
 }
 
@@ -271,10 +314,20 @@ func (a *AgentAPI) update(req *restful.Request, resp *restful.Response) {
 		return
 	}
 	logger.Info("update request decoded",
+		"name_provided", body.Name != nil,
 		"model_provided", body.Model != nil,
 		"system_prompt_provided", body.SystemPrompt != nil,
 		"knowledge_base_ids_provided", body.KnowledgeBaseIDs != nil,
 	)
+
+	if body.Name != nil {
+		name := strings.TrimSpace(*body.Name)
+		if name == "" {
+			writeError(req, resp, http.StatusBadRequest, "name must not be empty")
+			return
+		}
+		existing.Name = name
+	}
 
 	// Partial update: only provided fields change, and only provided fields
 	// are validated — untouched KB references are not re-checked.
@@ -399,6 +452,80 @@ func (a *AgentAPI) uploadRAGDocument(req *restful.Request, resp *restful.Respons
 	})
 }
 
+// listRAGDocuments lists the distinct documents of an agent's RAG
+// collection, aggregated from its chunk index.
+func (a *AgentAPI) listRAGDocuments(req *restful.Request, resp *restful.Response) {
+	id := req.PathParameter("id")
+	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id)
+	logger.Info("rag document listing requested")
+
+	agent, found, err := a.agents.Get(req.Request.Context(), id)
+	if err != nil {
+		logger.Error("failed to look up agent for rag listing", "err", err)
+		writeError(req, resp, http.StatusInternalServerError, "failed to look up agent")
+		return
+	}
+	if !found {
+		logger.Warn("agent not found for rag listing")
+		writeError(req, resp, http.StatusNotFound, "agent not found")
+		return
+	}
+	logger.Info("agent loaded")
+
+	docs, err := a.rags.ListDocuments(req.Request.Context(), agent.UserID, agent.ID)
+	if err != nil {
+		logger.Error("failed to list rag documents", "err", err)
+		writeError(req, resp, http.StatusInternalServerError, "failed to list RAG documents")
+		return
+	}
+	out := make([]ragDocumentResponse, 0, len(docs))
+	for _, d := range docs {
+		out = append(out, ragDocumentResponse{DocumentID: d.DocumentID, Filename: d.Filename, Chunks: d.Chunks})
+	}
+	logger.Info("rag documents listed", "documents", len(out))
+	requesthelper.WriteJSON(req, resp, http.StatusOK, listRAGDocumentsResponse{AgentID: agent.ID, Documents: out})
+}
+
+// deleteRAGDocument queues the asynchronous removal of one RAG document's
+// chunks; the indexer performs the delete, scoped to this agent.
+func (a *AgentAPI) deleteRAGDocument(req *restful.Request, resp *restful.Response) {
+	id := req.PathParameter("id")
+	docID := req.PathParameter("docId")
+	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id, "document_id", docID)
+	logger.Info("rag document deletion requested")
+
+	agent, found, err := a.agents.Get(req.Request.Context(), id)
+	if err != nil {
+		logger.Error("failed to look up agent for rag deletion", "err", err)
+		writeError(req, resp, http.StatusInternalServerError, "failed to look up agent")
+		return
+	}
+	if !found {
+		logger.Warn("agent not found for rag deletion")
+		writeError(req, resp, http.StatusNotFound, "agent not found")
+		return
+	}
+	logger.Info("agent loaded")
+
+	message := queue.DocumentMessage{
+		Type:       queue.DocumentTypeAgentRAGDelete,
+		UserID:     agent.UserID,
+		AgentID:    agent.ID,
+		DocumentID: docID,
+	}
+	if err := a.producer.Publish(req.Request.Context(), message); err != nil {
+		logger.Error("failed to enqueue rag document deletion", "err", err)
+		writeError(req, resp, http.StatusBadGateway, "failed to enqueue document deletion")
+		return
+	}
+	logger.Info("rag document deletion queued")
+	requesthelper.WriteJSON(req, resp, http.StatusAccepted, deleteRAGDocumentResponse{
+		AgentID:    agent.ID,
+		DocumentID: docID,
+		Status:     "queued",
+	})
+}
+
 func decode(req *restful.Request, resp *restful.Response, logger *logging.Logger) (agentRequest, bool) {
 	var body agentRequest
 	dec := json.NewDecoder(req.Request.Body)
@@ -422,6 +549,7 @@ func toAgentResponse(a agents.Agent) agentResponse {
 	return agentResponse{
 		ID:               a.ID,
 		UserID:           a.UserID,
+		Name:             a.Name,
 		Model:            a.Model,
 		SystemPrompt:     a.SystemPrompt,
 		KnowledgeBaseIDs: normalizeIDs(a.KnowledgeBaseIDs),

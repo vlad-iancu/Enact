@@ -193,6 +193,43 @@ type Hit struct {
 	Source json.RawMessage `json:"_source"`
 }
 
+// SearchResult carries a search's hits plus its raw aggregations.
+type SearchResult struct {
+	Hits []Hit
+	// Aggregations is the response's "aggregations" object verbatim (nil
+	// when the query requested none); callers unmarshal into their own
+	// typed structs.
+	Aggregations json.RawMessage
+}
+
+// SearchWithAggregations runs a query body against index and returns hits
+// and aggregations. Search (above) discards aggregations; use this for
+// queries whose payload is the aggregation result (e.g. size:0 + terms).
+func (c *Client) SearchWithAggregations(ctx context.Context, index string, body []byte) (SearchResult, error) {
+	req := opensearchapi.SearchRequest{Index: []string{index}, Body: bytes.NewReader(body)}
+	res, err := req.Do(ctx, c.api)
+	if err != nil {
+		return SearchResult{}, fmt.Errorf("opensearch: search %q: %w", index, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotFound {
+		return SearchResult{}, nil
+	}
+	if res.IsError() {
+		return SearchResult{}, fmt.Errorf("opensearch: search %q: %s", index, res.String())
+	}
+	var parsed struct {
+		Hits struct {
+			Hits []Hit `json:"hits"`
+		} `json:"hits"`
+		Aggregations json.RawMessage `json:"aggregations"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
+		return SearchResult{}, fmt.Errorf("opensearch: decode search %q: %w", index, err)
+	}
+	return SearchResult{Hits: parsed.Hits.Hits, Aggregations: parsed.Aggregations}, nil
+}
+
 // DeleteByQuery deletes every document in index matching the query body.
 func (c *Client) DeleteByQuery(ctx context.Context, index string, body []byte) error {
 	refresh := true

@@ -16,6 +16,7 @@
         "agent_id":    { "type": "keyword" },
         "document_id": { "type": "keyword" },
         "chunk_index": { "type": "integer" },
+        "filename":    { "type": "keyword" },
         "text":        { "type": "text" },
         "embedding": {
           "type": "knn_vector",

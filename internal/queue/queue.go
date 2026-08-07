@@ -66,6 +66,15 @@ const (
 	// configuration. The indexer extracts, chunks, and embeds it into the
 	// agent's vector collection for retrieval at inference time.
 	DocumentTypeAgentRAG DocumentType = "agent_rag"
+
+	// DocumentTypeKBContextDelete asks the indexer to remove one context
+	// document from its knowledge base. Content is empty on these messages;
+	// KBID and DocumentID identify the target.
+	DocumentTypeKBContextDelete DocumentType = "kb_context_delete"
+	// DocumentTypeAgentRAGDelete asks the indexer to remove one document's
+	// chunks from an agent's RAG collection. Content is empty; AgentID and
+	// DocumentID identify the target.
+	DocumentTypeAgentRAGDelete DocumentType = "agent_rag_delete"
 )
 
 // DocumentMessage is the payload pushed onto the queue for each uploaded

@@ -17,7 +17,7 @@ func NewAgentCreateGetDelete() utils.TestCase { return &agentCreateGetDeleteCase
 func (c *agentCreateGetDeleteCase) Name() string { return "TestAgentManagement_CreateGetDelete" }
 
 func (c *agentCreateGetDeleteCase) Run(t *utils.T) {
-	c.agent = t.CreateAgent(`{"model":"claude-sonnet-4-6","system_prompt":"integration test agent"}`)
+	c.agent = t.CreateAgent(`{"name":"integration test agent","model":"claude-sonnet-4-6","system_prompt":"integration test agent"}`)
 
 	var fetched utils.AgentDTO
 	status := t.DoJSON("enact-tests", utils.AgentAudience, http.MethodGet, t.AgentURL("/v1/agents/"+c.agent.ID), nil, &fetched)

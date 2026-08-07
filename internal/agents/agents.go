@@ -20,11 +20,12 @@ type Config struct {
 	RAGChunksIndex string `env:"OPENSEARCH_INDEX_AGENT_RAG_CHUNKS, default=enact-agent-rag-chunks"`
 }
 
-// Agent is a configured assistant: a model (friendly name), a system prompt,
-// and the knowledge bases it retrieves from.
+// Agent is a configured assistant: a user-facing friendly name, a model, a
+// system prompt, and the knowledge bases it retrieves from.
 type Agent struct {
 	ID               string    `json:"id"`
 	UserID           string    `json:"user_id"`
+	Name             string    `json:"name"`
 	Model            string    `json:"model"`
 	SystemPrompt     string    `json:"system_prompt"`
 	KnowledgeBaseIDs []string  `json:"knowledge_base_ids"`

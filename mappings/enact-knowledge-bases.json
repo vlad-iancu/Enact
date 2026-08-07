@@ -1,8 +1,10 @@
 {
-  "index_patterns": ["enact-knowledge-bases"],
+  "index_patterns": [
+    "enact-knowledge-bases"
+  ],
   "priority": 100,
   "_meta": {
-    "description": "Knowledge-base metadata records (id only; no friendly name)."
+    "description": "Knowledge-base metadata records: id, owner, friendly name."
   },
   "template": {
     "settings": {
@@ -11,9 +13,21 @@
     },
     "mappings": {
       "properties": {
-        "id":         { "type": "keyword" },
-        "user_id":    { "type": "keyword" },
-        "created_at": { "type": "date" }
+        "id": {
+          "type": "keyword"
+        },
+        "user_id": {
+          "type": "keyword"
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "name": {
+          "type": "text"
+        },
+        "updated_at": {
+          "type": "date"
+        }
       }
     }
   }

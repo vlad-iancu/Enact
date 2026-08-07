@@ -2,6 +2,7 @@ package utils
 
 import (
 	"net/http"
+	"strings"
 )
 
 // Helpers for the knowledge-base cases. kb-api is internal (no anonymous
@@ -11,6 +12,7 @@ import (
 type KBDTO struct {
 	ID        string `json:"id"`
 	UserID    string `json:"user_id"`
+	Name      string `json:"name"`
 	Error     string `json:"error"`
 	Documents []struct {
 		DocumentID string `json:"document_id"`
@@ -26,7 +28,8 @@ func (t *T) KBURL(path string) string { return t.Env.KBAPIURL + path }
 // DeleteKB in the case's TearDown.
 func (t *T) CreateKB() KBDTO {
 	var out KBDTO
-	status := t.DoJSON("enact-tests", KBAudience, http.MethodPost, t.KBURL("/v1/knowledge-bases"), nil, &out)
+	status := t.DoJSON("enact-tests", KBAudience, http.MethodPost, t.KBURL("/v1/knowledge-bases"),
+		strings.NewReader(`{"name":"integration test kb"}`), &out)
 	if status != http.StatusCreated {
 		t.Fatalf("create kb: got HTTP %d (%s), want 201", status, out.Error)
 	}

@@ -1,0 +1,72 @@
+# Access control list for enact-main.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# The main service is the browser-facing entry point: every auth route and
+# page must be reachable without a service token. Authentication of PEOPLE
+# happens in the handlers (sessions), not in the S2S layer.
+service: enact-main
+rules:
+  - route: "GET /auth/google"
+    allow: [anonymous, "*"]
+  - route: "GET /google/oauth/callback"
+    allow: [anonymous, "*"]
+  - route: "POST /auth/register"
+    allow: [anonymous, "*"]
+  - route: "POST /auth/login"
+    allow: [anonymous, "*"]
+  - route: "POST /auth/logout"
+    allow: [anonymous, "*"]
+  - route: "GET /auth/me"
+    allow: [anonymous, "*"]
+  - route: "GET /app"
+    allow: [anonymous, "*"]
+  - route: "GET /login"
+    allow: [anonymous, "*"]
+
+  # Conversations: browser-facing; PEOPLE are authenticated by the session
+  # filter inside the handlers, not by S2S.
+  - route: "GET /conversations"
+    allow: [anonymous, "*"]
+  - route: "POST /conversations"
+    allow: [anonymous, "*"]
+  - route: "GET /conversations/{id}"
+    allow: [anonymous, "*"]
+  - route: "PUT /conversations/{id}"
+    allow: [anonymous, "*"]
+  - route: "POST /conversations/{id}/messages"
+    allow: [anonymous, "*"]
+  - route: "GET /models"
+    allow: [anonymous, "*"]
+
+  # Agent & knowledge-base management: browser-facing; sessions authenticate
+  # people inside the handlers.
+  - route: "GET /agents"
+    allow: [anonymous, "*"]
+  - route: "POST /agents"
+    allow: [anonymous, "*"]
+  - route: "PUT /agents/{id}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /agents/{id}"
+    allow: [anonymous, "*"]
+  - route: "GET /agents/{id}"
+    allow: [anonymous, "*"]
+  - route: "GET /agents/{id}/rag/documents"
+    allow: [anonymous, "*"]
+  - route: "POST /agents/{id}/rag/documents"
+    allow: [anonymous, "*"]
+  - route: "DELETE /agents/{id}/rag/documents/{docId}"
+    allow: [anonymous, "*"]
+  - route: "GET /knowledge-bases"
+    allow: [anonymous, "*"]
+  - route: "POST /knowledge-bases"
+    allow: [anonymous, "*"]
+  - route: "GET /knowledge-bases/{id}"
+    allow: [anonymous, "*"]
+  - route: "PUT /knowledge-bases/{id}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /knowledge-bases/{id}"
+    allow: [anonymous, "*"]
+  - route: "POST /knowledge-bases/{id}/documents"
+    allow: [anonymous, "*"]
+  - route: "DELETE /knowledge-bases/{id}/documents/{docId}"
+    allow: [anonymous, "*"]

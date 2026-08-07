@@ -15,8 +15,12 @@ type RAGChunk struct {
 	AgentID    string    `json:"agent_id"`
 	DocumentID string    `json:"document_id"`
 	ChunkIndex int       `json:"chunk_index"`
-	Text       string    `json:"text"`
-	Embedding  []float32 `json:"embedding"`
+	// Filename of the uploaded document, denormalized onto every chunk so
+	// document listings can show it. Chunks indexed before this field
+	// existed have it empty.
+	Filename  string    `json:"filename,omitempty"`
+	Text      string    `json:"text"`
+	Embedding []float32 `json:"embedding"`
 }
 
 // RetrievedChunk pairs a RAG chunk with its relevance score.
@@ -51,6 +55,102 @@ func (r *RAGRepository) EnsureIndex(ctx context.Context) error {
 		return fmt.Errorf("agents: required index %q is missing; run `make infrastructure-up` to create it", r.index)
 	}
 	return nil
+}
+
+// RAGDocument summarizes one uploaded document of an agent's RAG
+// collection: identity, display name, and how many chunks it produced.
+type RAGDocument struct {
+	DocumentID string `json:"document_id"`
+	Filename   string `json:"filename,omitempty"`
+	Chunks     int    `json:"chunks"`
+}
+
+// ListDocuments returns the distinct documents of an agent's RAG collection
+// via a terms aggregation on document_id (capped at 1000 distinct documents,
+// the platform's usual listing ceiling). Filename comes from a one-hit
+// top_hits sample per bucket; chunks indexed before filenames existed yield
+// an empty one.
+func (r *RAGRepository) ListDocuments(ctx context.Context, userID, agentID string) ([]RAGDocument, error) {
+	body, err := json.Marshal(map[string]any{
+		"size": 0,
+		"query": map[string]any{
+			"bool": map[string]any{
+				"filter": []any{
+					map[string]any{"term": map[string]any{"user_id": userID}},
+					map[string]any{"term": map[string]any{"agent_id": agentID}},
+				},
+			},
+		},
+		"aggs": map[string]any{
+			"documents": map[string]any{
+				"terms": map[string]any{"field": "document_id", "size": 1000},
+				"aggs": map[string]any{
+					"sample": map[string]any{
+						"top_hits": map[string]any{"size": 1, "_source": []string{"filename"}},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("agents: marshal list rag documents query: %w", err)
+	}
+	res, err := r.os.SearchWithAggregations(ctx, r.index, body)
+	if err != nil {
+		return nil, err
+	}
+	if res.Aggregations == nil {
+		return []RAGDocument{}, nil
+	}
+	var aggs struct {
+		Documents struct {
+			Buckets []struct {
+				Key      string `json:"key"`
+				DocCount int    `json:"doc_count"`
+				Sample   struct {
+					Hits struct {
+						Hits []struct {
+							Source struct {
+								Filename string `json:"filename"`
+							} `json:"_source"`
+						} `json:"hits"`
+					} `json:"hits"`
+				} `json:"sample"`
+			} `json:"buckets"`
+		} `json:"documents"`
+	}
+	if err := json.Unmarshal(res.Aggregations, &aggs); err != nil {
+		return nil, fmt.Errorf("agents: decode rag document aggregation: %w", err)
+	}
+	out := make([]RAGDocument, 0, len(aggs.Documents.Buckets))
+	for _, b := range aggs.Documents.Buckets {
+		doc := RAGDocument{DocumentID: b.Key, Chunks: b.DocCount}
+		if hits := b.Sample.Hits.Hits; len(hits) > 0 {
+			doc.Filename = hits[0].Source.Filename
+		}
+		out = append(out, doc)
+	}
+	return out, nil
+}
+
+// DeleteByDocument removes one document's chunks, scoped to its agent: the
+// agent_id filter makes deleting another agent's document by guessed id
+// structurally impossible. Idempotent — zero matches is success.
+func (r *RAGRepository) DeleteByDocument(ctx context.Context, agentID, documentID string) error {
+	body, err := json.Marshal(map[string]any{
+		"query": map[string]any{
+			"bool": map[string]any{
+				"filter": []any{
+					map[string]any{"term": map[string]any{"agent_id": agentID}},
+					map[string]any{"term": map[string]any{"document_id": documentID}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("agents: marshal delete rag document query: %w", err)
+	}
+	return r.os.DeleteByQuery(ctx, r.index, body)
 }
 
 // Index indexes a single RAG chunk and its embedding. The document id is

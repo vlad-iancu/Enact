@@ -14,9 +14,13 @@ rules:
     allow: ["*"]
   - route: "GET /v1/knowledge-bases/{id}"
     allow: ["*"]
+  - route: "PUT /v1/knowledge-bases/{id}"
+    allow: ["*"]
   - route: "DELETE /v1/knowledge-bases/{id}"
     allow: ["*"]
   - route: "POST /v1/knowledge-bases/{id}/documents"
+    allow: ["*"]
+  - route: "DELETE /v1/knowledge-bases/{id}/documents/{docId}"
     allow: ["*"]
 
   # Document contents feed model context; the inference service needs the

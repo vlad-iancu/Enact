@@ -17,7 +17,7 @@ func NewAgentPartialUpdate() utils.TestCase { return &agentPartialUpdateCase{} }
 func (c *agentPartialUpdateCase) Name() string { return "TestAgentManagement_PartialUpdate" }
 
 func (c *agentPartialUpdateCase) Setup(t *utils.T) {
-	c.agent = t.CreateAgent(`{"model":"claude-sonnet-4-6","system_prompt":"original"}`)
+	c.agent = t.CreateAgent(`{"name":"integration test agent","model":"claude-sonnet-4-6","system_prompt":"original"}`)
 }
 
 func (c *agentPartialUpdateCase) Run(t *utils.T) {

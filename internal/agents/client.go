@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -83,4 +84,130 @@ func (c *Client) Get(ctx context.Context, id string) (Agent, bool, error) {
 	default:
 		return Agent{}, false, fmt.Errorf("agents: get %s: unexpected status %d", id, resp.StatusCode)
 	}
+}
+
+// CreateAgentRequest is the body of an agent creation.
+type CreateAgentRequest struct {
+	Name             string   `json:"name"`
+	Model            string   `json:"model"`
+	SystemPrompt     string   `json:"system_prompt"`
+	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+}
+
+// do issues one JSON request and decodes the response. It maps 404 to
+// found=false and 400 to *requesthelper.BadRequestError; any other
+// unexpected status is a plain error.
+func (c *Client) do(ctx context.Context, method, url string, body []byte, wantStatus int, out any) (bool, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	if err != nil {
+		return false, fmt.Errorf("agents: build %s request: %w", method, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set(identity.Header, identity.FromContext(ctx))
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("agents: %s %s: %w", method, url, err)
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	switch resp.StatusCode {
+	case wantStatus:
+		if out != nil {
+			if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+				return false, fmt.Errorf("agents: decode response: %w", err)
+			}
+		}
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	case http.StatusBadRequest:
+		var apiErr struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		if apiErr.Error == "" {
+			apiErr.Error = "bad request"
+		}
+		return false, &requesthelper.BadRequestError{Message: apiErr.Error}
+	default:
+		return false, fmt.Errorf("agents: %s %s: unexpected status %d", method, url, resp.StatusCode)
+	}
+}
+
+// List returns the calling user's agents.
+func (c *Client) List(ctx context.Context) ([]Agent, error) {
+	var out struct {
+		Agents []Agent `json:"agents"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, c.baseURL+"/v1/agents", nil, http.StatusOK, &out); err != nil {
+		return nil, err
+	}
+	return out.Agents, nil
+}
+
+// Create creates an agent; validation failures surface as *BadRequestError.
+func (c *Client) Create(ctx context.Context, body CreateAgentRequest) (Agent, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return Agent{}, fmt.Errorf("agents: marshal create request: %w", err)
+	}
+	var created Agent
+	if _, err := c.do(ctx, http.MethodPost, c.baseURL+"/v1/agents", payload, http.StatusCreated, &created); err != nil {
+		return Agent{}, err
+	}
+	return created, nil
+}
+
+// Update partially updates an agent. rawBody is passed through verbatim so
+// the callee's partial-update semantics (absent field = unchanged) are
+// preserved end to end. The boolean reports existence.
+func (c *Client) Update(ctx context.Context, id string, rawBody json.RawMessage) (Agent, bool, error) {
+	var updated Agent
+	found, err := c.do(ctx, http.MethodPut, c.baseURL+"/v1/agents/"+url.PathEscape(id), rawBody, http.StatusOK, &updated)
+	if err != nil {
+		return Agent{}, false, err
+	}
+	return updated, found, nil
+}
+
+// Delete removes an agent (and, server-side, its RAG collection). The
+// boolean reports existence.
+func (c *Client) Delete(ctx context.Context, id string) (bool, error) {
+	return c.do(ctx, http.MethodDelete, c.baseURL+"/v1/agents/"+url.PathEscape(id), nil, http.StatusNoContent, nil)
+}
+
+// ListRAGDocuments returns the distinct documents of the agent's RAG
+// collection. The boolean reports the agent's existence.
+func (c *Client) ListRAGDocuments(ctx context.Context, id string) ([]RAGDocument, bool, error) {
+	var out struct {
+		Documents []RAGDocument `json:"documents"`
+	}
+	found, err := c.do(ctx, http.MethodGet, c.baseURL+"/v1/agents/"+url.PathEscape(id)+"/rag/documents", nil, http.StatusOK, &out)
+	if err != nil {
+		return nil, false, err
+	}
+	return out.Documents, found, nil
+}
+
+// DeleteRAGDocument queues the removal of one RAG document. The boolean
+// reports the agent's existence (deletion itself is asynchronous).
+func (c *Client) DeleteRAGDocument(ctx context.Context, agentID, docID string) (bool, error) {
+	endpoint := c.baseURL + "/v1/agents/" + url.PathEscape(agentID) + "/rag/documents/" + url.PathEscape(docID)
+	return c.do(ctx, http.MethodDelete, endpoint, nil, http.StatusAccepted, nil)
+}
+
+// UploadRAGDocuments forwards files to the agent's RAG collection as a
+// multipart upload. It returns the callee's 202 response body verbatim; the
+// boolean reports the agent's existence.
+func (c *Client) UploadRAGDocuments(ctx context.Context, id string, files []requesthelper.UploadedFile) (json.RawMessage, bool, error) {
+	endpoint := c.baseURL + "/v1/agents/" + url.PathEscape(id) + "/rag/documents"
+	return requesthelper.PostMultipart(ctx, c.http, "agents", endpoint, files)
 }

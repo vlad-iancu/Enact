@@ -23,9 +23,9 @@ func (c *agentDeleteIsolationCase) Name() string { return "TestAgentManagement_D
 // Setup creates the victim and both bystanders. An abort mid-way is safe:
 // TearDown deletes whatever was created (empty ids are no-ops).
 func (c *agentDeleteIsolationCase) Setup(t *utils.T) {
-	c.victim = t.CreateAgent(`{"model":"claude-sonnet-4-6","system_prompt":"victim"}`)
-	c.bystander1 = t.CreateAgent(`{"model":"claude-sonnet-4-6","system_prompt":"bystander one"}`)
-	c.bystander2 = t.CreateAgent(`{"model":"claude-sonnet-4-6","system_prompt":"bystander two"}`)
+	c.victim = t.CreateAgent(`{"name":"integration test agent","model":"claude-sonnet-4-6","system_prompt":"victim"}`)
+	c.bystander1 = t.CreateAgent(`{"name":"integration test agent","model":"claude-sonnet-4-6","system_prompt":"bystander one"}`)
+	c.bystander2 = t.CreateAgent(`{"name":"integration test agent","model":"claude-sonnet-4-6","system_prompt":"bystander two"}`)
 }
 
 func (c *agentDeleteIsolationCase) Run(t *utils.T) {

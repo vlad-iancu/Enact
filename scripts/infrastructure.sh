@@ -38,7 +38,7 @@ TIKA_URL="${TIKA_URL:-http://localhost:9998}"
 BEDROCK_EMBEDDING_DIM="${BEDROCK_EMBEDDING_DIM:-1024}"
 
 # Indices, paired with their template files in mappings/.
-INDICES=(enact-knowledge-bases enact-agents enact-kb-documents enact-agent-rag-chunks)
+INDICES=(enact-knowledge-bases enact-agents enact-kb-documents enact-agent-rag-chunks enact-users enact-conversations)
 
 # --- helpers ---------------------------------------------------------------
 
@@ -129,6 +129,29 @@ register_templates() {
   done
 }
 
+# Templates only apply to indices created after registration; fields added
+# to a template later must also be PUT onto the live index. Adding a new
+# field to an existing mapping is an idempotent, always-allowed operation.
+update_live_mappings() {
+  put_live_mapping enact-agent-rag-chunks '{"properties":{"filename":{"type":"keyword"}}}'
+  put_live_mapping enact-knowledge-bases '{"properties":{"name":{"type":"text"},"updated_at":{"type":"date"}}}'
+  put_live_mapping enact-agents '{"properties":{"name":{"type":"text"}}}'
+}
+
+# put_live_mapping <index> <mapping-json>
+put_live_mapping() {
+  log "Updating live mapping: $1"
+  local code
+  code=$(os -o /dev/null -w '%{http_code}' \
+    -X PUT -H 'Content-Type: application/json' \
+    "$OPENSEARCH_URL/$1/_mapping" -d "$2")
+  case "$code" in
+    200|201) ;;
+    404) log "Index $1 not created yet; template will cover it" ;;
+    *) err "failed to update mapping for $1 (HTTP $code)"; exit 1 ;;
+  esac
+}
+
 create_indices() {
   for index in "${INDICES[@]}"; do
     if [ "$(os_status "$index")" = "200" ]; then
@@ -173,6 +196,7 @@ cmd_up() {
   wait_for_tika
   register_templates
   create_indices
+  update_live_mappings
   ensure_redis_stream
   log "Infrastructure is up."
 }

@@ -48,6 +48,15 @@ func (w *worker) handle(ctx context.Context, msg queue.DocumentMessage) error {
 	)
 	logger.Info("processing queued document")
 
+	// Delete operations carry no content; branch before the decode/extract
+	// steps, which assume an uploaded payload.
+	switch msg.Type {
+	case queue.DocumentTypeKBContextDelete:
+		return w.deleteContextDocument(ctx, logger, msg)
+	case queue.DocumentTypeAgentRAGDelete:
+		return w.deleteRAGDocument(ctx, logger, msg)
+	}
+
 	// Content is the raw upload bytes base64-encoded (see queue.DocumentMessage).
 	// A decode failure is a permanently malformed message, so ack it (return nil)
 	// rather than retrying it forever.
@@ -81,6 +90,33 @@ func (w *worker) handle(ctx context.Context, msg queue.DocumentMessage) error {
 		logger.Warn("unknown document type; skipping")
 		return nil
 	}
+}
+
+// deleteContextDocument removes one KB context document. Idempotent, so a
+// redelivered message is harmless; errors leave the message pending for
+// retry like any other handler failure.
+func (w *worker) deleteContextDocument(ctx context.Context, logger *logging.Logger, msg queue.DocumentMessage) error {
+	logger = logger.WithFields("kb_id", msg.KBID)
+	logger.Info("deleting context document")
+	if err := w.documents.DeleteByDocument(ctx, msg.KBID, msg.DocumentID); err != nil {
+		logger.Error("failed to delete context document", "err", err)
+		return fmt.Errorf("indexer: delete context doc %s: %w", msg.DocumentID, err)
+	}
+	logger.Info("context document deleted")
+	return nil
+}
+
+// deleteRAGDocument removes one document's chunks from an agent's RAG
+// collection. Idempotent; errors stay pending for retry.
+func (w *worker) deleteRAGDocument(ctx context.Context, logger *logging.Logger, msg queue.DocumentMessage) error {
+	logger = logger.WithFields("agent_id", msg.AgentID)
+	logger.Info("deleting rag document")
+	if err := w.rags.DeleteByDocument(ctx, msg.AgentID, msg.DocumentID); err != nil {
+		logger.Error("failed to delete rag document", "err", err)
+		return fmt.Errorf("indexer: delete rag doc %s: %w", msg.DocumentID, err)
+	}
+	logger.Info("rag document deleted")
+	return nil
 }
 
 // storeContextDocument stores a KB document's extracted text whole.
@@ -125,6 +161,7 @@ func (w *worker) indexRAGDocument(ctx context.Context, logger *logging.Logger, m
 			AgentID:    msg.AgentID,
 			DocumentID: msg.DocumentID,
 			ChunkIndex: i,
+			Filename:   msg.Filename,
 			Text:       chunkText,
 			Embedding:  vector,
 		}

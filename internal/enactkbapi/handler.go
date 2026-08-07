@@ -2,8 +2,10 @@ package enactkbapi
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	restful "github.com/emicklei/go-restful/v3"
@@ -37,10 +39,24 @@ func newKBAPI(kbs *kb.Repository, documents *kb.DocumentRepository, producer *qu
 	return &KBAPI{kbs: kbs, documents: documents, producer: producer, logger: logger}
 }
 
+// createKBRequest names the knowledge base being created.
+type createKBRequest struct {
+	Name string `json:"name"`
+}
+
+// updateKBRequest is the partial-update body. It deliberately covers only
+// the KB's own fields, never its documents (those have their own endpoints);
+// pointer fields distinguish "absent — keep" from "provided — set".
+type updateKBRequest struct {
+	Name *string `json:"name"`
+}
+
 type knowledgeBaseResponse struct {
 	ID        string    `json:"id"`
 	UserID    string    `json:"user_id"`
+	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type listKBResponse struct {
@@ -89,6 +105,13 @@ type queuedDocument struct {
 	Status     string `json:"status"`
 }
 
+// deleteDocumentResponse acknowledges an asynchronous document deletion.
+type deleteDocumentResponse struct {
+	KBID       string `json:"kb_id"`
+	DocumentID string `json:"document_id"`
+	Status     string `json:"status"`
+}
+
 type errorResponse struct {
 	Error string `json:"error"`
 }
@@ -101,8 +124,21 @@ func (a *KBAPI) WebService() *restful.WebService {
 
 	ws.Route(ws.POST("").
 		To(a.create).
-		Doc("Create a knowledge base").
-		Returns(http.StatusCreated, "Created", knowledgeBaseResponse{}))
+		Consumes(restful.MIME_JSON).
+		Reads(createKBRequest{}).
+		Doc("Create a knowledge base with a friendly name").
+		Returns(http.StatusCreated, "Created", knowledgeBaseResponse{}).
+		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}))
+
+	ws.Route(ws.PUT("/{id}").
+		To(a.update).
+		Consumes(restful.MIME_JSON).
+		Reads(updateKBRequest{}).
+		Param(ws.PathParameter("id", "knowledge base id")).
+		Doc("Partially update a knowledge base's own fields (currently: name); documents are managed via their own endpoints").
+		Returns(http.StatusOK, "OK", knowledgeBaseResponse{}).
+		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
+		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
 	ws.Route(ws.GET("").
 		To(a.list).
@@ -130,6 +166,14 @@ func (a *KBAPI) WebService() *restful.WebService {
 		Returns(http.StatusNoContent, "Deleted", nil).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
+	ws.Route(ws.DELETE("/{id}/documents/{docId}").
+		To(a.deleteDocument).
+		Param(ws.PathParameter("id", "knowledge base id")).
+		Param(ws.PathParameter("docId", "document id")).
+		Doc("Queue the removal of one context document; deletion is asynchronous (a nonexistent document id is still accepted)").
+		Returns(http.StatusAccepted, "Accepted for deletion", deleteDocumentResponse{}).
+		Returns(http.StatusNotFound, "Knowledge base not found", errorResponse{}))
+
 	ws.Route(ws.POST("/{id}/documents").
 		To(a.uploadDocument).
 		Consumes("multipart/form-data").
@@ -147,17 +191,35 @@ func (a *KBAPI) create(req *restful.Request, resp *restful.Response) {
 	userID := identity.FromContext(req.Request.Context())
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", userID)
 	logger.Info("create knowledge base requested")
+
+	var body createKBRequest
+	dec := json.NewDecoder(req.Request.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		logger.Warn("invalid create body", "err", err)
+		writeError(req, resp, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v", err))
+		return
+	}
+	logger.Info("create request decoded", "name", body.Name)
+	if strings.TrimSpace(body.Name) == "" {
+		writeError(req, resp, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	now := time.Now().UTC()
 	record := kb.KnowledgeBase{
 		ID:        uuid.NewString(),
 		UserID:    userID,
-		CreatedAt: time.Now().UTC(),
+		Name:      strings.TrimSpace(body.Name),
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 	if err := a.kbs.Create(req.Request.Context(), record); err != nil {
 		logger.Error("failed to create knowledge base", "kb_id", record.ID, "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to create knowledge base")
 		return
 	}
-	logger.Info("knowledge base created", "kb_id", record.ID)
+	logger.Info("knowledge base created", "kb_id", record.ID, "name", record.Name)
 	requesthelper.WriteJSON(req, resp, http.StatusCreated, toKBResponse(record))
 }
 
@@ -177,6 +239,54 @@ func (a *KBAPI) list(req *restful.Request, resp *restful.Response) {
 		out = append(out, toKBResponse(record))
 	}
 	requesthelper.WriteJSON(req, resp, http.StatusOK, listKBResponse{KnowledgeBases: out})
+}
+
+// update partially updates a knowledge base's own fields — currently only
+// the friendly name. Documents are deliberately out of scope here.
+func (a *KBAPI) update(req *restful.Request, resp *restful.Response) {
+	id := req.PathParameter("id")
+	logger := requesthelper.Logger(req, a.logger).WithFields("kb_id", id)
+	logger.Info("update knowledge base requested")
+
+	record, found, err := a.kbs.Get(req.Request.Context(), id)
+	if err != nil {
+		logger.Error("failed to look up knowledge base for update", "err", err)
+		writeError(req, resp, http.StatusInternalServerError, "failed to update knowledge base")
+		return
+	}
+	if !found {
+		logger.Warn("knowledge base not found for update")
+		writeError(req, resp, http.StatusNotFound, "knowledge base not found")
+		return
+	}
+	logger.Info("knowledge base loaded", "name", record.Name)
+
+	var body updateKBRequest
+	dec := json.NewDecoder(req.Request.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		logger.Warn("invalid update body", "err", err)
+		writeError(req, resp, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v", err))
+		return
+	}
+	logger.Info("update request decoded", "name_provided", body.Name != nil)
+
+	if body.Name != nil {
+		name := strings.TrimSpace(*body.Name)
+		if name == "" {
+			writeError(req, resp, http.StatusBadRequest, "name must not be empty")
+			return
+		}
+		record.Name = name
+	}
+	record.UpdatedAt = time.Now().UTC()
+	if err := a.kbs.Create(req.Request.Context(), record); err != nil {
+		logger.Error("failed to update knowledge base", "err", err)
+		writeError(req, resp, http.StatusInternalServerError, "failed to update knowledge base")
+		return
+	}
+	logger.Info("knowledge base updated", "name", record.Name)
+	requesthelper.WriteJSON(req, resp, http.StatusOK, toKBResponse(record))
 }
 
 func (a *KBAPI) get(req *restful.Request, resp *restful.Response) {
@@ -349,8 +459,54 @@ func (a *KBAPI) uploadDocument(req *restful.Request, resp *restful.Response) {
 	})
 }
 
+// deleteDocument queues the asynchronous removal of one context document;
+// the indexer performs the actual delete, scoped to this knowledge base.
+func (a *KBAPI) deleteDocument(req *restful.Request, resp *restful.Response) {
+	id := req.PathParameter("id")
+	docID := req.PathParameter("docId")
+	logger := requesthelper.Logger(req, a.logger).WithFields("kb_id", id, "document_id", docID)
+	logger.Info("document deletion requested")
+
+	record, found, err := a.kbs.Get(req.Request.Context(), id)
+	if err != nil {
+		logger.Error("failed to look up knowledge base for document deletion", "err", err)
+		writeError(req, resp, http.StatusInternalServerError, "failed to look up knowledge base")
+		return
+	}
+	if !found {
+		logger.Warn("knowledge base not found for document deletion")
+		writeError(req, resp, http.StatusNotFound, "knowledge base not found")
+		return
+	}
+	logger.Info("knowledge base loaded")
+
+	message := queue.DocumentMessage{
+		Type:       queue.DocumentTypeKBContextDelete,
+		UserID:     record.UserID,
+		KBID:       record.ID,
+		DocumentID: docID,
+	}
+	if err := a.producer.Publish(req.Request.Context(), message); err != nil {
+		logger.Error("failed to enqueue document deletion", "err", err)
+		writeError(req, resp, http.StatusBadGateway, "failed to enqueue document deletion")
+		return
+	}
+	logger.Info("document deletion queued")
+	requesthelper.WriteJSON(req, resp, http.StatusAccepted, deleteDocumentResponse{
+		KBID:       record.ID,
+		DocumentID: docID,
+		Status:     "queued",
+	})
+}
+
 func toKBResponse(record kb.KnowledgeBase) knowledgeBaseResponse {
-	return knowledgeBaseResponse{ID: record.ID, UserID: record.UserID, CreatedAt: record.CreatedAt}
+	return knowledgeBaseResponse{
+		ID:        record.ID,
+		UserID:    record.UserID,
+		Name:      record.Name,
+		CreatedAt: record.CreatedAt,
+		UpdatedAt: record.UpdatedAt,
+	}
 }
 
 func writeError(req *restful.Request, resp *restful.Response, status int, msg string) {

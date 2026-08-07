@@ -13,6 +13,7 @@
       "properties": {
         "id":                 { "type": "keyword" },
         "user_id":            { "type": "keyword" },
+        "name":               { "type": "text" },
         "model":              { "type": "keyword" },
         "system_prompt":      { "type": "text", "index": false },
         "knowledge_base_ids": { "type": "keyword" },

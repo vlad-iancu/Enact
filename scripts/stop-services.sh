@@ -17,6 +17,7 @@ SERVICES=(
   enact-agent-management-api
   enact-kb-api
   enact-kb-document-indexer
+  enact-main
   enact-model-inference
   enact-model-management
   enact-tests

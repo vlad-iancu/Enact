@@ -29,6 +29,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
@@ -86,6 +87,13 @@ type Config struct {
 	Port              int           `env:"SERVICE_PORT, default=8080"`
 	ReadHeaderTimeout time.Duration `env:"SERVICE_READ_HEADER_TIMEOUT, default=10s"`
 	ShutdownTimeout   time.Duration `env:"SERVICE_SHUTDOWN_TIMEOUT, default=15s"`
+
+	// FrontendURL is the origin of the browser frontend, when one exists on
+	// a different origin than this service (e.g. https://app.example.com).
+	// Setting it enables CORS for exactly that origin — with credentials,
+	// so cookies flow — including preflight handling. Empty disables CORS
+	// entirely (same-origin or non-browser services).
+	FrontendURL string `env:"FRONTEND_URL"`
 
 	// Telemetry configures the OpenTelemetry export to the LGTM stack. Its
 	// env-tagged fields are populated by the same Load call as the rest of
@@ -194,6 +202,23 @@ func RunWithConfig(ctx context.Context, cfg Config, build Builder) error {
 	}
 
 	container := restful.NewContainer()
+	// CORS runs before everything else so preflights are answered cheaply
+	// without producing spans. AllowedDomains is an exact-match list: the
+	// single frontend origin — never a wildcard, which the credentials mode
+	// (cookies) would forbid anyway.
+	if origin := strings.TrimRight(cfg.FrontendURL, "/"); origin != "" {
+		cors := restful.CrossOriginResourceSharing{
+			AllowedDomains: []string{origin},
+			AllowedHeaders: []string{"Content-Type", "Accept", "Authorization", "X-User-Id"},
+			AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+			CookiesAllowed: true,
+			Container:      container,
+		}
+		// No container.OPTIONSFilter here: the CORS filter answers preflights
+		// for the allowed origin itself, and OPTIONSFilter would blindly echo
+		// ANY Origin back in Access-Control-Allow-Origin.
+		container.Filter(cors.Filter)
+	}
 	// Container-wide filters run for every route. Tracing goes first so the
 	// identity filter (and everything after it) executes inside the request's
 	// span and enriches the already-traced context.

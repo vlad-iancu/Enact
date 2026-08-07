@@ -22,12 +22,15 @@ type Config struct {
 	DocumentsIndex      string `env:"OPENSEARCH_INDEX_KB_DOCUMENTS, default=enact-kb-documents"`
 }
 
-// KnowledgeBase is the metadata record for a knowledge base. KBs have no
-// friendly name; the id is the sole identifier.
+// KnowledgeBase is the metadata record for a knowledge base. The id is the
+// identifier used across APIs; Name is the user-facing friendly name, given
+// at creation and updatable.
 type KnowledgeBase struct {
 	ID        string    `json:"id"`
 	UserID    string    `json:"user_id"`
+	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Repository persists knowledge-base metadata records in OpenSearch.

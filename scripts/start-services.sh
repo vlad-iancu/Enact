@@ -31,6 +31,7 @@ SERVICES=(
   enact-agent-management-api
   enact-kb-api
   enact-kb-document-indexer
+  enact-main
   enact-model-inference
   enact-model-management
   enact-tests
@@ -41,6 +42,7 @@ DEBUG_PORTS=(
   40001
   40002
   40003
+  40007
   40004
   40005
   40006

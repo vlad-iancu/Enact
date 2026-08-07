@@ -10,9 +10,11 @@
 // inference profiles enabled in your AWS account / region.
 package models
 
-// Model describes one available model.
+// Model describes one available model. Name is the id used across the
+// platform's APIs; DisplayName is what UIs show people.
 type Model struct {
 	Name           string `json:"name"`
+	DisplayName    string `json:"display_name"`
 	BedrockModelID string `json:"bedrock_model_id"`
 	Description    string `json:"description,omitempty"`
 }
@@ -22,36 +24,43 @@ type Model struct {
 var defaultModels = []Model{
 	{
 		Name:           "claude-haiku-4-5",
+		DisplayName:    "Claude Haiku 4.5",
 		BedrockModelID: "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
 		Description:    "Anthropic Claude Haiku 4.5.",
 	},
 	{
 		Name:           "claude-sonnet-4-5",
+		DisplayName:    "Claude Sonnet 4.5",
 		BedrockModelID: "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
 		Description:    "Anthropic Claude Sonnet 4.5.",
 	},
 	{
 		Name:           "claude-sonnet-4-6",
+		DisplayName:    "Claude Sonnet 4.6",
 		BedrockModelID: "eu.anthropic.claude-sonnet-4-6",
 		Description:    "Anthropic Claude Sonnet 4.6.",
 	},
 	{
 		Name:           "claude-opus-4-5",
+		DisplayName:    "Claude Opus 4.5",
 		BedrockModelID: "eu.anthropic.claude-opus-4-5-20251101-v1:0",
 		Description:    "Anthropic Claude Opus 4.5.",
 	},
 	{
 		Name:           "claude-opus-4-6",
+		DisplayName:    "Claude Opus 4.6",
 		BedrockModelID: "eu.anthropic.claude-opus-4-6-v1",
 		Description:    "Anthropic Claude Opus 4.6.",
 	},
 	{
 		Name:           "claude-opus-4-7",
+		DisplayName:    "Claude Opus 4.7",
 		BedrockModelID: "eu.anthropic.claude-opus-4-7",
 		Description:    "Anthropic Claude Opus 4.7.",
 	},
 	{
 		Name:           "claude-opus-4-8",
+		DisplayName:    "Claude Opus 4.8",
 		BedrockModelID: "eu.anthropic.claude-opus-4-8",
 		Description:    "Anthropic Claude Opus 4.8.",
 	},
