@@ -1,5 +1,7 @@
 {
-  "index_patterns": ["enact-users"],
+  "index_patterns": [
+    "enact-users"
+  ],
   "priority": 100,
   "_meta": {
     "description": "User accounts: display name, email (doc id), password hash for local accounts, Google subject for OAuth accounts."
@@ -11,14 +13,41 @@
     },
     "mappings": {
       "properties": {
-        "id":             { "type": "keyword" },
-        "email":          { "type": "keyword" },
-        "display_name":   { "type": "text" },
-        "password_hash":  { "type": "keyword", "index": false },
-        "email_verified": { "type": "boolean" },
-        "google_sub":     { "type": "keyword" },
-        "created_at":     { "type": "date" },
-        "updated_at":     { "type": "date" }
+        "id": {
+          "type": "keyword"
+        },
+        "email": {
+          "type": "keyword"
+        },
+        "display_name": {
+          "type": "text"
+        },
+        "password_hash": {
+          "type": "keyword",
+          "index": false
+        },
+        "email_verified": {
+          "type": "boolean"
+        },
+        "google_sub": {
+          "type": "keyword"
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "updated_at": {
+          "type": "date"
+        },
+        "avatar_key": {
+          "type": "keyword"
+        },
+        "verification_token_hash": {
+          "type": "keyword",
+          "index": false
+        },
+        "verification_expires_at": {
+          "type": "date"
+        }
       }
     }
   }

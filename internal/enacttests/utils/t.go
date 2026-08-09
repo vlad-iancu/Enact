@@ -5,10 +5,12 @@
 package utils
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"time"
 
@@ -104,6 +106,57 @@ func (t *T) Eventually(timeout time.Duration, desc string, check func() (bool, s
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+}
+
+// DoMultipart uploads one file as multipart/form-data (field "file") as the
+// given service identity, decodes the JSON response into out (unless nil),
+// and returns the status code. A transport-level failure aborts the phase.
+func (t *T) DoMultipart(as, audience, url, filename string, content []byte, out any) int {
+	client, err := t.Env.Client(as, audience)
+	if err != nil {
+		t.Fatalf("build client for %q: %v", as, err)
+	}
+	body, contentType, err := buildMultipart(filename, content)
+	if err != nil {
+		t.Fatalf("build multipart: %v", err)
+	}
+	req, err := http.NewRequestWithContext(t.ctx, http.MethodPost, url, body)
+	if err != nil {
+		t.Fatalf("build upload request %s: %v", url, err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-User-Id", t.Env.UserID)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			t.Fatalf("POST %s: decode response: %v", url, err)
+		}
+	}
+	return resp.StatusCode
+}
+
+// buildMultipart assembles a single-file multipart body under field "file".
+func buildMultipart(filename string, content []byte) (io.Reader, string, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := part.Write(content); err != nil {
+		return nil, "", err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, "", err
+	}
+	return &buf, writer.FormDataContentType(), nil
 }
 
 // DoJSON performs an HTTP request as the given service identity, decodes the

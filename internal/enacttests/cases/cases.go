@@ -15,11 +15,25 @@ func All() []utils.Factory {
 		NewAgentRejectsUnknownModel,
 		NewAgentGetMissing,
 		NewAgentDeleteIsolation,
+		NewAgentNameLifecycle,
+		NewAgentRAGUploadListDelete,
 
 		// Knowledge bases
 		NewKBCreateGetDelete,
 		NewKBDocumentsOnDetail,
 		NewKBDeleteIsolation,
+		NewKBNameLifecycle,
+		NewKBDocumentDeleteAsync,
+
+		// enact-main (UI backend), exercised as a browser: cookie sessions,
+		// no service tokens.
+		NewMainAuthSessionLifecycle,
+		NewMainAgentsCrudProxy,
+		NewMainKBCrudProxy,
+		NewMainConversationsLifecycle,
+		NewMainModelsList,
+		NewMainInferenceValidation,
+		NewMainAvatarValidation,
 
 		// Model catalogue
 		NewModelsList,
@@ -28,5 +42,6 @@ func All() []utils.Factory {
 		NewInferenceRejectsUnknownModel,
 		NewInferenceRequiresMessages,
 		NewInferenceRejectsBadTopK,
+		NewInferenceContextFilesValidation,
 	}
 }

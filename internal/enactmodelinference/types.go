@@ -22,6 +22,19 @@ type InferenceRequest struct {
 	// chunks are retrieved. Only meaningful when AgentID is set; distinct
 	// from the model sampling parameters (top_p).
 	RetrievalTopK *int `json:"retrieval_top_k,omitempty"`
+	// ContextFiles are ad-hoc documents for THIS request only, passed to the
+	// model natively as Bedrock DocumentBlocks (no server-side extraction).
+	// Content carries the file's exact bytes base64-encoded; at most 5 files
+	// of 4.5 MB each; supported formats: pdf, csv, doc, docx, xls, xlsx,
+	// html, txt, md (derived from the filename extension).
+	ContextFiles []ContextFile `json:"context_files,omitempty"`
+}
+
+// ContextFile is one ad-hoc document attached to an inference request.
+type ContextFile struct {
+	Filename string `json:"filename"`
+	// Content is the file's raw bytes, base64-encoded (StdEncoding).
+	Content string `json:"content"`
 }
 
 type InferenceResponse struct {

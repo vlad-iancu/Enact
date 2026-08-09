@@ -136,6 +136,8 @@ update_live_mappings() {
   put_live_mapping enact-agent-rag-chunks '{"properties":{"filename":{"type":"keyword"}}}'
   put_live_mapping enact-knowledge-bases '{"properties":{"name":{"type":"text"},"updated_at":{"type":"date"}}}'
   put_live_mapping enact-agents '{"properties":{"name":{"type":"text"}}}'
+  put_live_mapping enact-conversations '{"properties":{"messages":{"properties":{"attachments":{"type":"keyword"}}}}}'
+  put_live_mapping enact-users '{"properties":{"avatar_key":{"type":"keyword"},"verification_token_hash":{"type":"keyword","index":false},"verification_expires_at":{"type":"date"}}}'
 }
 
 # put_live_mapping <index> <mapping-json>

@@ -15,6 +15,7 @@ import (
 	restful "github.com/emicklei/go-restful/v3"
 
 	"enact/internal/agents"
+	"enact/internal/cloudfront"
 	"enact/internal/conversations"
 	"enact/internal/inference"
 	"enact/internal/kb"
@@ -22,7 +23,9 @@ import (
 	"enact/internal/models"
 	"enact/internal/opensearch"
 	"enact/internal/s2s"
+	"enact/internal/s3"
 	"enact/internal/service"
+	"enact/internal/ses"
 	"enact/internal/users"
 )
 
@@ -39,6 +42,19 @@ type Config struct {
 	Agents        agents.ClientConfig
 	KB            kb.ClientConfig
 	S2S           s2s.Config
+	Storage       s3.Config
+	CDN           cloudfront.Config
+	SES           ses.Config
+
+	// VerificationEnabled requires local accounts to verify their email
+	// before they can log in (unverified = unauthenticated). Requires
+	// SES_FROM_EMAIL. Disable only for local development without AWS email.
+	VerificationEnabled bool `env:"EMAIL_VERIFICATION_ENABLED, default=true"`
+	// VerificationTTL bounds how long an emailed verification link is valid.
+	VerificationTTL time.Duration `env:"VERIFICATION_TTL, default=24h"`
+	// PublicBaseURL is this service's browser-reachable base URL, used to
+	// build the emailed verification links.
+	PublicBaseURL string `env:"PUBLIC_BASE_URL, default=http://localhost:8000"`
 
 	GoogleClientID     string `env:"GOOGLE_CLIENT_ID"`
 	GoogleClientSecret string `env:"GOOGLE_CLIENT_SECRET"`
@@ -101,6 +117,29 @@ func Build(cfg *Config) service.Builder {
 		modelsClient := models.NewClient(cfg.Models, s2sRuntime.Transport(nil, "enact-model-management"))
 		agentsClient := agents.NewClient(cfg.Agents, s2sRuntime.Transport(nil, "enact-agent-management-api"))
 		kbClient := kb.NewClient(cfg.KB, s2sRuntime.Transport(nil, "enact-kb-api"))
+		// Avatar storage: S3 for the objects, CloudFront (when configured)
+		// for the public URLs. Credential problems surface on first upload,
+		// not at startup, so the service runs without AWS configured.
+		storage, err := s3.NewClient(ctx, cfg.Storage)
+		if err != nil {
+			logger.Error("failed to create s3 client", "err", err)
+			return nil, err
+		}
+		cdn := cloudfront.New(cfg.CDN)
+		// Email verification fails closed: enabling it without a sender
+		// identity would strand every new registration unverified.
+		var mailer *ses.Client
+		if cfg.VerificationEnabled {
+			if cfg.SES.From == "" {
+				logger.Error("EMAIL_VERIFICATION_ENABLED requires SES_FROM_EMAIL (a verified SES identity), or set EMAIL_VERIFICATION_ENABLED=false")
+				return nil, fmt.Errorf("enactmain: email verification enabled without SES_FROM_EMAIL")
+			}
+			mailer, err = ses.NewClient(ctx, cfg.SES)
+			if err != nil {
+				logger.Error("failed to create ses client", "err", err)
+				return nil, err
+			}
+		}
 		google, err := newGoogleAuth(ctx, cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.OAuthRedirectURL)
 		if err != nil {
 			logger.Error("failed to initialize google auth", "err", err)
@@ -114,6 +153,11 @@ func Build(cfg *Config) service.Builder {
 		}
 
 		logger.Info("main service initialized",
+			"storage_bucket", cfg.Storage.Bucket,
+			"cdn_configured", cdn.Configured(),
+			"verification_enabled", cfg.VerificationEnabled,
+			"ses_from", cfg.SES.From,
+			"public_base_url", cfg.PublicBaseURL,
 			"redirect_url", cfg.OAuthRedirectURL,
 			"session_ttl", cfg.SessionTTL,
 			"secure_cookies", secure,
@@ -121,8 +165,12 @@ func Build(cfg *Config) service.Builder {
 			"frontend_url", cfg.FrontendURL,
 			"s2s_key_id", cfg.S2S.KeyID,
 		)
-		api := newMainAPI(userRepo, sessions, google, convRepo, inferenceClient, modelsClient, agentsClient, kbClient,
+		api := newMainAPI(userRepo, sessions, google, convRepo, inferenceClient, modelsClient, agentsClient, kbClient, storage, cdn,
 			cookieSettings{Secure: secure, SameSite: sameSite}, cfg.FrontendURL, logger)
+		api.mailer = mailer
+		api.verificationEnabled = cfg.VerificationEnabled
+		api.verificationTTL = cfg.VerificationTTL
+		api.publicBaseURL = strings.TrimRight(cfg.PublicBaseURL, "/")
 		services := api.WebServices()
 		if s2sRuntime.Enabled() {
 			for _, ws := range services {

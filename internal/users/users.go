@@ -30,6 +30,16 @@ type User struct {
 	PasswordHash  string    `json:"password_hash,omitempty"`
 	EmailVerified bool      `json:"email_verified"`
 	GoogleSub     string    `json:"google_sub,omitempty"`
+	// AvatarKey is the storage key of the user's avatar (empty when none).
+	// The public URL is derived from it at read time, so CDN reconfiguration
+	// never invalidates stored records.
+	AvatarKey string `json:"avatar_key,omitempty"`
+	// VerificationTokenHash is the SHA-256 (hex) of the pending email
+	// verification token — never the token itself, so a storage leak does
+	// not yield working verification links. Empty once verified.
+	VerificationTokenHash string `json:"verification_token_hash,omitempty"`
+	// VerificationExpiresAt bounds the pending token's validity.
+	VerificationExpiresAt time.Time `json:"verification_expires_at"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }

@@ -13,6 +13,7 @@ type Env struct {
 	KBAPIURL        string
 	InferenceAPIURL string
 	ModelsAPIURL    string
+	MainAPIURL      string
 
 	// UserID is sent as the X-User-Id header on every test request so test
 	// data stays isolated from real users' data.

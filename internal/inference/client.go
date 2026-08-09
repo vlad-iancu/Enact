@@ -29,14 +29,23 @@ type Message struct {
 	Content string `json:"content"`
 }
 
+// ContextFile is one ad-hoc document attached to a request; Content is the
+// file's raw bytes base64-encoded. The callee passes it to the model
+// natively as a Bedrock DocumentBlock.
+type ContextFile struct {
+	Filename string `json:"filename"`
+	Content  string `json:"content"`
+}
+
 // Request mirrors the inference API's request body. Exactly one of AgentID
 // or Model must be set (the callee validates).
 type Request struct {
-	AgentID       string    `json:"agent_id,omitempty"`
-	Model         string    `json:"model,omitempty"`
-	Messages      []Message `json:"messages"`
-	RetrievalTopK *int      `json:"retrieval_top_k,omitempty"`
-	Stream        bool      `json:"stream,omitempty"`
+	AgentID       string        `json:"agent_id,omitempty"`
+	Model         string        `json:"model,omitempty"`
+	Messages      []Message     `json:"messages"`
+	RetrievalTopK *int          `json:"retrieval_top_k,omitempty"`
+	ContextFiles  []ContextFile `json:"context_files,omitempty"`
+	Stream        bool          `json:"stream,omitempty"`
 }
 
 // StreamEvent is one SSE event from a streaming inference call. Event is

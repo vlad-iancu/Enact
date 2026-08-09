@@ -23,11 +23,15 @@ type Config struct {
 // AgentID/Model record what an assistant message was produced by (and, on a
 // user message, what it was addressed to).
 type Message struct {
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	AgentID   string    `json:"agent_id,omitempty"`
-	Model     string    `json:"model,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	AgentID string `json:"agent_id,omitempty"`
+	Model   string `json:"model,omitempty"`
+	// Attachments are the filenames of context files sent with this message.
+	// Only the names are persisted: the files are read by the model on the
+	// turn they were attached to; later turns do not re-send them.
+	Attachments []string  `json:"attachments,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Conversation is one user's message thread. MessageCount is denormalized so

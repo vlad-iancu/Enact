@@ -41,11 +41,25 @@ type Message struct {
 	Content string
 }
 
+// Document is a raw file the model reads natively via a Bedrock Converse
+// DocumentBlock. Data carries the file's exact bytes — no extraction happens
+// on our side. Format must be one of the Converse-supported formats (pdf,
+// csv, doc, docx, xls, xlsx, html, txt, md); Name must satisfy Bedrock's
+// document-name character rules (callers sanitize).
+type Document struct {
+	Name   string
+	Format string
+	Data   []byte
+}
+
 // ConverseRequest is the high-level input to Converse / ConverseStream.
+// Documents are attached to the LAST user message (Bedrock requires
+// documents to ride in a user turn).
 type ConverseRequest struct {
 	Model        string
 	Messages     []Message
 	SystemPrompt string
+	Documents    []Document
 	MaxTokens    int32
 	Temperature  *float32
 	TopP         *float32
@@ -87,6 +101,26 @@ func buildConverseParams(req *ConverseRequest) converseParams {
 			Role:    role,
 			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: m.Content}},
 		})
+	}
+
+	// Documents ride in the last user message, per the Converse API's
+	// contract; inference validates that one exists when documents are sent.
+	if len(req.Documents) > 0 {
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role != types.ConversationRoleUser {
+				continue
+			}
+			for _, d := range req.Documents {
+				msgs[i].Content = append(msgs[i].Content, &types.ContentBlockMemberDocument{
+					Value: types.DocumentBlock{
+						Format: types.DocumentFormat(d.Format),
+						Name:   aws.String(d.Name),
+						Source: &types.DocumentSourceMemberBytes{Value: d.Data},
+					},
+				})
+			}
+			break
+		}
 	}
 
 	p := converseParams{

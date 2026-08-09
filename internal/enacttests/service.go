@@ -37,6 +37,7 @@ type Config struct {
 	KBAPIURL        string `env:"KB_API_URL, default=http://localhost:8082"`
 	InferenceAPIURL string `env:"INFERENCE_API_URL, default=http://localhost:8080"`
 	ModelsAPIURL    string `env:"MODELS_API_URL, default=http://localhost:8081"`
+	MainAPIURL      string `env:"MAIN_API_URL, default=http://localhost:8000"`
 
 	// TestUserID isolates test data from real users.
 	TestUserID string `env:"TEST_USER_ID, default=integration-tests"`
@@ -60,6 +61,7 @@ func Build(cfg *Config) service.Builder {
 			KBAPIURL:        cfg.KBAPIURL,
 			InferenceAPIURL: cfg.InferenceAPIURL,
 			ModelsAPIURL:    cfg.ModelsAPIURL,
+			MainAPIURL:      cfg.MainAPIURL,
 			UserID:          cfg.TestUserID,
 			Timeout:         cfg.TestTimeout,
 		}

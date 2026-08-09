@@ -12,12 +12,15 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"enact/internal/agents"
+	"enact/internal/cloudfront"
 	"enact/internal/conversations"
 	"enact/internal/inference"
 	"enact/internal/kb"
 	"enact/internal/logging"
 	"enact/internal/models"
 	"enact/internal/requesthelper"
+	"enact/internal/s3"
+	"enact/internal/ses"
 	"enact/internal/users"
 )
 
@@ -35,14 +38,23 @@ type MainAPI struct {
 	models        *models.Client
 	agents        *agents.Client
 	kb            *kb.Client
+	storage       *s3.Client
+	cdn           *cloudfront.Resolver
 	cookies       cookieSettings
+	// Email verification: when enabled, local registrations start
+	// unverified, receive a mailed link, and cannot log in (i.e. are not
+	// authenticated) until verified.
+	mailer              *ses.Client
+	verificationEnabled bool
+	verificationTTL     time.Duration
+	publicBaseURL       string
 	// frontendURL, when set, is where browser flows land after auth (an
 	// external SPA origin); empty means the built-in pages.
 	frontendURL string
 	logger      *logging.Logger
 }
 
-func newMainAPI(userRepo *users.Repository, sessions *SessionStore, google *googleAuth, convRepo *conversations.Repository, inferenceClient *inference.Client, modelsClient *models.Client, agentsClient *agents.Client, kbClient *kb.Client, cookies cookieSettings, frontendURL string, logger *logging.Logger) *MainAPI {
+func newMainAPI(userRepo *users.Repository, sessions *SessionStore, google *googleAuth, convRepo *conversations.Repository, inferenceClient *inference.Client, modelsClient *models.Client, agentsClient *agents.Client, kbClient *kb.Client, storage *s3.Client, cdn *cloudfront.Resolver, cookies cookieSettings, frontendURL string, logger *logging.Logger) *MainAPI {
 	return &MainAPI{
 		users:         userRepo,
 		sessions:      sessions,
@@ -52,6 +64,8 @@ func newMainAPI(userRepo *users.Repository, sessions *SessionStore, google *goog
 		models:        modelsClient,
 		agents:        agentsClient,
 		kb:            kbClient,
+		storage:       storage,
+		cdn:           cdn,
 		cookies:       cookies,
 		frontendURL:   strings.TrimRight(frontendURL, "/"),
 		logger:        logger,
@@ -101,26 +115,44 @@ type registerRequest struct {
 	Password    string `json:"password"`
 }
 
+// registerPendingResponse acknowledges a registration that awaits email
+// verification; no session was created.
+type registerPendingResponse struct {
+	Email                string `json:"email"`
+	VerificationRequired bool   `json:"verification_required"`
+	// EmailSent is false when the verification email could not be sent
+	// (e.g. SES misconfigured); POST /auth/resend-verification retries.
+	EmailSent bool `json:"email_sent"`
+}
+
 type loginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
 
 // userResponse is the public shape of an account: exactly the fields the
-// platform cares about, never the password hash.
+// platform cares about, never the password hash. AvatarURL is derived from
+// the stored storage key at read time.
 type userResponse struct {
 	ID            string `json:"id"`
 	Email         string `json:"email"`
 	DisplayName   string `json:"display_name"`
 	EmailVerified bool   `json:"email_verified"`
+	AvatarURL     string `json:"avatar_url,omitempty"`
 }
 
 type errorResponse struct {
 	Error string `json:"error"`
 }
 
-func toUserResponse(u users.User) userResponse {
-	return userResponse{ID: u.ID, Email: u.Email, DisplayName: u.DisplayName, EmailVerified: u.EmailVerified}
+func (a *MainAPI) toUserResponse(u users.User) userResponse {
+	return userResponse{
+		ID:            u.ID,
+		Email:         u.Email,
+		DisplayName:   u.DisplayName,
+		EmailVerified: u.EmailVerified,
+		AvatarURL:     a.avatarURL(u.AvatarKey),
+	}
 }
 
 // WebServices returns the route groups. Distinct root paths are separate
@@ -167,6 +199,27 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 		Returns(http.StatusOK, "OK", userResponse{}).
 		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
 
+	auth.Route(auth.GET("/verify").
+		To(a.verifyEmail).
+		Param(auth.QueryParameter("email", "account email")).
+		Param(auth.QueryParameter("token", "verification token from the email")).
+		Doc("Email verification link target: marks the account verified and redirects to the login page"))
+
+	auth.Route(auth.POST("/resend-verification").
+		To(a.resendVerification).
+		Consumes(restful.MIME_JSON).
+		Doc("Re-send the verification email; always 204 so account existence is not revealed").
+		Returns(http.StatusNoContent, "Accepted", nil))
+
+	auth.Route(auth.POST("/me/avatar").
+		To(a.uploadAvatar).
+		Consumes("multipart/form-data").
+		Param(auth.FormParameter("file", "the avatar image (jpeg/png/webp/gif, max 5 MiB)").DataType("file").Required(true)).
+		Doc("Upload the logged-in user's avatar; stored under an unguessable key and returned as avatar_url on /auth/me").
+		Returns(http.StatusOK, "OK", userResponse{}).
+		Returns(http.StatusBadRequest, "Invalid image", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
 	callback := new(restful.WebService)
 	callback.Path("/google")
 	callback.Route(callback.GET("/oauth/callback").
@@ -190,7 +243,7 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 	return []*restful.WebService{
 		auth, callback, app, login,
 		a.conversationsWebService(), a.modelsWebService(),
-		a.agentsWebService(), a.kbWebService(),
+		a.agentsWebService(), a.kbWebService(), a.inferenceWebService(),
 	}
 }
 
@@ -281,7 +334,11 @@ func (a *MainAPI) upsertGoogleUser(req *restful.Request, identity googleIdentity
 		user.DisplayName = identity.Name
 	}
 	user.GoogleSub = identity.Sub
+	// Google asserts the address is verified; any pending local
+	// verification token becomes moot.
 	user.EmailVerified = true
+	user.VerificationTokenHash = ""
+	user.VerificationExpiresAt = time.Time{}
 	user.UpdatedAt = now
 	if err := a.users.Save(ctx, user); err != nil {
 		return users.User{}, err
@@ -347,10 +404,10 @@ func (a *MainAPI) register(req *restful.Request, resp *restful.Response) {
 		Email:        email,
 		DisplayName:  body.DisplayName,
 		PasswordHash: string(hash),
-		// No verification-email infrastructure exists; local registrations
-		// are trusted. Replace with a real verification flow before any
-		// non-local deployment.
-		EmailVerified: true,
+		// With verification enabled the account starts unverified and the
+		// user is NOT authenticated (no session) until the emailed link is
+		// opened; login rejects unverified accounts.
+		EmailVerified: !a.verificationEnabled,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
@@ -359,7 +416,23 @@ func (a *MainAPI) register(req *restful.Request, resp *restful.Response) {
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to register")
 		return
 	}
-	logger.Info("user registered", "user_id", user.ID)
+	logger.Info("user registered", "user_id", user.ID, "email_verified", user.EmailVerified)
+
+	if a.verificationEnabled {
+		emailSent := true
+		if err := a.sendVerificationEmail(req, logger, user); err != nil {
+			// The account exists; a failed send is recoverable through the
+			// resend endpoint once SES is reachable/configured.
+			logger.Error("failed to send verification email", "err", err)
+			emailSent = false
+		}
+		requesthelper.WriteJSON(req, resp, http.StatusCreated, registerPendingResponse{
+			Email:                user.Email,
+			VerificationRequired: true,
+			EmailSent:            emailSent,
+		})
+		return
+	}
 
 	sess, err := a.sessions.Create(user.ID, user.Email, user.DisplayName)
 	if err != nil {
@@ -369,7 +442,7 @@ func (a *MainAPI) register(req *restful.Request, resp *restful.Response) {
 	}
 	setSessionCookie(resp.ResponseWriter, sess, a.cookies)
 	logger.Info("session created", "user_id", user.ID)
-	requesthelper.WriteJSON(req, resp, http.StatusCreated, toUserResponse(user))
+	requesthelper.WriteJSON(req, resp, http.StatusCreated, a.toUserResponse(user))
 }
 
 func (a *MainAPI) login(req *restful.Request, resp *restful.Response) {
@@ -407,10 +480,11 @@ func (a *MainAPI) login(req *restful.Request, resp *restful.Response) {
 	}
 	logger.Info("password verified", "user_id", user.ID)
 
-	// The platform authorizes only verified email addresses.
+	// The platform authorizes only verified email addresses: an unverified
+	// account is treated as unauthenticated.
 	if !user.EmailVerified {
 		logger.Warn("login rejected: email not verified", "user_id", user.ID)
-		requesthelper.WriteError(req, resp, http.StatusForbidden, "email address is not verified")
+		requesthelper.WriteError(req, resp, http.StatusForbidden, "email address is not verified; open the link in your verification email or request a new one")
 		return
 	}
 
@@ -422,7 +496,7 @@ func (a *MainAPI) login(req *restful.Request, resp *restful.Response) {
 	}
 	setSessionCookie(resp.ResponseWriter, sess, a.cookies)
 	logger.Info("session created", "user_id", user.ID)
-	requesthelper.WriteJSON(req, resp, http.StatusOK, toUserResponse(user))
+	requesthelper.WriteJSON(req, resp, http.StatusOK, a.toUserResponse(user))
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +527,7 @@ func (a *MainAPI) me(req *restful.Request, resp *restful.Response) {
 		requesthelper.WriteError(req, resp, http.StatusUnauthorized, "not logged in")
 		return
 	}
-	requesthelper.WriteJSON(req, resp, http.StatusOK, toUserResponse(user))
+	requesthelper.WriteJSON(req, resp, http.StatusOK, a.toUserResponse(user))
 }
 
 // appPage is the session-guarded homepage: with a session it renders, else

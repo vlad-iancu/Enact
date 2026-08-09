@@ -1,10 +1,12 @@
 package enactmodelinference
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	restful "github.com/emicklei/go-restful/v3"
@@ -26,6 +28,22 @@ const (
 	defaultRetrievalTopK = 5
 	maxRetrievalTopK     = 50
 )
+
+// Ad-hoc context files become Bedrock DocumentBlocks: the Converse API
+// allows at most 5 documents of ~4.5 MB each per request, and the model
+// re-reads them (and the caller re-pays their tokens) on every request that
+// carries them.
+const (
+	maxContextFiles     = 5
+	maxContextFileBytes = 4_500_000
+)
+
+// documentFormats maps file extensions to the Converse document formats.
+var documentFormats = map[string]string{
+	".pdf": "pdf", ".csv": "csv", ".doc": "doc", ".docx": "docx",
+	".xls": "xls", ".xlsx": "xlsx", ".html": "html", ".htm": "html",
+	".txt": "txt", ".md": "md",
+}
 
 // InferenceAPI provides endpoints for running inference requests. When a
 // request carries an agent_id, the API resolves the agent's model and system
@@ -56,7 +74,7 @@ func (a *InferenceAPI) WebService() *restful.WebService {
 
 	ws.Route(ws.POST("/inference").
 		To(a.infer).
-		Doc("Run a Bedrock inference request").
+		Doc("Run a Bedrock inference request. context_files (base64 content, max 5 files of 4.5MB) are passed to the model natively as Converse DocumentBlocks on the last user message").
 		Reads(InferenceRequest{}).
 		Returns(http.StatusOK, "OK", InferenceResponse{}).
 		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
@@ -86,6 +104,21 @@ func (a *InferenceAPI) infer(req *restful.Request, resp *restful.Response) {
 		writeError(req, resp, http.StatusBadRequest, fmt.Sprintf("retrieval_top_k must be between 1 and %d", maxRetrievalTopK))
 		return
 	}
+	documents, docErr := convertContextFiles(body)
+	if docErr != "" {
+		logger.Warn("invalid context files", "err", docErr, "files", len(body.ContextFiles))
+		writeError(req, resp, http.StatusBadRequest, docErr)
+		return
+	}
+	if len(documents) > 0 {
+		names := make([]string, len(documents))
+		total := 0
+		for i, d := range documents {
+			names[i] = d.Name + "." + d.Format
+			total += len(d.Data)
+		}
+		logger.Info("context files accepted", "files", names, "total_bytes", total)
+	}
 
 	logger.Info("inference request decoded",
 		"messages", len(body.Messages),
@@ -93,6 +126,7 @@ func (a *InferenceAPI) infer(req *restful.Request, resp *restful.Response) {
 		"retrieval_top_k", body.RetrievalTopK,
 	)
 	bedReq := toBedrockRequest(&body)
+	bedReq.Documents = documents
 	logger = logger.WithFields(
 		"model", bedReq.Model,
 		"top_p", bedReq.TopP,
@@ -152,6 +186,81 @@ func (a *InferenceAPI) infer(req *restful.Request, resp *restful.Response) {
 		InputTokens:  out.InputTokens,
 		OutputTokens: out.OutputTokens,
 	})
+}
+
+// convertContextFiles validates a request's context files and converts them
+// into Bedrock documents: count and per-file size caps, format derived from
+// the filename extension, base64 decoding, name sanitization per Bedrock's
+// document-name rules, and the requirement of a user message to carry them.
+// A non-empty string return is the client-facing validation error.
+func convertContextFiles(body InferenceRequest) ([]bedrock.Document, string) {
+	if len(body.ContextFiles) == 0 {
+		return nil, ""
+	}
+	if len(body.ContextFiles) > maxContextFiles {
+		return nil, fmt.Sprintf("at most %d context files are allowed", maxContextFiles)
+	}
+	hasUser := false
+	for _, m := range body.Messages {
+		if m.Role == "user" {
+			hasUser = true
+			break
+		}
+	}
+	if !hasUser {
+		return nil, "context files require at least one user message to attach to"
+	}
+
+	docs := make([]bedrock.Document, 0, len(body.ContextFiles))
+	for i, f := range body.ContextFiles {
+		ext := strings.ToLower(filepath.Ext(f.Filename))
+		format, ok := documentFormats[ext]
+		if !ok {
+			return nil, fmt.Sprintf("unsupported context file type %q (supported: pdf, csv, doc, docx, xls, xlsx, html, txt, md)", ext)
+		}
+		data, err := base64.StdEncoding.DecodeString(f.Content)
+		if err != nil {
+			return nil, fmt.Sprintf("context file %q content is not valid base64", f.Filename)
+		}
+		if len(data) == 0 {
+			return nil, fmt.Sprintf("context file %q is empty", f.Filename)
+		}
+		if len(data) > maxContextFileBytes {
+			return nil, fmt.Sprintf("context file %q exceeds the %d-byte limit", f.Filename, maxContextFileBytes)
+		}
+		docs = append(docs, bedrock.Document{
+			Name:   sanitizeDocumentName(f.Filename, i),
+			Format: format,
+			Data:   data,
+		})
+	}
+	return docs, ""
+}
+
+// sanitizeDocumentName maps a filename onto Bedrock's document-name rules:
+// only alphanumerics, single spaces, hyphens, parentheses and brackets.
+func sanitizeDocumentName(filename string, index int) string {
+	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	var b strings.Builder
+	lastSpace := false
+	for _, r := range base {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '-' || r == '(' || r == ')' || r == '[' || r == ']':
+			b.WriteRune(r)
+			lastSpace = false
+		case r == ' ' || r == '_' || r == '.':
+			if !lastSpace {
+				b.WriteRune(' ')
+			}
+			lastSpace = true
+		}
+	}
+	name := strings.TrimSpace(b.String())
+	if name == "" {
+		name = fmt.Sprintf("document-%d", index+1)
+	}
+	return name
 }
 
 // applyAgent loads the agent referenced by body.AgentID, resolves its model,

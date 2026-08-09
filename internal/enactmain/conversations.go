@@ -43,7 +43,15 @@ type addMessageRequest struct {
 	AgentID       string `json:"agent_id,omitempty"`
 	Model         string `json:"model,omitempty"`
 	RetrievalTopK *int   `json:"retrieval_top_k,omitempty"`
+	// ContextFiles are forwarded to the inference service, which passes
+	// them to the model natively (Bedrock DocumentBlocks) for THIS turn.
+	// Only their filenames are persisted on the message.
+	ContextFiles []inference.ContextFile `json:"context_files,omitempty"`
 }
+
+// maxMessageContextFiles mirrors the inference service's cap so the obvious
+// violation fails as a clean 400 before the SSE stream starts.
+const maxMessageContextFiles = 5
 
 // conversationsWebService returns the session-guarded conversation routes.
 func (a *MainAPI) conversationsWebService() *restful.WebService {
@@ -243,7 +251,11 @@ func (a *MainAPI) addMessage(req *restful.Request, resp *restful.Response) {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v", err))
 		return
 	}
-	logger.Info("message decoded", "content_chars", len(body.Content), "agent_id", body.AgentID, "model", body.Model, "retrieval_top_k", body.RetrievalTopK)
+	attachmentNames := make([]string, 0, len(body.ContextFiles))
+	for _, f := range body.ContextFiles {
+		attachmentNames = append(attachmentNames, f.Filename)
+	}
+	logger.Info("message decoded", "content_chars", len(body.Content), "agent_id", body.AgentID, "model", body.Model, "retrieval_top_k", body.RetrievalTopK, "attachments", attachmentNames)
 
 	if strings.TrimSpace(body.Content) == "" {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, "content must not be empty")
@@ -251,6 +263,10 @@ func (a *MainAPI) addMessage(req *restful.Request, resp *restful.Response) {
 	}
 	if (body.AgentID == "") == (body.Model == "") {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, "exactly one of agent_id or model must be set")
+		return
+	}
+	if len(body.ContextFiles) > maxMessageContextFiles {
+		requesthelper.WriteError(req, resp, http.StatusBadRequest, fmt.Sprintf("at most %d context files are allowed", maxMessageContextFiles))
 		return
 	}
 
@@ -269,11 +285,12 @@ func (a *MainAPI) addMessage(req *restful.Request, resp *restful.Response) {
 
 	now := time.Now().UTC()
 	conv.Messages = append(conv.Messages, conversations.Message{
-		Role:      "user",
-		Content:   body.Content,
-		AgentID:   body.AgentID,
-		Model:     body.Model,
-		CreatedAt: now,
+		Role:        "user",
+		Content:     body.Content,
+		AgentID:     body.AgentID,
+		Model:       body.Model,
+		Attachments: attachmentNames,
+		CreatedAt:   now,
 	})
 	if conv.Title == "" || conv.Title == "New conversation" {
 		conv.Title = deriveTitle(body.Content)
@@ -284,71 +301,30 @@ func (a *MainAPI) addMessage(req *restful.Request, resp *restful.Response) {
 		AgentID:       body.AgentID,
 		Model:         body.Model,
 		RetrievalTopK: body.RetrievalTopK,
-		Messages:      make([]inference.Message, 0, len(conv.Messages)),
+		// Files attach to the last user message downstream — the one just
+		// appended. Only this turn carries them; history replays never do.
+		ContextFiles: body.ContextFiles,
+		Messages:     make([]inference.Message, 0, len(conv.Messages)),
 	}
 	for _, m := range conv.Messages {
 		infReq.Messages = append(infReq.Messages, inference.Message{Role: m.Role, Content: m.Content})
 	}
 
-	flusher, ok := resp.ResponseWriter.(http.Flusher)
-	if !ok {
-		logger.Error("streaming not supported by underlying writer")
-		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "streaming not supported")
-		return
-	}
-	resp.Header().Set("Content-Type", "text/event-stream")
-	resp.Header().Set("Cache-Control", "no-cache")
-	resp.Header().Set("X-Accel-Buffering", "no")
-	meta := requesthelper.MetaFrom(req.Request.Context())
-	resp.Header().Set("X-Trace-Id", meta.TraceID)
-	resp.WriteHeader(http.StatusOK)
-	// The first SSE event carries the conversation id and trace id, so a
-	// client that just created the conversation (or a browser that cannot
-	// read headers) has both without a second request.
-	if metaBody, err := json.Marshal(map[string]any{"conversation_id": conv.ID, "trace_id": meta.TraceID}); err == nil {
-		_, _ = fmt.Fprintf(resp, "event: meta\ndata: %s\n\n", metaBody)
-		flusher.Flush()
-	}
-
-	// Relay the upstream SSE stream, accumulating the assistant's text.
-	var assistant strings.Builder
-	streamErr := a.inference.Stream(req.Request.Context(), infReq, func(ev inference.StreamEvent) error {
-		switch ev.Event {
-		case "message":
-			var chunk struct {
-				Delta string `json:"delta"`
-			}
-			if err := json.Unmarshal([]byte(ev.Data), &chunk); err == nil && chunk.Delta != "" {
-				assistant.WriteString(chunk.Delta)
-			}
-			_, err := fmt.Fprintf(resp, "data: %s\n\n", ev.Data)
-			flusher.Flush()
-			return err
-		case "error":
-			_, err := fmt.Fprintf(resp, "event: error\ndata: %s\n\n", ev.Data)
-			flusher.Flush()
-			return err
-		default:
-			// Upstream meta (inference's own trace event) is not relayed:
-			// this response has its own meta event of the same trace.
-			return nil
-		}
-	})
+	// The meta event carries the conversation id so a client that just
+	// created the conversation has it without a second request.
+	assistant, streamErr := a.relayInferenceStream(req, resp, logger, infReq, map[string]any{"conversation_id": conv.ID})
 	if streamErr != nil {
-		logger.Error("inference stream failed", "err", streamErr, "assistant_chars", assistant.Len())
-		errBody, _ := json.Marshal(map[string]any{"error": streamErr.Error(), "meta": requesthelper.MetaFrom(req.Request.Context())})
-		_, _ = fmt.Fprintf(resp, "event: error\ndata: %s\n\n", errBody)
-		flusher.Flush()
+		logger.Warn("stream ended with error; persisting partial result", "assistant_chars", len(assistant))
 	}
-	logger.Info("stream relayed", "assistant_chars", assistant.Len())
+	logger.Info("stream relayed", "assistant_chars", len(assistant))
 
 	// Persist: the user message always; the assistant message when any text
 	// arrived. Saving must survive the browser hanging up mid-stream, so it
 	// does not use the (possibly cancelled) request context.
-	if assistant.Len() > 0 {
+	if len(assistant) > 0 {
 		conv.Messages = append(conv.Messages, conversations.Message{
 			Role:      "assistant",
-			Content:   assistant.String(),
+			Content:   assistant,
 			AgentID:   body.AgentID,
 			Model:     body.Model,
 			CreatedAt: time.Now().UTC(),

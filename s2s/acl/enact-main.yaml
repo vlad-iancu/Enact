@@ -18,6 +18,12 @@ rules:
     allow: [anonymous, "*"]
   - route: "GET /auth/me"
     allow: [anonymous, "*"]
+  - route: "POST /auth/me/avatar"
+    allow: [anonymous, "*"]
+  - route: "GET /auth/verify"
+    allow: [anonymous, "*"]
+  - route: "POST /auth/resend-verification"
+    allow: [anonymous, "*"]
   - route: "GET /app"
     allow: [anonymous, "*"]
   - route: "GET /login"
@@ -36,6 +42,8 @@ rules:
   - route: "POST /conversations/{id}/messages"
     allow: [anonymous, "*"]
   - route: "GET /models"
+    allow: [anonymous, "*"]
+  - route: "POST /inference"
     allow: [anonymous, "*"]
 
   # Agent & knowledge-base management: browser-facing; sessions authenticate
