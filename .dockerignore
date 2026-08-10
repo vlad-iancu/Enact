@@ -1,0 +1,17 @@
+# Keep the image build context free of secrets and host-only artifacts.
+# dist/ holds built binaries, real env files and an OAuth client secret;
+# s2s/ holds private keys; deploy/ and mappings/ are host-side only.
+.git/
+.idea/
+.DS_Store
+dist/
+deploy/
+docs/
+mappings/
+s2s/
+scripts/
+.env
+*.env
+README.md
+Dockerfile
+.dockerignore

@@ -34,6 +34,7 @@ func All() []utils.Factory {
 		NewMainModelsList,
 		NewMainInferenceValidation,
 		NewMainAvatarValidation,
+		NewMainAdminUserManagement,
 
 		// Model catalogue
 		NewModelsList,

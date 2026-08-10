@@ -1,0 +1,261 @@
+# The enact deployment stack: the seven Go services PLUS the full
+# infrastructure they depend on — OpenSearch (+ Dashboards), Redis, Tika.
+# One `docker compose up -d` on a VM brings up the whole platform; only
+# AWS (Bedrock/S3/SES/CloudFront) remains external.
+#
+# Explicit project name: docker-compose.infra.yml has none (its project is
+# the directory name "deploy") and the LGTM stack is "enact-lgtm"; without
+# a distinct name this file would collide with the infra project.
+#
+# Interpolated variables (from a .env beside this file, or the shell):
+#   ENACT_REGISTRY       image prefix, e.g. ghcr.io/<owner>     (required)
+#   ENACT_TAG            image tag, e.g. a git SHA              (default: latest)
+#   OPENSEARCH_PASSWORD  admin password for the in-stack cluster (required)
+#
+# Uncommitted env files expected next to this file (copy from *.example):
+#   app.env         AWS credentials + platform settings (all services)
+#   enact-main.env  browser-facing secrets (enact-main only — FRONTEND_URL
+#                   lives here so CORS is not enabled fleet-wide)
+# Infrastructure endpoints are wired below via the x-infra-env anchor and
+# are not read from app.env (compose `environment:` wins over env_file).
+#
+# First boot: the Go services verify their indices at startup, so provision
+# the cluster once (idempotent) before/while they crash-loop into health:
+#
+#   docker compose -f docker-compose.app.yml up -d opensearch
+#   OPENSEARCH_ADDRESSES=https://127.0.0.1:9200 \
+#     OPENSEARCH_PASSWORD=<password> ./scripts/infrastructure.sh provision
+#   docker compose -f docker-compose.app.yml up -d
+#
+# S2S key material is bind-mounted from ./s2s (read-only) and loaded via
+# the S2S_*_FILE variables; the images ship no dotenv files, so container
+# environment is the only configuration source. The mount must be readable
+# by uid 65532 (distroless nonroot).
+#
+# Published ports: enact-main (8000) publicly; enact-tests (8006),
+# OpenSearch (9200, for provisioning/debugging) and Dashboards (5601) on
+# loopback only — reach them through an SSH tunnel. A TLS reverse proxy in
+# front of 8000 is out of scope here.
+name: enact-app
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  volumes:
+    - ./s2s:/s2s:ro
+  env_file:
+    - app.env
+
+# Connection settings for the in-stack infrastructure, merged into every
+# service's environment. The self-signed OpenSearch certificate makes
+# INSECURE_SKIP_VERIFY=true correct here (traffic never leaves the compose
+# network).
+x-infra-env: &infra-env
+  OPENSEARCH_ADDRESSES: https://opensearch:9200
+  OPENSEARCH_USERNAME: admin
+  OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:?set OPENSEARCH_PASSWORD in deploy/.env}
+  OPENSEARCH_INSECURE_SKIP_VERIFY: "true"
+  REDIS_ADDR: redis:6379
+
+services:
+  # --- Infrastructure -------------------------------------------------------
+
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      # Sized for a small VM; raise on hosts with more memory to spare.
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_PASSWORD:?set OPENSEARCH_PASSWORD in deploy/.env}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk -u admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD} https://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    restart: unless-stopped
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      - 'OPENSEARCH_HOSTS=["https://opensearch:9200"]'
+      - OPENSEARCH_USERNAME=admin
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD:?set OPENSEARCH_PASSWORD in deploy/.env}
+      - OPENSEARCH_SSL_VERIFICATIONMODE=none
+    ports:
+      - "127.0.0.1:5601:5601"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  tika:
+    image: apache/tika:2.9.2.1-full
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9998/tika >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # --- Services -------------------------------------------------------------
+
+  enact-main:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-main:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    env_file:
+      - app.env
+      - enact-main.env
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-main
+      SERVICE_PORT: "8000"
+      INFERENCE_API_URL: http://enact-model-inference:8004
+      MODELS_API_URL: http://enact-model-management:8005
+      AGENT_API_URL: http://enact-agent-management-api:8001
+      KB_API_URL: http://enact-kb-api:8002
+      S2S_KEY_ID: enact-main
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-main.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-main.key
+
+  enact-agent-management-api:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-agent-management-api:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-agent-management-api
+      SERVICE_PORT: "8001"
+      KB_API_URL: http://enact-kb-api:8002
+      S2S_KEY_ID: enact-agent-management-api
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-agent-management-api.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-agent-management-api.key
+
+  enact-kb-api:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-kb-api:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-kb-api
+      SERVICE_PORT: "8002"
+      S2S_KEY_ID: enact-kb-api
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-kb-api.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-kb-api.key
+
+  enact-kb-document-indexer:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-kb-document-indexer:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tika:
+        condition: service_healthy
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-kb-document-indexer
+      SERVICE_PORT: "8003"
+      TIKA_URL: http://tika:9998
+      S2S_KEY_ID: enact-kb-document-indexer
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-kb-document-indexer.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-kb-document-indexer.key
+
+  enact-model-inference:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-model-inference:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-model-inference
+      SERVICE_PORT: "8004"
+      KB_API_URL: http://enact-kb-api:8002
+      AGENT_API_URL: http://enact-agent-management-api:8001
+      S2S_KEY_ID: enact-model-inference
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-model-inference.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-model-inference.key
+
+  enact-model-management:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-model-management:${ENACT_TAG:-latest}
+    environment:
+      SERVICE_NAME: enact-model-management
+      SERVICE_PORT: "8005"
+      S2S_KEY_ID: enact-model-management
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-model-management.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-model-management.key
+
+  enact-tests:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-tests:${ENACT_TAG:-latest}
+    ports:
+      - "127.0.0.1:8006:8006"
+    environment:
+      SERVICE_NAME: enact-tests
+      SERVICE_PORT: "8006"
+      AGENT_API_URL: http://enact-agent-management-api:8001
+      KB_API_URL: http://enact-kb-api:8002
+      INFERENCE_API_URL: http://enact-model-inference:8004
+      MODELS_API_URL: http://enact-model-management:8005
+      MAIN_API_URL: http://enact-main:8000
+      S2S_KEY_ID: enact-tests
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-tests.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-tests.key
+      S2S_PRIVATE_KEYS_FILE: /s2s/private-keys.yaml
+
+volumes:
+  opensearch-data:
+  redis-data:

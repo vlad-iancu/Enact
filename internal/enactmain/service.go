@@ -163,6 +163,7 @@ func Build(cfg *Config) service.Builder {
 			"secure_cookies", secure,
 			"cookie_samesite", cfg.CookieSameSite,
 			"frontend_url", cfg.FrontendURL,
+			"admin_email", cfg.AdminEmail,
 			"s2s_key_id", cfg.S2S.KeyID,
 		)
 		api := newMainAPI(userRepo, sessions, google, convRepo, inferenceClient, modelsClient, agentsClient, kbClient, storage, cdn,
@@ -171,6 +172,7 @@ func Build(cfg *Config) service.Builder {
 		api.verificationEnabled = cfg.VerificationEnabled
 		api.verificationTTL = cfg.VerificationTTL
 		api.publicBaseURL = strings.TrimRight(cfg.PublicBaseURL, "/")
+		api.adminEmail = users.NormalizeEmail(cfg.AdminEmail)
 		services := api.WebServices()
 		if s2sRuntime.Enabled() {
 			for _, ws := range services {

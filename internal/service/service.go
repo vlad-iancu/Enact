@@ -95,6 +95,12 @@ type Config struct {
 	// entirely (same-origin or non-browser services).
 	FrontendURL string `env:"FRONTEND_URL"`
 
+	// AdminEmail designates the platform administrator's account by email.
+	// It is a common setting so every service agrees on the identity;
+	// enact-main grants that account the /admin endpoints and reports
+	// is_admin on /auth/me. Empty means no administrator.
+	AdminEmail string `env:"ADMIN_EMAIL"`
+
 	// Telemetry configures the OpenTelemetry export to the LGTM stack. Its
 	// env-tagged fields are populated by the same Load call as the rest of
 	// Config, so every service picks up telemetry settings automatically.

@@ -23,7 +23,7 @@ INFRA := ./scripts/infrastructure.sh
 START := ./scripts/start-services.sh
 STOP  := ./scripts/stop-services.sh
 
-.PHONY: all build clean test vet tidy infrastructure-up infrastructure-down infrastructure-clean observability-up observability-down start stop restart s2s-keygen FORCE
+.PHONY: all build clean test vet tidy infrastructure-up infrastructure-down infrastructure-clean observability-up observability-down start stop restart s2s-keygen docker-build docker-build-local docker-push docker-deploy FORCE
 
 LGTM := docker compose -f deploy/docker-compose.lgtm.yml
 
@@ -99,3 +99,57 @@ restart: stop build start
 # s2s/keys/ (gitignored) and the public JWKS at s2s/jwks.yaml. Idempotent.
 s2s-keygen:
 	go run ./scripts/s2s-keygen
+
+# --- Docker images ----------------------------------------------------------
+# One image per service from the single root Dockerfile (--build-arg SERVICE).
+# REGISTRY is the image prefix (e.g. ghcr.io/<owner>); TAG defaults to the
+# short git SHA. Deployment images target linux/amd64 (cloud VMs) — the Go
+# toolchain cross-compiles natively, no emulation.
+REGISTRY ?=
+TAG      ?= $(shell git rev-parse --short HEAD)
+
+# Fails fast when REGISTRY is unset instead of producing images named "/x".
+check-registry:
+	@[ -n "$(REGISTRY)" ] || { echo "ERROR: set REGISTRY, e.g. make docker-build REGISTRY=ghcr.io/<owner>"; exit 1; }
+.PHONY: check-registry
+
+# Build linux/amd64 images for every service, tagged :$(TAG) and :latest.
+docker-build: check-registry
+	for svc in $(CMDS); do \
+		docker buildx build --platform linux/amd64 --build-arg SERVICE=$$svc \
+			-t $(REGISTRY)/$$svc:$(TAG) -t $(REGISTRY)/$$svc:latest --load . || exit 1; \
+	done
+
+# Native-architecture images loaded into the local docker engine, tagged
+# :dev — for smoke-testing the compose stack on this machine.
+docker-build-local: check-registry
+	for svc in $(CMDS); do \
+		docker buildx build --build-arg SERVICE=$$svc \
+			-t $(REGISTRY)/$$svc:dev --load . || exit 1; \
+	done
+
+# Build and push linux/amd64 images (buildx builds and pushes in one step).
+docker-push: check-registry
+	for svc in $(CMDS); do \
+		docker buildx build --platform linux/amd64 --build-arg SERVICE=$$svc \
+			-t $(REGISTRY)/$$svc:$(TAG) -t $(REGISTRY)/$$svc:latest --push . || exit 1; \
+	done
+
+# Sync the compose file and S2S material to the VM and roll the stack.
+# Env files (app.env, enact-main.env, .env) are deliberately NOT synced —
+# they are created once on the VM from the deploy/*.example files. The s2s
+# mount must be readable by the distroless nonroot uid (65532), so the
+# remote step re-applies ownership after every sync (needs passwordless
+# sudo; otherwise run the chown on the VM manually).
+# Usage: make docker-deploy VM=user@host [VM_DIR=/opt/enact]
+VM     ?=
+VM_DIR ?= /opt/enact
+docker-deploy:
+	@[ -n "$(VM)" ] || { echo "ERROR: set VM, e.g. make docker-deploy VM=user@host"; exit 1; }
+	rsync -av deploy/docker-compose.app.yml $(VM):$(VM_DIR)/
+	rsync -av scripts/infrastructure.sh $(VM):$(VM_DIR)/scripts/
+	rsync -av mappings $(VM):$(VM_DIR)/
+	rsync -av s2s $(VM):$(VM_DIR)/
+	ssh $(VM) "cd $(VM_DIR) \
+		&& { sudo -n chown -R 65532:65532 s2s && sudo -n chmod -R u=rX,go= s2s || echo 'WARNING: fix s2s ownership manually: sudo chown -R 65532:65532 $(VM_DIR)/s2s'; } \
+		&& docker compose -f docker-compose.app.yml pull && docker compose -f docker-compose.app.yml up -d"

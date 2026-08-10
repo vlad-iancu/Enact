@@ -51,7 +51,15 @@ type MainAPI struct {
 	// frontendURL, when set, is where browser flows land after auth (an
 	// external SPA origin); empty means the built-in pages.
 	frontendURL string
-	logger      *logging.Logger
+	// adminEmail (normalized) designates the administrator account: it gets
+	// the /admin endpoints and is_admin=true on /auth/me. Empty means none.
+	adminEmail string
+	logger     *logging.Logger
+}
+
+// isAdmin reports whether the given account email is the administrator.
+func (a *MainAPI) isAdmin(email string) bool {
+	return a.adminEmail != "" && users.NormalizeEmail(email) == a.adminEmail
 }
 
 func newMainAPI(userRepo *users.Repository, sessions *SessionStore, google *googleAuth, convRepo *conversations.Repository, inferenceClient *inference.Client, modelsClient *models.Client, agentsClient *agents.Client, kbClient *kb.Client, storage *s3.Client, cdn *cloudfront.Resolver, cookies cookieSettings, frontendURL string, logger *logging.Logger) *MainAPI {
@@ -138,7 +146,9 @@ type userResponse struct {
 	Email         string `json:"email"`
 	DisplayName   string `json:"display_name"`
 	EmailVerified bool   `json:"email_verified"`
-	AvatarURL     string `json:"avatar_url,omitempty"`
+	// IsAdmin is true only for the account designated by ADMIN_EMAIL.
+	IsAdmin   bool   `json:"is_admin"`
+	AvatarURL string `json:"avatar_url,omitempty"`
 }
 
 type errorResponse struct {
@@ -151,6 +161,7 @@ func (a *MainAPI) toUserResponse(u users.User) userResponse {
 		Email:         u.Email,
 		DisplayName:   u.DisplayName,
 		EmailVerified: u.EmailVerified,
+		IsAdmin:       a.isAdmin(u.Email),
 		AvatarURL:     a.avatarURL(u.AvatarKey),
 	}
 }
@@ -244,6 +255,7 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 		auth, callback, app, login,
 		a.conversationsWebService(), a.modelsWebService(),
 		a.agentsWebService(), a.kbWebService(), a.inferenceWebService(),
+		a.adminWebService(),
 	}
 }
 
@@ -406,8 +418,11 @@ func (a *MainAPI) register(req *restful.Request, resp *restful.Response) {
 		PasswordHash: string(hash),
 		// With verification enabled the account starts unverified and the
 		// user is NOT authenticated (no session) until the emailed link is
-		// opened; login rejects unverified accounts.
-		EmailVerified: !a.verificationEnabled,
+		// opened; login rejects unverified accounts. The administrator
+		// bootstraps verified: the operator asserted ownership of that
+		// address by configuring ADMIN_EMAIL, and nobody outranks the admin
+		// to vet them.
+		EmailVerified: !a.verificationEnabled || a.isAdmin(email),
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
@@ -416,9 +431,9 @@ func (a *MainAPI) register(req *restful.Request, resp *restful.Response) {
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to register")
 		return
 	}
-	logger.Info("user registered", "user_id", user.ID, "email_verified", user.EmailVerified)
+	logger.Info("user registered", "user_id", user.ID, "email_verified", user.EmailVerified, "is_admin", a.isAdmin(email))
 
-	if a.verificationEnabled {
+	if !user.EmailVerified {
 		emailSent := true
 		if err := a.sendVerificationEmail(req, logger, user); err != nil {
 			// The account exists; a failed send is recoverable through the

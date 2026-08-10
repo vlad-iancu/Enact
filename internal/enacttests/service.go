@@ -32,6 +32,9 @@ type Config struct {
 	// PrivateKeys is the YAML document holding every service's private key
 	// (the counterpart of the JWKS), assembled by scripts/start-services.sh.
 	PrivateKeys string `env:"S2S_PRIVATE_KEYS"`
+	// PrivateKeysFile is a path to that document (written by s2s-keygen as
+	// s2s/private-keys.yaml), read when PrivateKeys is empty.
+	PrivateKeysFile string `env:"S2S_PRIVATE_KEYS_FILE"`
 
 	AgentAPIURL     string `env:"AGENT_API_URL, default=http://localhost:8084"`
 	KBAPIURL        string `env:"KB_API_URL, default=http://localhost:8082"`
@@ -63,12 +66,18 @@ func Build(cfg *Config) service.Builder {
 			ModelsAPIURL:    cfg.ModelsAPIURL,
 			MainAPIURL:      cfg.MainAPIURL,
 			UserID:          cfg.TestUserID,
+			AdminEmail:      cfg.AdminEmail,
 			Timeout:         cfg.TestTimeout,
 		}
 		// The fleet requires the platform's private keys; without S2S there
 		// is nothing to sign, so the cases run with plain clients.
 		if s2sRuntime.Enabled() {
-			fleet, err := utils.NewFleet(cfg.PrivateKeys, cfg.S2S.TokenTTL)
+			privateKeys, err := s2s.ResolveContent(cfg.PrivateKeys, cfg.PrivateKeysFile, "S2S_PRIVATE_KEYS_FILE")
+			if err != nil {
+				logger.Error("failed to read fleet private keys", "err", err)
+				return nil, err
+			}
+			fleet, err := utils.NewFleet(privateKeys, cfg.S2S.TokenTTL)
 			if err != nil {
 				logger.Error("failed to load impersonation fleet", "err", err)
 				return nil, err

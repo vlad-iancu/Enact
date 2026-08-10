@@ -77,6 +77,12 @@ func NormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
+// Delete removes a user record by email. Deleting an absent user is an
+// error surfaced by the underlying client, so callers check existence first.
+func (r *Repository) Delete(ctx context.Context, email string) error {
+	return r.os.DeleteDoc(ctx, r.index, NormalizeEmail(email))
+}
+
 // GetByEmail fetches a user by email. The boolean reports existence.
 func (r *Repository) GetByEmail(ctx context.Context, email string) (User, bool, error) {
 	var u User

@@ -3,11 +3,20 @@
 # Manage the enact platform's local infrastructure (OpenSearch + Redis + Tika)
 # and the data structures the services depend on.
 #
-#   infrastructure.sh up       start containers, register index templates,
-#                              create indices and the Redis stream/group
-#   infrastructure.sh down     stop the containers (data is preserved)
-#   infrastructure.sh clean    delete and recreate the indices and the Redis
-#                              stream (containers keep running)
+#   infrastructure.sh up        start containers, register index templates,
+#                               create indices and the Redis stream/group
+#   infrastructure.sh down      stop the containers (data is preserved)
+#   infrastructure.sh clean     delete and recreate the indices and the Redis
+#                               stream (containers keep running)
+#   infrastructure.sh provision register templates, create indices and apply
+#                               live mappings against an EXTERNAL OpenSearch
+#                               (e.g. Aiven) — no containers, no Redis (the
+#                               indexer creates its stream/group itself):
+#
+#                                 OPENSEARCH_ADDRESSES=https://host:port \
+#                                 OPENSEARCH_USERNAME=... OPENSEARCH_PASSWORD=... \
+#                                 OPENSEARCH_INSECURE_SKIP_VERIFY=false \
+#                                 ./scripts/infrastructure.sh provision
 #
 # OpenSearch index mappings are owned by the composable index templates in
 # the mappings/ directory; indices are created bare so the templates apply.
@@ -45,19 +54,33 @@ INDICES=(enact-knowledge-bases enact-agents enact-kb-documents enact-agent-rag-c
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; }
 
-# Resolve the docker compose command (plugin form vs legacy binary).
-if docker compose version >/dev/null 2>&1; then
-  DC=(docker compose)
-elif command -v docker-compose >/dev/null 2>&1; then
-  DC=(docker-compose)
-else
-  err "docker compose / docker-compose not found on PATH"
-  exit 1
-fi
-compose() { "${DC[@]}" -f "$COMPOSE_FILE" "$@"; }
+# Resolve the docker compose command (plugin form vs legacy binary) on
+# first use — `provision` runs against an external cluster and must work on
+# machines without docker.
+compose() {
+  if [ -z "${DC+set}" ]; then
+    if docker compose version >/dev/null 2>&1; then
+      DC=(docker compose)
+    elif command -v docker-compose >/dev/null 2>&1; then
+      DC=(docker-compose)
+    else
+      err "docker compose / docker-compose not found on PATH"
+      exit 1
+    fi
+  fi
+  "${DC[@]}" -f "$COMPOSE_FILE" "$@"
+}
 
-# os <curl args...> : authenticated, TLS-insecure curl against OpenSearch.
-os() { curl -sk -u "$OPENSEARCH_USERNAME:$OPENSEARCH_PASSWORD" "$@"; }
+# os <curl args...> : authenticated curl against OpenSearch. Certificate
+# verification follows OPENSEARCH_INSECURE_SKIP_VERIFY (default true, for
+# the self-signed local container; set false for Aiven/real certificates).
+OPENSEARCH_INSECURE_SKIP_VERIFY="${OPENSEARCH_INSECURE_SKIP_VERIFY:-true}"
+if [ "$OPENSEARCH_INSECURE_SKIP_VERIFY" = "false" ]; then
+  OS_TLS_FLAG=""
+else
+  OS_TLS_FLAG="-k"
+fi
+os() { curl -s $OS_TLS_FLAG -u "$OPENSEARCH_USERNAME:$OPENSEARCH_PASSWORD" "$@"; }
 
 # os_status <path> : print the HTTP status code for a GET against OpenSearch.
 os_status() { os -o /dev/null -w '%{http_code}' "$OPENSEARCH_URL/$1"; }
@@ -222,14 +245,25 @@ cmd_clean() {
   log "Clean complete: indices and stream recreated empty."
 }
 
+# provision targets an external cluster: everything OpenSearch-side, nothing
+# container- or Redis-side (the indexer's EnsureGroup creates the stream).
+cmd_provision() {
+  wait_for_opensearch
+  register_templates
+  create_indices
+  update_live_mappings
+  log "Provisioning complete for $OPENSEARCH_URL."
+}
+
 main() {
   local cmd="${1:-}"
   case "$cmd" in
-    up)    cmd_up ;;
-    down)  cmd_down ;;
-    clean) cmd_clean ;;
+    up)        cmd_up ;;
+    down)      cmd_down ;;
+    clean)     cmd_clean ;;
+    provision) cmd_provision ;;
     *)
-      err "usage: $0 {up|down|clean}"
+      err "usage: $0 {up|down|clean|provision}"
       exit 2
       ;;
   esac

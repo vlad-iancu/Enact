@@ -19,6 +19,11 @@ type Env struct {
 	// data stays isolated from real users' data.
 	UserID string
 
+	// AdminEmail mirrors the platform-wide ADMIN_EMAIL setting so admin
+	// cases know which account carries elevated rights. Empty when the
+	// platform has no administrator configured.
+	AdminEmail string
+
 	// Fleet signs requests as arbitrary service identities; nil when S2S is
 	// disabled, in which case clients are unsigned.
 	Fleet *Fleet

@@ -79,6 +79,21 @@ func (s *SessionStore) Delete(token string) {
 	s.mu.Unlock()
 }
 
+// DeleteByUserID revokes every session of one user (e.g. when an
+// administrator deletes the account) and returns how many were removed.
+func (s *SessionStore) DeleteByUserID(userID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for token, sess := range s.sessions {
+		if sess.UserID == userID {
+			delete(s.sessions, token)
+			removed++
+		}
+	}
+	return removed
+}
+
 // cookieSettings carries the attributes shared by all auth cookies.
 //
 // SameSite matters when the frontend lives on a DIFFERENT REGISTRABLE

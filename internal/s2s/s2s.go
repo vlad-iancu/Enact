@@ -5,9 +5,12 @@
 // against a per-service ACL (default deny).
 //
 // The JWKS and ACL are YAML documents passed IN FULL through environment
-// variables (S2S_JWKS / S2S_ACL) — the services never read them from disk.
-// The files under the repository's s2s/ directory are the distribution
-// source; scripts/start-services.sh reads them into the environment.
+// variables (S2S_JWKS / S2S_ACL). The files under the repository's s2s/
+// directory are the distribution source; scripts/start-services.sh reads
+// them into the environment. In containers, where multiline env values are
+// impractical, each content variable has a *_FILE counterpart naming a
+// mounted path (docker-secrets idiom); the content variable wins when both
+// are set.
 //
 // Wiring is per service (deliberately not part of the generic service
 // runtime): each service embeds Config in its own Config, calls Load at
@@ -21,6 +24,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"enact/internal/logging"
@@ -43,10 +47,16 @@ type Config struct {
 
 	// JWKS is the YAML document listing every service's public key.
 	JWKS string `env:"S2S_JWKS"`
+	// JWKSFile is a path to the JWKS document, read when JWKS is empty.
+	JWKSFile string `env:"S2S_JWKS_FILE"`
 	// ACL is the YAML document with this service's route access rules.
 	ACL string `env:"S2S_ACL"`
+	// ACLFile is a path to the ACL document, read when ACL is empty.
+	ACLFile string `env:"S2S_ACL_FILE"`
 	// PrivateKey is this service's PEM-encoded (PKCS#8) Ed25519 private key.
 	PrivateKey string `env:"S2S_PRIVATE_KEY"`
+	// PrivateKeyFile is a path to the key PEM, read when PrivateKey is empty.
+	PrivateKeyFile string `env:"S2S_PRIVATE_KEY_FILE"`
 	// KeyID names this service's key in the JWKS. It triples as the JWT
 	// "kid" header, the "iss" claim of tokens this service signs, and the
 	// expected "aud" claim of tokens it receives — by convention the
@@ -79,6 +89,16 @@ func Load(cfg Config, logger *logging.Logger) (*Runtime, error) {
 	if !cfg.Enabled {
 		logger.Warn("s2s authentication is DISABLED; all routes accept unauthenticated callers")
 		return &Runtime{logger: logger}, nil
+	}
+	var err error
+	if cfg.JWKS, err = ResolveContent(cfg.JWKS, cfg.JWKSFile, "S2S_JWKS_FILE"); err != nil {
+		return nil, err
+	}
+	if cfg.ACL, err = ResolveContent(cfg.ACL, cfg.ACLFile, "S2S_ACL_FILE"); err != nil {
+		return nil, err
+	}
+	if cfg.PrivateKey, err = ResolveContent(cfg.PrivateKey, cfg.PrivateKeyFile, "S2S_PRIVATE_KEY_FILE"); err != nil {
+		return nil, err
 	}
 	switch {
 	case cfg.KeyID == "":
@@ -139,6 +159,20 @@ func (r *Runtime) Transport(base http.RoundTripper, audience string) http.RoundT
 		return base
 	}
 	return NewTransport(base, r.signer, audience)
+}
+
+// ResolveContent returns content when set, otherwise reads the file named
+// by path (skipped when also empty). varName is the *_FILE environment
+// variable, used to attribute read failures to their setting.
+func ResolveContent(content, path, varName string) (string, error) {
+	if content != "" || path == "" {
+		return content, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("s2s: read %s: %w", varName, err)
+	}
+	return string(data), nil
 }
 
 // parsePrivateKey decodes a PEM PKCS#8 Ed25519 private key.

@@ -46,6 +46,13 @@ rules:
   - route: "POST /inference"
     allow: [anonymous, "*"]
 
+  # Administration: browser-facing; the session filter authenticates the
+  # person and the admin filter requires the ADMIN_EMAIL account.
+  - route: "POST /admin/create-user"
+    allow: [anonymous, "*"]
+  - route: "POST /admin/delete-user"
+    allow: [anonymous, "*"]
+
   # Agent & knowledge-base management: browser-facing; sessions authenticate
   # people inside the handlers.
   - route: "GET /agents"

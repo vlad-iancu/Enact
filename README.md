@@ -186,6 +186,86 @@ context into outbound requests so a call from one service continues the same
 trace in the next. Use a wrapped `*http.Client` for any new service-to-service
 call to keep the trace connected (the Tika client already does).
 
+## Deploying with Docker
+
+The seven services ship as one image each, built from the single root
+`Dockerfile` (`--build-arg SERVICE=<cmd-dir>`, distroless, static Go
+binaries). `deploy/docker-compose.app.yml` is the full platform for a VM:
+the services **plus the infrastructure** — OpenSearch (with Dashboards on
+loopback :5601), Redis, and Tika — with data in named volumes. Only AWS
+(Bedrock/S3/SES/CloudFront) remains external. The images contain **no**
+dotenv files — container environment is the only configuration source (so
+the local `.env` overload behavior cannot interfere). Infrastructure
+connection settings live in the compose file itself (`x-infra-env`); the
+env files carry AWS credentials and platform settings. Plan ~4 GB of RAM on
+the VM (OpenSearch runs with a 512 MB heap by default; raise
+`OPENSEARCH_JAVA_OPTS` on larger hosts).
+
+Build and push (from the dev machine; images target `linux/amd64`):
+
+```sh
+docker login ghcr.io                     # or your registry
+make docker-push REGISTRY=ghcr.io/<owner>   # tags :<git-sha> and :latest
+```
+
+One-time VM setup:
+
+```sh
+# On the VM: install docker + the compose plugin, then
+sudo mkdir -p /opt/enact && sudo chown $USER /opt/enact
+docker login ghcr.io
+
+# From the dev machine: generate DEPLOYMENT S2S material (prefer fresh keys
+# over reusing local-dev ones; run from a clean checkout or temp dir) and
+# copy the deployment files over:
+make s2s-keygen        # also writes s2s/private-keys.yaml (enact-tests bundle)
+rsync -av deploy/docker-compose.app.yml deploy/*.example s2s <vm>:/opt/enact/
+
+# On the VM: the s2s mount must be readable by the distroless nonroot uid
+sudo chown -R 65532:65532 /opt/enact/s2s && sudo chmod -R u=rX,go= /opt/enact/s2s
+
+# On the VM: fill in the env files (gitignored; never commit the real ones)
+cd /opt/enact
+cp app.env.example app.env               # AWS creds + platform settings
+cp enact-main.env.example enact-main.env # OAuth/frontend/SES/S3
+echo 'ENACT_REGISTRY=ghcr.io/<owner>' > .env
+echo 'ENACT_TAG=<git-sha>' >> .env
+echo 'OPENSEARCH_PASSWORD=<strong-password>' >> .env  # in-stack cluster admin
+
+# First boot: start OpenSearch alone, create the indices (idempotent),
+# then bring up everything (the services verify their indices at startup):
+docker compose -f docker-compose.app.yml up -d opensearch
+OPENSEARCH_ADDRESSES=https://127.0.0.1:9200 OPENSEARCH_PASSWORD=<password> \
+  ./scripts/infrastructure.sh provision
+docker compose -f docker-compose.app.yml up -d
+```
+
+Run and operate:
+
+```sh
+docker compose -f docker-compose.app.yml up -d
+docker compose -f docker-compose.app.yml ps       # all Up; enact-main on :8000
+docker compose -f docker-compose.app.yml logs -f enact-main
+```
+
+Only `enact-main` (8000) is published; `enact-tests` listens on
+`127.0.0.1:8006` (reach it via `ssh -L 8006:127.0.0.1:8006 <vm>` to trigger
+the integration suite). Put a TLS reverse proxy in front of 8000 before real
+use (`SECURE_COOKIES=true`, and `COOKIE_SAMESITE=none` requires HTTPS).
+
+To update: `make docker-push REGISTRY=...` on the dev machine, bump
+`ENACT_TAG` in `/opt/enact/.env`, then `docker compose pull && docker compose
+up -d` on the VM (`make docker-deploy VM=user@host` automates the
+sync+pull+up path). Services shut down gracefully on SIGTERM.
+
+The stack can also run against an external OpenSearch/Redis (e.g. Aiven)
+instead of the in-stack containers: override the `x-infra-env` values in the
+compose file and run `infrastructure.sh provision` against that cluster
+(`OPENSEARCH_INSECURE_SKIP_VERIFY=false` for real certificates). On Aiven's
+free tier the cluster powers off when idle; the services then crash-loop
+(`restart: unless-stopped`) until it is powered back on — expected recovery
+behavior, not a bug.
+
 ## End-to-end example
 
 ```sh
