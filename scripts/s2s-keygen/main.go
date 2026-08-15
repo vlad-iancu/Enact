@@ -30,6 +30,8 @@ var services = []string{
 	"enact-model-inference",
 	"enact-model-management",
 	"enact-tests",
+	"enact-tool-registry",
+	"enact-external-identities",
 }
 
 func main() {

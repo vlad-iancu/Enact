@@ -196,6 +196,10 @@ type Hit struct {
 // SearchResult carries a search's hits plus its raw aggregations.
 type SearchResult struct {
 	Hits []Hit
+	// Total is the number of documents matching the query across all
+	// pages (hits.total.value), for paginated listings. Accurate up to
+	// 10k unless the query sets track_total_hits.
+	Total int
 	// Aggregations is the response's "aggregations" object verbatim (nil
 	// when the query requested none); callers unmarshal into their own
 	// typed structs.
@@ -220,6 +224,9 @@ func (c *Client) SearchWithAggregations(ctx context.Context, index string, body 
 	}
 	var parsed struct {
 		Hits struct {
+			Total struct {
+				Value int `json:"value"`
+			} `json:"total"`
 			Hits []Hit `json:"hits"`
 		} `json:"hits"`
 		Aggregations json.RawMessage `json:"aggregations"`
@@ -227,7 +234,7 @@ func (c *Client) SearchWithAggregations(ctx context.Context, index string, body 
 	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
 		return SearchResult{}, fmt.Errorf("opensearch: decode search %q: %w", index, err)
 	}
-	return SearchResult{Hits: parsed.Hits.Hits, Aggregations: parsed.Aggregations}, nil
+	return SearchResult{Hits: parsed.Hits.Hits, Total: parsed.Hits.Total.Value, Aggregations: parsed.Aggregations}, nil
 }
 
 // DeleteByQuery deletes every document in index matching the query body.

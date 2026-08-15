@@ -30,8 +30,39 @@ type Message struct {
 	// Attachments are the filenames of context files sent with this message.
 	// Only the names are persisted: the files are read by the model on the
 	// turn they were attached to; later turns do not re-send them.
-	Attachments []string  `json:"attachments,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	Attachments []string `json:"attachments,omitempty"`
+	// ToolCalls are the MCP tools this assistant message used, in the order
+	// they ran, so reopening a conversation shows what the agent actually
+	// did rather than only what it concluded.
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+// ToolCall is one MCP tool invocation recorded on an assistant message.
+//
+// Arguments are the MODEL's arguments, exactly as the stream reported them —
+// before the platform injects any credential — so a stored conversation can
+// never carry a user's token. Everything else is kept as the tool returned
+// it, because the record has to be able to reproduce the exchange rather
+// than merely describe it.
+type ToolCall struct {
+	ServerID  string          `json:"server_id"`
+	Tool      string          `json:"tool"`
+	ToolUseID string          `json:"tool_use_id"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
+	// Content and StructuredContent are what the tool returned. A server may
+	// send prose, a structured object, or both; both are kept, because both
+	// are what the model was given.
+	Content           string          `json:"content,omitempty"`
+	StructuredContent json.RawMessage `json:"structured_content,omitempty"`
+	IsError           bool            `json:"is_error,omitempty"`
+	// Turn is the tool-loop round this call belongs to, counting from 1, and
+	// Text is what the assistant said in that round before calling. Together
+	// they make the record a transcript rather than a summary: a second
+	// round's call was made KNOWING the first round's results, and replaying
+	// them as one round would misrepresent that.
+	Turn int    `json:"turn,omitempty"`
+	Text string `json:"text,omitempty"`
 }
 
 // Conversation is one user's message thread. MessageCount is denormalized so

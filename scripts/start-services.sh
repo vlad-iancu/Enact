@@ -35,6 +35,8 @@ SERVICES=(
   enact-model-inference
   enact-model-management
   enact-tests
+  enact-tool-registry
+  enact-external-identities
 )
 
 # Delve listen ports per service, index-aligned with SERVICES.
@@ -46,6 +48,8 @@ DEBUG_PORTS=(
   40004
   40005
   40006
+  40008
+  40009
 )
 
 # assemble_private_keys emits a YAML document with every service's private

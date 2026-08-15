@@ -36,6 +36,19 @@ func All() []utils.Factory {
 		NewMainAvatarValidation,
 		NewMainAdminUserManagement,
 
+		// MCP tool registry + agent tool use
+		NewMCPRegistryLifecycle,
+		NewMCPAgentToolInvocation,
+
+		// External identities (third-party credentials)
+		NewIdentitiesPATLifecycle,
+		NewIdentitiesOAuthFlow,
+
+		// Per-user credentials injected into MCP tool calls
+		NewMCPToolCredentialInjection,
+		NewMCPToolAuthorizationWait,
+		NewMCPGatedServer,
+
 		// Model catalogue
 		NewModelsList,
 

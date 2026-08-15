@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
+	"enact/internal/identity"
 	"enact/internal/requesthelper"
 	"enact/internal/users"
 )
@@ -34,6 +36,19 @@ func (a *MainAPI) adminWebService() *restful.WebService {
 		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
 		Returns(http.StatusConflict, "Email already registered", errorResponse{}).
 		Returns(http.StatusForbidden, "Not the administrator", errorResponse{}))
+
+	ws.Route(ws.GET("/users").
+		To(a.adminListUsers).
+		Param(ws.QueryParameter("page", "1-based page number (default 1)").DataType("integer")).
+		Param(ws.QueryParameter("page_size", "accounts per page (default 20, max 100)").DataType("integer")).
+		Doc("List all accounts, newest first, paginated (admin only)").
+		Returns(http.StatusOK, "OK", adminUsersResponse{}).
+		Returns(http.StatusBadRequest, "Invalid pagination", errorResponse{}).
+		Returns(http.StatusForbidden, "Not the administrator", errorResponse{}))
+
+	// Identity-provider administration lives here too: it is the same
+	// "platform-wide, administrator-only" class of action.
+	a.registerAdminIdentityRoutes(ws)
 
 	ws.Route(ws.POST("/delete-user").
 		To(a.adminDeleteUser).
@@ -68,6 +83,72 @@ type adminCreateUserRequest struct {
 
 type adminDeleteUserRequest struct {
 	Email string `json:"email"`
+}
+
+// adminUsersResponse is one page of the account listing.
+type adminUsersResponse struct {
+	Users []userResponse `json:"users"`
+	// Total is the account count across all pages.
+	Total    int `json:"total"`
+	Page     int `json:"page"`
+	PageSize int `json:"page_size"`
+}
+
+// pagination bounds for the user listing.
+const (
+	defaultUsersPageSize = 20
+	maxUsersPageSize     = 100
+)
+
+// parsePageParam reads a positive integer query parameter, falling back to
+// def when absent. The boolean reports validity.
+func parsePageParam(req *restful.Request, name string, def int) (int, bool) {
+	raw := req.QueryParameter(name)
+	if raw == "" {
+		return def, true
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 1 {
+		return 0, false
+	}
+	return v, true
+}
+
+// adminListUsers returns one page of every account, newest first.
+func (a *MainAPI) adminListUsers(req *restful.Request, resp *restful.Response) {
+	logger := requesthelper.Logger(req, a.logger)
+	logger.Info("admin list-users requested", "admin_id", sessionAttr(req).UserID)
+
+	page, ok := parsePageParam(req, "page", 1)
+	if !ok {
+		requesthelper.WriteError(req, resp, http.StatusBadRequest, "page must be a positive integer")
+		return
+	}
+	pageSize, ok := parsePageParam(req, "page_size", defaultUsersPageSize)
+	if !ok || pageSize > maxUsersPageSize {
+		requesthelper.WriteError(req, resp, http.StatusBadRequest,
+			fmt.Sprintf("page_size must be between 1 and %d", maxUsersPageSize))
+		return
+	}
+	logger.Info("list-users decoded", "page", page, "page_size", pageSize)
+
+	list, total, err := a.users.List(req.Request.Context(), (page-1)*pageSize, pageSize)
+	if err != nil {
+		logger.Error("failed to list users", "err", err)
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to list users")
+		return
+	}
+	out := adminUsersResponse{
+		Users:    make([]userResponse, 0, len(list)),
+		Total:    total,
+		Page:     page,
+		PageSize: pageSize,
+	}
+	for _, u := range list {
+		out.Users = append(out.Users, a.toUserResponse(u))
+	}
+	logger.Info("users listed", "count", len(out.Users), "total", total)
+	requesthelper.WriteJSON(req, resp, http.StatusOK, out)
 }
 
 // adminCreateUser creates a local account on the administrator's authority:
@@ -184,6 +265,22 @@ func (a *MainAPI) adminDeleteUser(req *restful.Request, resp *restful.Response) 
 
 	revoked := a.sessions.DeleteByUserID(user.ID)
 	logger.Info("sessions revoked", "user_id", user.ID, "count", revoked)
+
+	// Third-party credentials go BEFORE the account, and unlike the avatar
+	// this one is allowed to fail the whole delete. An orphaned avatar is a
+	// stray object; an orphaned credential is a live grant on someone's
+	// Google account that nothing can now map back to a user — and the
+	// refresh sweep would keep it alive indefinitely. Failing here leaves a
+	// consistent, retryable state instead.
+	deleted, err := a.identities.DeleteAll(identity.WithUserID(req.Request.Context(), user.ID))
+	if err != nil {
+		logger.Error("failed to delete the user's stored credentials", "user_id", user.ID, "err", err)
+		relayIdentitiesErr(req, resp, err, "delete the account's connected accounts")
+		return
+	}
+	logger.Info("stored credentials deleted", "user_id", user.ID, "deleted", deleted.Deleted,
+		"revoked", deleted.Revoked, "revocation_unsupported", deleted.RevocationUnsupported,
+		"revocation_failed", deleted.RevocationFailed)
 
 	// Avatar cleanup is best-effort, like avatar replacement: an orphaned
 	// object must never block the account deletion.

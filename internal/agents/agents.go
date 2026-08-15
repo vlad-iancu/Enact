@@ -23,14 +23,17 @@ type Config struct {
 // Agent is a configured assistant: a user-facing friendly name, a model, a
 // system prompt, and the knowledge bases it retrieves from.
 type Agent struct {
-	ID               string    `json:"id"`
-	UserID           string    `json:"user_id"`
-	Name             string    `json:"name"`
-	Model            string    `json:"model"`
-	SystemPrompt     string    `json:"system_prompt"`
-	KnowledgeBaseIDs []string  `json:"knowledge_base_ids"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               string   `json:"id"`
+	UserID           string   `json:"user_id"`
+	Name             string   `json:"name"`
+	Model            string   `json:"model"`
+	SystemPrompt     string   `json:"system_prompt"`
+	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+	// Tools names the MCP servers (by registry id) whose tools this agent
+	// may call during inference.
+	Tools     []string  `json:"tools"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Repository persists agent records in OpenSearch.

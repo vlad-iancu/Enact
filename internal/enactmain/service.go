@@ -17,6 +17,7 @@ import (
 	"enact/internal/agents"
 	"enact/internal/cloudfront"
 	"enact/internal/conversations"
+	"enact/internal/extidentities"
 	"enact/internal/inference"
 	"enact/internal/kb"
 	"enact/internal/logging"
@@ -26,6 +27,7 @@ import (
 	"enact/internal/s3"
 	"enact/internal/service"
 	"enact/internal/ses"
+	"enact/internal/tools"
 	"enact/internal/users"
 )
 
@@ -41,6 +43,8 @@ type Config struct {
 	Models        models.ClientConfig
 	Agents        agents.ClientConfig
 	KB            kb.ClientConfig
+	ToolRegistry  tools.ClientConfig
+	Identities    extidentities.ClientConfig
 	S2S           s2s.Config
 	Storage       s3.Config
 	CDN           cloudfront.Config
@@ -173,6 +177,8 @@ func Build(cfg *Config) service.Builder {
 		api.verificationTTL = cfg.VerificationTTL
 		api.publicBaseURL = strings.TrimRight(cfg.PublicBaseURL, "/")
 		api.adminEmail = users.NormalizeEmail(cfg.AdminEmail)
+		api.toolRegistry = tools.NewClient(cfg.ToolRegistry, s2sRuntime.Transport(nil, "enact-tool-registry"))
+		api.identities = extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities"))
 		services := api.WebServices()
 		if s2sRuntime.Enabled() {
 			for _, ws := range services {

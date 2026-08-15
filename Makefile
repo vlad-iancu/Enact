@@ -147,9 +147,26 @@ VM_DIR ?= /opt/enact
 docker-deploy:
 	@[ -n "$(VM)" ] || { echo "ERROR: set VM, e.g. make docker-deploy VM=user@host"; exit 1; }
 	rsync -av deploy/docker-compose.app.yml $(VM):$(VM_DIR)/
+	# The Caddyfile (no secrets, unlike the env files) syncs when present
+	# locally — deploy/Caddyfile is the source of truth, VM edits get
+	# overwritten. Its presence on the VM is also what enables the web
+	# profile below.
+	@[ ! -f deploy/Caddyfile ] || rsync -av deploy/Caddyfile $(VM):$(VM_DIR)/
+	# Reclaim directories other uids may own before rsync writes to them:
+	# s2s belongs to the container uid (65532) after a deploy, and docker
+	# creates the www bind-mount source as root if caddy starts before the
+	# first upload. s2s is re-chowned by the post-step; www stays with the
+	# ssh user (caddy only reads it).
+	ssh $(VM) "cd $(VM_DIR) && for d in s2s www; do [ ! -d \$$d ] || sudo -n chown -R \$$(id -un):\$$(id -gn) \$$d; done"
+	# The frontend build staged in deploy/www (copy the SPA's dist/ there)
+	# mirrors to the VM web root — --delete keeps removed assets from
+	# accumulating, so the VM copy is exactly the staged build.
+	@[ ! -d deploy/www ] || rsync -av --delete deploy/www/ $(VM):$(VM_DIR)/www/
 	rsync -av scripts/infrastructure.sh $(VM):$(VM_DIR)/scripts/
 	rsync -av mappings $(VM):$(VM_DIR)/
 	rsync -av s2s $(VM):$(VM_DIR)/
 	ssh $(VM) "cd $(VM_DIR) \
 		&& { sudo -n chown -R 65532:65532 s2s && sudo -n chmod -R u=rX,go= s2s || echo 'WARNING: fix s2s ownership manually: sudo chown -R 65532:65532 $(VM_DIR)/s2s'; } \
-		&& docker compose -f docker-compose.app.yml pull && docker compose -f docker-compose.app.yml up -d"
+		&& PROFILES=''; [ -f Caddyfile ] && PROFILES='--profile web'; \
+		docker compose -f docker-compose.app.yml \$$PROFILES pull && docker compose -f docker-compose.app.yml \$$PROFILES up -d \
+		&& docker image prune -af"

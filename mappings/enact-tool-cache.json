@@ -1,0 +1,50 @@
+{
+  "index_patterns": [
+    "enact-tool-cache"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Cached MCP tool definitions per registered server, refreshed on an interval. Schema/annotation/meta payloads are stored verbatim and not indexed (arbitrary JSON would explode the mapping)."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "server_id": {
+          "type": "keyword"
+        },
+        "name": {
+          "type": "keyword"
+        },
+        "title": {
+          "type": "text"
+        },
+        "description": {
+          "type": "text"
+        },
+        "input_schema": {
+          "type": "object",
+          "enabled": false
+        },
+        "output_schema": {
+          "type": "object",
+          "enabled": false
+        },
+        "annotations": {
+          "type": "object",
+          "enabled": false
+        },
+        "meta": {
+          "type": "object",
+          "enabled": false
+        },
+        "refreshed_at": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}

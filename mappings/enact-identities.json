@@ -1,0 +1,66 @@
+{
+"index_patterns": [
+    "enact-identities"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Third-party credentials held on a user's behalf: one document per (user, provider), shared by everything that needs that provider. The credentials field is an AES-256-GCM envelope and is deliberately NOT indexed; everything the refresh sweep queries on (expires_at, refreshable, status) is lifted out of it."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id": {
+          "type": "keyword"
+        },
+        "user_id": {
+          "type": "keyword"
+        },
+        "provider": {
+          "type": "keyword"
+        },
+        "provider_type": {
+          "type": "keyword"
+        },
+        "credentials": {
+          "type": "keyword",
+          "index": false,
+          "doc_values": false
+        },
+        "access": {
+          "type": "keyword"
+        },
+        "access_level": {
+          "type": "keyword"
+        },
+        "expires_at": {
+          "type": "date"
+        },
+        "refreshable": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "keyword"
+        },
+        "refresh_failures": {
+          "type": "integer"
+        },
+        "refresh_failed_at": {
+          "type": "date"
+        },
+        "last_refreshed_at": {
+          "type": "date"
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "updated_at": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}

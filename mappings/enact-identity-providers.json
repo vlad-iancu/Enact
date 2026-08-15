@@ -1,0 +1,100 @@
+{
+  "index_patterns": [
+    "enact-identity-providers"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Registered identity providers (google, github, jira): the OAuth endpoints and client registration, or the PAT presentation metadata. The OAuth client secret is stored sealed and is never indexed."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "name": {
+          "type": "keyword"
+        },
+        "type": {
+          "type": "keyword"
+        },
+        "display_name": {
+          "type": "text"
+        },
+        "oauth": {
+          "properties": {
+            "issuer": {
+              "type": "keyword"
+            },
+            "discovery_url": {
+              "type": "keyword"
+            },
+            "authorize_url": {
+              "type": "keyword"
+            },
+            "token_url": {
+              "type": "keyword"
+            },
+            "revoke_url": {
+              "type": "keyword"
+            },
+            "userinfo_url": {
+              "type": "keyword"
+            },
+            "client_id": {
+              "type": "keyword"
+            },
+            "client_secret_enc": {
+              "type": "keyword",
+              "index": false,
+              "doc_values": false
+            },
+            "scopes": {
+              "type": "keyword"
+            },
+            "use_pkce": {
+              "type": "boolean"
+            },
+            "access_type": {
+              "type": "keyword"
+            },
+            "prompt": {
+              "type": "keyword"
+            },
+            "auth_style": {
+              "type": "keyword"
+            },
+            "extra_auth_params": {
+              "type": "object",
+              "enabled": false
+            }
+          }
+        },
+        "pat": {
+          "properties": {
+            "scheme": {
+              "type": "keyword"
+            },
+            "header_name": {
+              "type": "keyword"
+            },
+            "docs_url": {
+              "type": "keyword"
+            }
+          }
+        },
+        "access_levels": {
+          "type": "object",
+          "enabled": false
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "updated_at": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}

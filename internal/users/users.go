@@ -24,12 +24,12 @@ type Config struct {
 // PasswordHash is set for local accounts, GoogleSub for Google accounts; an
 // account that used both login methods has both.
 type User struct {
-	ID            string    `json:"id"`
-	Email         string    `json:"email"`
-	DisplayName   string    `json:"display_name"`
-	PasswordHash  string    `json:"password_hash,omitempty"`
-	EmailVerified bool      `json:"email_verified"`
-	GoogleSub     string    `json:"google_sub,omitempty"`
+	ID            string `json:"id"`
+	Email         string `json:"email"`
+	DisplayName   string `json:"display_name"`
+	PasswordHash  string `json:"password_hash,omitempty"`
+	EmailVerified bool   `json:"email_verified"`
+	GoogleSub     string `json:"google_sub,omitempty"`
 	// AvatarKey is the storage key of the user's avatar (empty when none).
 	// The public URL is derived from it at read time, so CDN reconfiguration
 	// never invalidates stored records.
@@ -40,8 +40,8 @@ type User struct {
 	VerificationTokenHash string `json:"verification_token_hash,omitempty"`
 	// VerificationExpiresAt bounds the pending token's validity.
 	VerificationExpiresAt time.Time `json:"verification_expires_at"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 // Repository persists users in OpenSearch. The document id is the
@@ -81,6 +81,27 @@ func NormalizeEmail(email string) string {
 // error surfaced by the underlying client, so callers check existence first.
 func (r *Repository) Delete(ctx context.Context, email string) error {
 	return r.os.DeleteDoc(ctx, r.index, NormalizeEmail(email))
+}
+
+// List returns one page of all user records, newest first, plus the total
+// account count for pagination.
+func (r *Repository) List(ctx context.Context, from, size int) ([]User, int, error) {
+	query := fmt.Sprintf(
+		`{"from":%d,"size":%d,"sort":[{"created_at":"desc"}],"track_total_hits":true,"query":{"match_all":{}}}`,
+		from, size)
+	result, err := r.os.SearchWithAggregations(ctx, r.index, []byte(query))
+	if err != nil {
+		return nil, 0, err
+	}
+	users := make([]User, 0, len(result.Hits))
+	for _, hit := range result.Hits {
+		var u User
+		if err := json.Unmarshal(hit.Source, &u); err != nil {
+			return nil, 0, fmt.Errorf("users: decode %s: %w", hit.ID, err)
+		}
+		users = append(users, u)
+	}
+	return users, result.Total, nil
 }
 
 // GetByEmail fetches a user by email. The boolean reports existence.

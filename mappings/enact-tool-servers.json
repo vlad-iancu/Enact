@@ -1,0 +1,51 @@
+{
+  "index_patterns": [
+    "enact-tool-servers"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Registered MCP servers: endpoint, transport, description, owning user."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id": {
+          "type": "keyword"
+        },
+        "url": {
+          "type": "keyword"
+        },
+        "transport_type": {
+          "type": "keyword"
+        },
+        "description": {
+          "type": "text"
+        },
+        "owner": {
+          "type": "keyword"
+        },
+        "tool_count": {
+          "type": "integer"
+        },
+        "tool_access_requirements": {
+          "type": "object",
+          "enabled": false
+        },
+        "tool_authorizations": {
+          "type": "object",
+          "enabled": false
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "updated_at": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}

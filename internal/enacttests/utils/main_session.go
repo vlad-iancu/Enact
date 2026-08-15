@@ -100,3 +100,29 @@ func (s *MainSession) RegisterOrLogin(t *T, displayName, email, password string)
 		t.Fatalf("register %s: got HTTP %d, want 201 or 409", email, status)
 	}
 }
+
+// DoJSONRaw is DoJSON plus the raw response body, for assertions about what
+// a payload must NOT contain (e.g. that a provider response never echoes a
+// client secret).
+func (s *MainSession) DoJSONRaw(t *T, method, path string, body io.Reader, out any) (int, string) {
+	req, err := http.NewRequestWithContext(t.Context(), method, s.baseURL+path, body)
+	if err != nil {
+		t.Fatalf("build request %s %s: %v", method, path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("%s %s: read response: %v", method, path, err)
+	}
+	if out != nil && len(raw) > 0 {
+		if err := json.NewDecoder(strings.NewReader(string(raw))).Decode(out); err != nil {
+			t.Fatalf("%s %s: decode response: %v", method, path, err)
+		}
+	}
+	return resp.StatusCode, string(raw)
+}

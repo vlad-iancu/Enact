@@ -1,8 +1,32 @@
 package enactmodelinference
 
+import "encoding/json"
+
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls are the MCP tools an assistant message used, replayed into
+	// the model's context. See expandToolHistory for how one of these
+	// becomes the assistant/user pair Bedrock requires.
+	ToolCalls []MessageToolCall `json:"tool_calls,omitempty"`
+}
+
+// MessageToolCall is one recorded tool invocation being replayed.
+//
+// Turn groups calls into the rounds they were made in, and Text is the
+// assistant's own words in that round — the model may say "let me check"
+// before calling. Both are needed to replay the turn as it happened rather
+// than as a summary of it.
+type MessageToolCall struct {
+	ServerID          string          `json:"server_id"`
+	Tool              string          `json:"tool"`
+	ToolUseID         string          `json:"tool_use_id"`
+	Arguments         json.RawMessage `json:"arguments,omitempty"`
+	Content           string          `json:"content,omitempty"`
+	StructuredContent json.RawMessage `json:"structured_content,omitempty"`
+	IsError           bool            `json:"is_error,omitempty"`
+	Turn              int             `json:"turn,omitempty"`
+	Text              string          `json:"text,omitempty"`
 }
 
 type InferenceRequest struct {
@@ -38,11 +62,15 @@ type ContextFile struct {
 }
 
 type InferenceResponse struct {
-	Model        string `json:"model"`
-	Content      string `json:"content"`
-	StopReason   string `json:"stop_reason,omitempty"`
-	InputTokens  int32  `json:"input_tokens"`
-	OutputTokens int32  `json:"output_tokens"`
+	Model   string `json:"model"`
+	Content string `json:"content"`
+	// ToolCalls records the MCP tool invocations executed during the
+	// request's tool loop (non-streaming; streams announce them as
+	// toolCall / toolCallResult SSE events instead).
+	ToolCalls    []ToolCallRecord `json:"tool_calls,omitempty"`
+	StopReason   string           `json:"stop_reason,omitempty"`
+	InputTokens  int32            `json:"input_tokens"`
+	OutputTokens int32            `json:"output_tokens"`
 }
 
 type errorResponse struct {

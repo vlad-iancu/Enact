@@ -1,0 +1,46 @@
+# Access control list for enact-external-identities.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# Every management route is service-to-service only: enact-main fronts them
+# for people, scoping each call to the session's user. Credentials are the
+# most sensitive thing the platform stores, so nothing here is anonymous —
+# with ONE exception.
+#
+# The OAuth callback is that exception: the third-party provider redirects
+# the user's BROWSER here, and a browser cannot sign a platform token. Its
+# security is the single-use, unguessable `state` value minted by
+# /v1/oauth/authorize, which also carries the user the credential belongs
+# to — the callback never trusts anything in the request itself.
+service: enact-external-identities
+rules:
+  # Provider registration and lookup.
+  - route: "POST /v1/providers/oauth"
+    allow: ["*"]
+  - route: "POST /v1/providers/pat"
+    allow: ["*"]
+  - route: "GET /v1/providers"
+    allow: ["*"]
+  - route: "GET /v1/providers/{name}"
+    allow: ["*"]
+  - route: "DELETE /v1/providers/{name}"
+    allow: ["*"]
+
+  # Stored identities.
+  - route: "POST /v1/identities"
+    allow: ["*"]
+  - route: "GET /v1/identities"
+    allow: ["*"]
+  - route: "GET /v1/identities/credentials"
+    allow: ["*"]
+  - route: "DELETE /v1/identities"
+    allow: ["*"]
+  # Every credential of one user at once: the account-deletion path.
+  - route: "DELETE /v1/identities/all"
+    allow: ["*"]
+
+  # OAuth flow: starting one is a service call; finishing one is a browser
+  # redirect from the provider.
+  - route: "GET /v1/oauth/authorize"
+    allow: ["*"]
+  - route: "GET /v1/oauth/callback"
+    allow: [anonymous, "*"]

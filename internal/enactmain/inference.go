@@ -8,6 +8,7 @@ import (
 
 	restful "github.com/emicklei/go-restful/v3"
 
+	"enact/internal/conversations"
 	"enact/internal/inference"
 	"enact/internal/logging"
 	"enact/internal/requesthelper"
@@ -27,7 +28,9 @@ type testInferenceRequest struct {
 // inferenceWebService returns the session-guarded one-shot inference route.
 func (a *MainAPI) inferenceWebService() *restful.WebService {
 	ws := new(restful.WebService)
-	ws.Path("/inference")
+	// This route streams SSE: without text/event-stream in Produces,
+	// go-restful answers 406 to a client that declares it accepts one.
+	ws.Path("/inference").Produces(restful.MIME_JSON, "text/event-stream")
 	ws.Filter(a.csrfOriginFilter)
 	ws.Filter(a.requireSession)
 
@@ -97,12 +100,12 @@ func (a *MainAPI) testInference(req *restful.Request, resp *restful.Response) {
 		RetrievalTopK: body.RetrievalTopK,
 		ContextFiles:  body.ContextFiles,
 	}
-	assistant, streamErr := a.relayInferenceStream(req, resp, logger, infReq, map[string]any{"mode": "test"})
+	out, streamErr := a.relayInferenceStream(req, resp, logger, infReq, map[string]any{"mode": "test"})
 	if streamErr != nil {
-		logger.Warn("test inference stream ended with error", "err", streamErr, "assistant_chars", len(assistant))
+		logger.Warn("test inference stream ended with error", "err", streamErr, "assistant_chars", len(out.Assistant))
 		return
 	}
-	logger.Info("test inference completed", "assistant_chars", len(assistant))
+	logger.Info("test inference completed", "assistant_chars", len(out.Assistant), "tool_calls", len(out.ToolCalls))
 }
 
 // relayInferenceStream streams an inference call back to the browser as SSE:
@@ -110,12 +113,19 @@ func (a *MainAPI) testInference(req *restful.Request, resp *restful.Response) {
 // an `error` event on failure. It returns the accumulated assistant text and
 // the upstream error, if any. Shared by conversation messages and the
 // one-shot test endpoint.
-func (a *MainAPI) relayInferenceStream(req *restful.Request, resp *restful.Response, logger *logging.Logger, infReq inference.Request, metaExtra map[string]any) (string, error) {
+// relayed is what a relayed stream produced, for persisting afterwards: the
+// assistant's text and the tool calls it made.
+type relayed struct {
+	Assistant string
+	ToolCalls []conversations.ToolCall
+}
+
+func (a *MainAPI) relayInferenceStream(req *restful.Request, resp *restful.Response, logger *logging.Logger, infReq inference.Request, metaExtra map[string]any) (relayed, error) {
 	flusher, ok := resp.ResponseWriter.(http.Flusher)
 	if !ok {
 		logger.Error("streaming not supported by underlying writer")
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "streaming not supported")
-		return "", fmt.Errorf("streaming not supported by underlying writer")
+		return relayed{}, fmt.Errorf("streaming not supported by underlying writer")
 	}
 	meta := requesthelper.MetaFrom(req.Request.Context())
 	resp.Header().Set("Content-Type", "text/event-stream")
@@ -134,6 +144,16 @@ func (a *MainAPI) relayInferenceStream(req *restful.Request, resp *restful.Respo
 	}
 
 	var assistant strings.Builder
+	// Tool calls are collected as they stream, keyed by tool_use_id so the
+	// result event can find the call it belongs to.
+	var toolCalls []conversations.ToolCall
+	byUseID := map[string]int{}
+	// Text arrives before the round that follows it, so the assistant's
+	// words are split at each round boundary: what came before a round
+	// belongs to that round, and what is left at the end is the answer.
+	// Without this the record would concatenate "let me check" and the
+	// conclusion into one string that was never said in one breath.
+	flushed, currentTurn := 0, 0
 	streamErr := a.inference.Stream(req.Request.Context(), infReq, func(ev inference.StreamEvent) error {
 		switch ev.Event {
 		case "message":
@@ -150,6 +170,48 @@ func (a *MainAPI) relayInferenceStream(req *restful.Request, resp *restful.Respo
 			_, err := fmt.Fprintf(resp, "event: error\ndata: %s\n\n", ev.Data)
 			flusher.Flush()
 			return err
+		case "toolCall", "toolCallResult", "toolCallWaitingAuthorization":
+			// Tool-loop progress from the inference service, forwarded
+			// verbatim so the frontend can render live tool activity — and,
+			// for waiting authorizations, prompt the user to connect the
+			// account the tool needs.
+			//
+			// The call and its result are also collected, so reopening the
+			// conversation shows what the agent did. Waiting events are not:
+			// they are the state of a call in flight, not part of what
+			// happened. A parse failure only costs the record, never the
+			// relay — the client still gets the bytes.
+			switch ev.Event {
+			case "toolCall":
+				var call conversations.ToolCall
+				if err := json.Unmarshal([]byte(ev.Data), &call); err != nil {
+					logger.Warn("could not record a tool call", "err", err)
+				} else {
+					if call.Turn != currentTurn {
+						call.Text = assistant.String()[flushed:]
+						flushed = assistant.Len()
+						currentTurn = call.Turn
+					}
+					byUseID[call.ToolUseID] = len(toolCalls)
+					toolCalls = append(toolCalls, call)
+				}
+			case "toolCallResult":
+				var result conversations.ToolCall
+				if err := json.Unmarshal([]byte(ev.Data), &result); err != nil {
+					logger.Warn("could not record a tool result", "err", err)
+				} else if i, ok := byUseID[result.ToolUseID]; ok {
+					toolCalls[i].Content = result.Content
+					toolCalls[i].StructuredContent = result.StructuredContent
+					toolCalls[i].IsError = result.IsError
+				} else {
+					// A result with no call announced: keep it rather than
+					// lose the fact that the tool ran.
+					toolCalls = append(toolCalls, result)
+				}
+			}
+			_, err := fmt.Fprintf(resp, "event: %s\ndata: %s\n\n", ev.Event, ev.Data)
+			flusher.Flush()
+			return err
 		default:
 			// Upstream meta is not relayed: this response has its own meta
 			// event of the same trace.
@@ -162,5 +224,7 @@ func (a *MainAPI) relayInferenceStream(req *restful.Request, resp *restful.Respo
 		_, _ = fmt.Fprintf(resp, "event: error\ndata: %s\n\n", errBody)
 		flusher.Flush()
 	}
-	return assistant.String(), streamErr
+	// Only what followed the last round is the answer; earlier text is on
+	// the round it preceded.
+	return relayed{Assistant: assistant.String()[flushed:], ToolCalls: toolCalls}, streamErr
 }

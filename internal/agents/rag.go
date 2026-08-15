@@ -11,10 +11,10 @@ import (
 // RAGChunk is a single indexed slice of a document uploaded to an agent's
 // RAG configuration, including its embedding.
 type RAGChunk struct {
-	UserID     string    `json:"user_id"`
-	AgentID    string    `json:"agent_id"`
-	DocumentID string    `json:"document_id"`
-	ChunkIndex int       `json:"chunk_index"`
+	UserID     string `json:"user_id"`
+	AgentID    string `json:"agent_id"`
+	DocumentID string `json:"document_id"`
+	ChunkIndex int    `json:"chunk_index"`
 	// Filename of the uploaded document, denormalized onto every chunk so
 	// document listings can show it. Chunks indexed before this field
 	// existed have it empty.

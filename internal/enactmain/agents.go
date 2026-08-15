@@ -45,6 +45,14 @@ func (a *MainAPI) agentsWebService() *restful.WebService {
 		Doc("List the logged-in user's agents").
 		Returns(http.StatusOK, "OK", listAgentsResponse{}))
 
+	ws.Route(ws.GET("/{id}/required-identities").
+		To(a.agentRequiredIdentities).
+		Param(ws.PathParameter("id", "agent id")).
+		Doc("What the logged-in user must connect before this agent's tools can run, and whether they already have").
+		Returns(http.StatusOK, "OK", agentRequirementsResponse{}).
+		Returns(http.StatusNotFound, "No such agent", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
 	ws.Route(ws.POST("").
 		To(a.createAgent).
 		Consumes(restful.MIME_JSON).

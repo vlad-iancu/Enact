@@ -130,6 +130,31 @@ services:
       timeout: 5s
       retries: 12
 
+  # --- Web entry point (optional: --profile web) ----------------------------
+  # Serves the frontend SPA from ./www and proxies /api/* to enact-main on
+  # one origin (no CORS, cookies stay SameSite=lax). Requires ./Caddyfile
+  # (copy Caddyfile.example) and the SPA build output in ./www. With a
+  # domain configured in the Caddyfile, TLS certificates are automatic.
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: [web]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./www:/srv/www:ro
+      - caddy-data:/data # ACME certificates survive recreation
+      - caddy-config:/config
+
   # --- Services -------------------------------------------------------------
 
   enact-main:
@@ -151,6 +176,8 @@ services:
       MODELS_API_URL: http://enact-model-management:8005
       AGENT_API_URL: http://enact-agent-management-api:8001
       KB_API_URL: http://enact-kb-api:8002
+      TOOL_REGISTRY_API_URL: http://enact-tool-registry:8007
+      EXTERNAL_IDENTITIES_API_URL: http://enact-external-identities:8008
       S2S_KEY_ID: enact-main
       S2S_JWKS_FILE: /s2s/jwks.yaml
       S2S_ACL_FILE: /s2s/acl/enact-main.yaml
@@ -167,6 +194,7 @@ services:
       SERVICE_NAME: enact-agent-management-api
       SERVICE_PORT: "8001"
       KB_API_URL: http://enact-kb-api:8002
+      TOOL_REGISTRY_API_URL: http://enact-tool-registry:8007
       S2S_KEY_ID: enact-agent-management-api
       S2S_JWKS_FILE: /s2s/jwks.yaml
       S2S_ACL_FILE: /s2s/acl/enact-agent-management-api.yaml
@@ -215,12 +243,18 @@ services:
     depends_on:
       opensearch:
         condition: service_healthy
+      # Redis carries the "credential connected" signal that resumes a tool
+      # call parked on a missing credential.
+      redis:
+        condition: service_healthy
     environment:
       <<: *infra-env
       SERVICE_NAME: enact-model-inference
       SERVICE_PORT: "8004"
       KB_API_URL: http://enact-kb-api:8002
       AGENT_API_URL: http://enact-agent-management-api:8001
+      TOOL_REGISTRY_API_URL: http://enact-tool-registry:8007
+      EXTERNAL_IDENTITIES_API_URL: http://enact-external-identities:8008
       S2S_KEY_ID: enact-model-inference
       S2S_JWKS_FILE: /s2s/jwks.yaml
       S2S_ACL_FILE: /s2s/acl/enact-model-inference.yaml
@@ -237,6 +271,44 @@ services:
       S2S_ACL_FILE: /s2s/acl/enact-model-management.yaml
       S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-model-management.key
 
+  enact-tool-registry:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-tool-registry:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-tool-registry
+      SERVICE_PORT: "8007"
+      # Probing a credential-gated MCP server needs the owner's credentials.
+      EXTERNAL_IDENTITIES_API_URL: http://enact-external-identities:8008
+      S2S_KEY_ID: enact-tool-registry
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-tool-registry.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-tool-registry.key
+
+  enact-external-identities:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-external-identities:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      # Publishes the "credential connected" signal (see enact-model-inference).
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-external-identities
+      SERVICE_PORT: "8008"
+      # The OAuth callback must be reachable by the user's BROWSER: behind
+      # the Caddy entry point this is https://<domain>/identities.
+      IDENTITIES_PUBLIC_URL: ${IDENTITIES_PUBLIC_URL:-http://localhost:8008}
+      S2S_KEY_ID: enact-external-identities
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-external-identities.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-external-identities.key
+
   enact-tests:
     <<: *common
     image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-tests:${ENACT_TAG:-latest}
@@ -250,6 +322,9 @@ services:
       INFERENCE_API_URL: http://enact-model-inference:8004
       MODELS_API_URL: http://enact-model-management:8005
       MAIN_API_URL: http://enact-main:8000
+      TOOL_REGISTRY_API_URL: http://enact-tool-registry:8007
+      EXTERNAL_IDENTITIES_API_URL: http://enact-external-identities:8008
+      TEST_MCP_URL: http://enact-tests:8099
       S2S_KEY_ID: enact-tests
       S2S_JWKS_FILE: /s2s/jwks.yaml
       S2S_ACL_FILE: /s2s/acl/enact-tests.yaml
@@ -259,3 +334,5 @@ services:
 volumes:
   opensearch-data:
   redis-data:
+  caddy-data:
+  caddy-config:

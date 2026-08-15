@@ -18,6 +18,7 @@ import (
 	"enact/internal/models"
 	"enact/internal/queue"
 	"enact/internal/requesthelper"
+	"enact/internal/tools"
 )
 
 // maxUploadBytes caps the size of a RAG document upload. Requests whose body
@@ -36,12 +37,13 @@ type AgentAPI struct {
 	agents   *agents.Repository
 	rags     *agents.RAGRepository
 	kbs      *kb.Client
+	tools    *tools.Client
 	producer *queue.Producer
 	logger   *logging.Logger
 }
 
-func newAgentAPI(agentRepo *agents.Repository, rags *agents.RAGRepository, kbs *kb.Client, producer *queue.Producer, logger *logging.Logger) *AgentAPI {
-	return &AgentAPI{agents: agentRepo, rags: rags, kbs: kbs, producer: producer, logger: logger}
+func newAgentAPI(agentRepo *agents.Repository, rags *agents.RAGRepository, kbs *kb.Client, toolsClient *tools.Client, producer *queue.Producer, logger *logging.Logger) *AgentAPI {
+	return &AgentAPI{agents: agentRepo, rags: rags, kbs: kbs, tools: toolsClient, producer: producer, logger: logger}
 }
 
 type agentRequest struct {
@@ -49,6 +51,8 @@ type agentRequest struct {
 	Model            string   `json:"model"`
 	SystemPrompt     string   `json:"system_prompt"`
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+	// Tools names registered MCP servers whose tools the agent may call.
+	Tools []string `json:"tools"`
 }
 
 // agentUpdateRequest is the partial-update body: pointer fields distinguish
@@ -60,6 +64,7 @@ type agentUpdateRequest struct {
 	Model            *string   `json:"model"`
 	SystemPrompt     *string   `json:"system_prompt"`
 	KnowledgeBaseIDs *[]string `json:"knowledge_base_ids"`
+	Tools            *[]string `json:"tools"`
 }
 
 type agentResponse struct {
@@ -69,6 +74,7 @@ type agentResponse struct {
 	Model            string    `json:"model"`
 	SystemPrompt     string    `json:"system_prompt"`
 	KnowledgeBaseIDs []string  `json:"knowledge_base_ids"`
+	Tools            []string  `json:"tools"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }
@@ -198,7 +204,34 @@ func (a *AgentAPI) validate(req *restful.Request, logger *logging.Logger, body a
 		logger.Warn("agent validation failed: name is required")
 		return "name is required", false
 	}
-	return a.validateKBs(req, logger, body.KnowledgeBaseIDs)
+	if msg, ok := a.validateKBs(req, logger, body.KnowledgeBaseIDs); !ok {
+		return msg, false
+	}
+	return a.validateTools(req, logger, body.Tools)
+}
+
+// validateTools checks that every referenced MCP server is registered,
+// asking the tool registry (the owner of that domain).
+func (a *AgentAPI) validateTools(req *restful.Request, logger *logging.Logger, serverIDs []string) (string, bool) {
+	if len(serverIDs) == 0 {
+		return "", true
+	}
+	servers, err := a.tools.List(req.Request.Context(), serverIDs, "")
+	if err != nil {
+		logger.Error("failed to validate mcp servers", "server_ids", serverIDs, "err", err)
+		return "failed to validate MCP servers", false
+	}
+	known := make(map[string]bool, len(servers))
+	for _, s := range servers {
+		known[s.ID] = true
+	}
+	for _, id := range serverIDs {
+		if !known[id] {
+			logger.Warn("agent validation failed: mcp server not found", "server_id", id)
+			return fmt.Sprintf("MCP server %q not found", id), false
+		}
+	}
+	return "", true
 }
 
 // validateKBs checks that every referenced knowledge base exists, asking the
@@ -240,6 +273,7 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 		Model:            body.Model,
 		SystemPrompt:     body.SystemPrompt,
 		KnowledgeBaseIDs: normalizeIDs(body.KnowledgeBaseIDs),
+		Tools:            normalizeIDs(body.Tools),
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
@@ -348,6 +382,13 @@ func (a *AgentAPI) update(req *restful.Request, resp *restful.Response) {
 			return
 		}
 		existing.KnowledgeBaseIDs = normalizeIDs(*body.KnowledgeBaseIDs)
+	}
+	if body.Tools != nil {
+		if msg, valid := a.validateTools(req, logger, *body.Tools); !valid {
+			writeError(req, resp, http.StatusBadRequest, msg)
+			return
+		}
+		existing.Tools = normalizeIDs(*body.Tools)
 	}
 	logger.Info("agent changes applied", "model", existing.Model, "knowledge_base_ids", existing.KnowledgeBaseIDs, "system_prompt_chars", len(existing.SystemPrompt))
 	existing.UpdatedAt = time.Now().UTC()
@@ -553,6 +594,7 @@ func toAgentResponse(a agents.Agent) agentResponse {
 		Model:            a.Model,
 		SystemPrompt:     a.SystemPrompt,
 		KnowledgeBaseIDs: normalizeIDs(a.KnowledgeBaseIDs),
+		Tools:            normalizeIDs(a.Tools),
 		CreatedAt:        a.CreatedAt,
 		UpdatedAt:        a.UpdatedAt,
 	}

@@ -41,6 +41,17 @@ type Config struct {
 	InferenceAPIURL string `env:"INFERENCE_API_URL, default=http://localhost:8080"`
 	ModelsAPIURL    string `env:"MODELS_API_URL, default=http://localhost:8081"`
 	MainAPIURL      string `env:"MAIN_API_URL, default=http://localhost:8000"`
+	ToolRegistryURL string `env:"TOOL_REGISTRY_API_URL, default=http://localhost:8007"`
+	IdentitiesURL   string `env:"EXTERNAL_IDENTITIES_API_URL, default=http://localhost:8008"`
+
+	// MCPFixtureListen is where the embedded MCP fixture server listens;
+	// MCPFixtureURL is that server as the REGISTRY reaches it (differs in
+	// docker compose, where it is this container's hostname).
+	MCPFixtureListen string `env:"TEST_MCP_LISTEN, default=:8099"`
+	MCPFixtureURL    string `env:"TEST_MCP_URL, default=http://localhost:8099"`
+	// The OAuth fixture provider, same listen-vs-reachable-URL split.
+	OAuthFixtureListen string `env:"TEST_OAUTH_LISTEN, default=:8098"`
+	OAuthFixtureURL    string `env:"TEST_OAUTH_URL, default=http://localhost:8098"`
 
 	// TestUserID isolates test data from real users.
 	TestUserID string `env:"TEST_USER_ID, default=integration-tests"`
@@ -65,10 +76,18 @@ func Build(cfg *Config) service.Builder {
 			InferenceAPIURL: cfg.InferenceAPIURL,
 			ModelsAPIURL:    cfg.ModelsAPIURL,
 			MainAPIURL:      cfg.MainAPIURL,
+			ToolRegistryURL: cfg.ToolRegistryURL,
+			IdentitiesURL:   cfg.IdentitiesURL,
+			MCPFixtureURL:   cfg.MCPFixtureURL,
+			OAuthFixtureURL: cfg.OAuthFixtureURL,
 			UserID:          cfg.TestUserID,
 			AdminEmail:      cfg.AdminEmail,
 			Timeout:         cfg.TestTimeout,
 		}
+		// The MCP fixture is part of the service, not a case: registry and
+		// agent cases need a live spec-compliant server to point at.
+		utils.StartMCPFixture(cfg.MCPFixtureListen, logger)
+		utils.StartOAuthFixture(cfg.OAuthFixtureListen, logger)
 		// The fleet requires the platform's private keys; without S2S there
 		// is nothing to sign, so the cases run with plain clients.
 		if s2sRuntime.Enabled() {

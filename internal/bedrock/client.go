@@ -5,12 +5,15 @@ package bedrock
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
 
@@ -35,10 +38,46 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	return &Client{api: bedrockruntime.NewFromConfig(awsCfg)}, nil
 }
 
-// Message is a single conversational turn passed to Converse.
+// Message is a single conversational turn passed to Converse. Beyond plain
+// text, an assistant turn may carry the tool calls the model requested
+// (ToolUses) and a user turn may carry their outcomes (ToolResults) — the
+// shapes a Converse tool-use loop threads back into the conversation.
 type Message struct {
 	Role    string // "user" or "assistant"
 	Content string
+	// ToolUses are the model's tool invocations (assistant turns).
+	ToolUses []ToolUse
+	// ToolResults answer earlier tool uses (user turns).
+	ToolResults []ToolResult
+}
+
+// ToolSpec advertises one callable tool to the model.
+type ToolSpec struct {
+	// Name must satisfy Bedrock's tool-name rules (letters, digits, _ -).
+	Name        string
+	Description string
+	// InputSchema is the tool's JSON Schema, passed to the model verbatim.
+	InputSchema json.RawMessage
+}
+
+// ToolUse is one tool invocation requested by the model.
+type ToolUse struct {
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+// ToolResult is the outcome of one tool invocation, fed back to the model.
+//
+// Content and Structured are what the tool actually returned — MCP servers
+// may send text, a structured object, or both, and both are forwarded as
+// their own content blocks so the model reads JSON as JSON rather than as a
+// string that happens to look like it.
+type ToolResult struct {
+	ToolUseID  string
+	Content    string
+	Structured json.RawMessage
+	IsError    bool
 }
 
 // Document is a raw file the model reads natively via a Bedrock Converse
@@ -60,14 +99,18 @@ type ConverseRequest struct {
 	Messages     []Message
 	SystemPrompt string
 	Documents    []Document
-	MaxTokens    int32
-	Temperature  *float32
-	TopP         *float32
+	// Tools the model may call; a "tool_use" stop reason then carries the
+	// requested invocations.
+	Tools       []ToolSpec
+	MaxTokens   int32
+	Temperature *float32
+	TopP        *float32
 }
 
 // ConverseResponse is the high-level output from Converse.
 type ConverseResponse struct {
 	Content      string
+	ToolUses     []ToolUse
 	StopReason   string
 	InputTokens  int32
 	OutputTokens int32
@@ -88,6 +131,32 @@ type converseParams struct {
 	messages        []types.Message
 	system          []types.SystemContentBlock
 	inferenceConfig *types.InferenceConfiguration
+	toolConfig      *types.ToolConfiguration
+}
+
+// rawToDocument converts raw JSON into the SDK's document representation
+// (marshaling a json.RawMessage directly would base64 the bytes).
+func rawToDocument(raw json.RawMessage) document.Interface {
+	var v any
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &v)
+	}
+	if v == nil {
+		v = map[string]any{}
+	}
+	return document.NewLazyDocument(v)
+}
+
+// documentToRaw extracts the JSON of an SDK document.
+func documentToRaw(doc document.Interface) json.RawMessage {
+	if doc == nil {
+		return nil
+	}
+	raw, err := doc.MarshalSmithyDocument()
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 func buildConverseParams(req *ConverseRequest) converseParams {
@@ -97,10 +166,46 @@ func buildConverseParams(req *ConverseRequest) converseParams {
 		if m.Role == "assistant" {
 			role = types.ConversationRoleAssistant
 		}
-		msgs = append(msgs, types.Message{
-			Role:    role,
-			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: m.Content}},
-		})
+		var content []types.ContentBlock
+		if m.Content != "" || (len(m.ToolUses) == 0 && len(m.ToolResults) == 0) {
+			content = append(content, &types.ContentBlockMemberText{Value: m.Content})
+		}
+		for _, tu := range m.ToolUses {
+			content = append(content, &types.ContentBlockMemberToolUse{
+				Value: types.ToolUseBlock{
+					ToolUseId: aws.String(tu.ID),
+					Name:      aws.String(tu.Name),
+					Input:     rawToDocument(tu.Input),
+				},
+			})
+		}
+		for _, tr := range m.ToolResults {
+			status := types.ToolResultStatusSuccess
+			if tr.IsError {
+				status = types.ToolResultStatusError
+			}
+			// A result block carries a list, so a tool that returned both
+			// prose and data is represented as both — no flattening, and no
+			// duplicating one as the other.
+			var blocks []types.ToolResultContentBlock
+			if tr.Content != "" {
+				blocks = append(blocks, &types.ToolResultContentBlockMemberText{Value: tr.Content})
+			}
+			if len(tr.Structured) > 0 {
+				blocks = append(blocks, &types.ToolResultContentBlockMemberJson{Value: rawToDocument(tr.Structured)})
+			}
+			if len(blocks) == 0 {
+				blocks = append(blocks, &types.ToolResultContentBlockMemberText{Value: tr.Content})
+			}
+			content = append(content, &types.ContentBlockMemberToolResult{
+				Value: types.ToolResultBlock{
+					ToolUseId: aws.String(tr.ToolUseID),
+					Status:    status,
+					Content:   blocks,
+				},
+			})
+		}
+		msgs = append(msgs, types.Message{Role: role, Content: content})
 	}
 
 	// Documents ride in the last user message, per the Converse API's
@@ -129,6 +234,20 @@ func buildConverseParams(req *ConverseRequest) converseParams {
 	}
 	if req.SystemPrompt != "" {
 		p.system = []types.SystemContentBlock{&types.SystemContentBlockMemberText{Value: req.SystemPrompt}}
+	}
+	if len(req.Tools) > 0 {
+		specs := make([]types.Tool, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			spec := types.ToolSpecification{
+				Name:        aws.String(t.Name),
+				InputSchema: &types.ToolInputSchemaMemberJson{Value: rawToDocument(t.InputSchema)},
+			}
+			if t.Description != "" {
+				spec.Description = aws.String(t.Description)
+			}
+			specs = append(specs, &types.ToolMemberToolSpec{Value: spec})
+		}
+		p.toolConfig = &types.ToolConfiguration{Tools: specs}
 	}
 
 	cfg := &types.InferenceConfiguration{}
@@ -159,6 +278,7 @@ func (c *Client) Converse(ctx context.Context, req *ConverseRequest) (*ConverseR
 		Messages:        p.messages,
 		System:          p.system,
 		InferenceConfig: p.inferenceConfig,
+		ToolConfig:      p.toolConfig,
 	})
 	if err != nil {
 		return nil, err
@@ -167,8 +287,15 @@ func (c *Client) Converse(ctx context.Context, req *ConverseRequest) (*ConverseR
 	resp := &ConverseResponse{StopReason: string(out.StopReason)}
 	if outputMsg, ok := out.Output.(*types.ConverseOutputMemberMessage); ok {
 		for _, block := range outputMsg.Value.Content {
-			if textBlock, ok := block.(*types.ContentBlockMemberText); ok {
-				resp.Content += textBlock.Value
+			switch b := block.(type) {
+			case *types.ContentBlockMemberText:
+				resp.Content += b.Value
+			case *types.ContentBlockMemberToolUse:
+				resp.ToolUses = append(resp.ToolUses, ToolUse{
+					ID:    aws.ToString(b.Value.ToolUseId),
+					Name:  aws.ToString(b.Value.Name),
+					Input: documentToRaw(b.Value.Input),
+				})
 			}
 		}
 	}
@@ -183,34 +310,80 @@ func (c *Client) Converse(ctx context.Context, req *ConverseRequest) (*ConverseR
 	return resp, nil
 }
 
-// ConverseStream runs a streaming Bedrock conversation turn, invoking onChunk
-// for each event. A final chunk with Done=true is emitted after the upstream
-// stream closes cleanly.
-func (c *Client) ConverseStream(ctx context.Context, req *ConverseRequest, onChunk func(StreamChunk) error) error {
+// StreamResult is the accumulated outcome of one streaming turn: the full
+// assistant text, any tool invocations the model requested, and the turn's
+// stop reason and token usage. Callers running a tool loop feed Content +
+// ToolUses back as the assistant message.
+type StreamResult struct {
+	Content      string
+	ToolUses     []ToolUse
+	StopReason   string
+	InputTokens  int32
+	OutputTokens int32
+}
+
+// ConverseStream runs one streaming Bedrock conversation turn, invoking
+// onChunk for each text delta / stop / usage event, and returns the
+// accumulated turn. It does NOT emit a Done chunk — a tool loop spans
+// several turns, so end-of-response is the caller's call.
+func (c *Client) ConverseStream(ctx context.Context, req *ConverseRequest, onChunk func(StreamChunk) error) (*StreamResult, error) {
 	p := buildConverseParams(req)
 	out, err := c.api.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
 		ModelId:         p.modelID,
 		Messages:        p.messages,
 		System:          p.system,
 		InferenceConfig: p.inferenceConfig,
+		ToolConfig:      p.toolConfig,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	stream := out.GetStream()
 	defer stream.Close()
 
+	result := &StreamResult{}
+	var content strings.Builder
+	// One tool-use block accumulates between ContentBlockStart and
+	// ContentBlockStop; its input JSON arrives as string fragments.
+	var currentTool *ToolUse
+	var currentInput strings.Builder
+
 	for event := range stream.Events() {
 		switch e := event.(type) {
+		case *types.ConverseStreamOutputMemberContentBlockStart:
+			if ts, ok := e.Value.Start.(*types.ContentBlockStartMemberToolUse); ok {
+				currentTool = &ToolUse{
+					ID:   aws.ToString(ts.Value.ToolUseId),
+					Name: aws.ToString(ts.Value.Name),
+				}
+				currentInput.Reset()
+			}
 		case *types.ConverseStreamOutputMemberContentBlockDelta:
-			if td, ok := e.Value.Delta.(*types.ContentBlockDeltaMemberText); ok {
+			switch td := e.Value.Delta.(type) {
+			case *types.ContentBlockDeltaMemberText:
+				content.WriteString(td.Value)
 				if err := onChunk(StreamChunk{Delta: td.Value}); err != nil {
-					return err
+					return nil, err
+				}
+			case *types.ContentBlockDeltaMemberToolUse:
+				if currentTool != nil && td.Value.Input != nil {
+					currentInput.WriteString(*td.Value.Input)
 				}
 			}
+		case *types.ConverseStreamOutputMemberContentBlockStop:
+			if currentTool != nil {
+				input := currentInput.String()
+				if input == "" {
+					input = "{}"
+				}
+				currentTool.Input = json.RawMessage(input)
+				result.ToolUses = append(result.ToolUses, *currentTool)
+				currentTool = nil
+			}
 		case *types.ConverseStreamOutputMemberMessageStop:
-			if err := onChunk(StreamChunk{StopReason: string(e.Value.StopReason)}); err != nil {
-				return err
+			result.StopReason = string(e.Value.StopReason)
+			if err := onChunk(StreamChunk{StopReason: result.StopReason}); err != nil {
+				return nil, err
 			}
 		case *types.ConverseStreamOutputMemberMetadata:
 			chunk := StreamChunk{}
@@ -222,13 +395,16 @@ func (c *Client) ConverseStream(ctx context.Context, req *ConverseRequest, onChu
 					chunk.OutputTokens = *e.Value.Usage.OutputTokens
 				}
 			}
+			result.InputTokens += chunk.InputTokens
+			result.OutputTokens += chunk.OutputTokens
 			if err := onChunk(chunk); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
 	if err := stream.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	return onChunk(StreamChunk{Done: true})
+	result.Content = content.String()
+	return result, nil
 }

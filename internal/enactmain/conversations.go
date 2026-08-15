@@ -56,7 +56,10 @@ const maxMessageContextFiles = 5
 // conversationsWebService returns the session-guarded conversation routes.
 func (a *MainAPI) conversationsWebService() *restful.WebService {
 	ws := new(restful.WebService)
-	ws.Path("/conversations").Produces(restful.MIME_JSON)
+	// Adding a message streams SSE, so the group advertises both media
+	// types; without it a client sending Accept: text/event-stream is
+	// refused with 406.
+	ws.Path("/conversations").Produces(restful.MIME_JSON, "text/event-stream")
 	ws.Filter(a.csrfOriginFilter)
 	ws.Filter(a.requireSession)
 
@@ -307,26 +310,46 @@ func (a *MainAPI) addMessage(req *restful.Request, resp *restful.Response) {
 		Messages:     make([]inference.Message, 0, len(conv.Messages)),
 	}
 	for _, m := range conv.Messages {
-		infReq.Messages = append(infReq.Messages, inference.Message{Role: m.Role, Content: m.Content})
+		// Tool calls travel with the message that made them, so the model
+		// sees what it already did — and does not redo it.
+		calls := make([]inference.MessageToolCall, 0, len(m.ToolCalls))
+		for _, c := range m.ToolCalls {
+			calls = append(calls, inference.MessageToolCall{
+				ServerID:          c.ServerID,
+				Tool:              c.Tool,
+				ToolUseID:         c.ToolUseID,
+				Arguments:         c.Arguments,
+				Content:           c.Content,
+				StructuredContent: c.StructuredContent,
+				IsError:           c.IsError,
+				Turn:              c.Turn,
+				Text:              c.Text,
+			})
+		}
+		infReq.Messages = append(infReq.Messages, inference.Message{Role: m.Role, Content: m.Content, ToolCalls: calls})
 	}
 
 	// The meta event carries the conversation id so a client that just
 	// created the conversation has it without a second request.
-	assistant, streamErr := a.relayInferenceStream(req, resp, logger, infReq, map[string]any{"conversation_id": conv.ID})
+	out, streamErr := a.relayInferenceStream(req, resp, logger, infReq, map[string]any{"conversation_id": conv.ID})
 	if streamErr != nil {
-		logger.Warn("stream ended with error; persisting partial result", "assistant_chars", len(assistant))
+		logger.Warn("stream ended with error; persisting partial result", "assistant_chars", len(out.Assistant))
 	}
-	logger.Info("stream relayed", "assistant_chars", len(assistant))
+	logger.Info("stream relayed", "assistant_chars", len(out.Assistant), "tool_calls", len(out.ToolCalls))
 
 	// Persist: the user message always; the assistant message when any text
 	// arrived. Saving must survive the browser hanging up mid-stream, so it
 	// does not use the (possibly cancelled) request context.
-	if len(assistant) > 0 {
+	// Tool calls alone are worth an assistant message: a turn that ran tools
+	// and then lost the connection still happened, and the record of what it
+	// did should survive.
+	if len(out.Assistant) > 0 || len(out.ToolCalls) > 0 {
 		conv.Messages = append(conv.Messages, conversations.Message{
 			Role:      "assistant",
-			Content:   assistant,
+			Content:   out.Assistant,
 			AgentID:   body.AgentID,
 			Model:     body.Model,
+			ToolCalls: out.ToolCalls,
 			CreatedAt: time.Now().UTC(),
 		})
 	}

@@ -15,6 +15,7 @@ import (
 	"enact/internal/queue"
 	"enact/internal/s2s"
 	"enact/internal/service"
+	"enact/internal/tools"
 )
 
 // Config wires the runtime, OpenSearch, the Redis queue (RAG document
@@ -22,11 +23,12 @@ import (
 // knowledge bases an agent references.
 type Config struct {
 	service.Config
-	OpenSearch opensearch.Config
-	Queue      queue.Config
-	Agents     agents.Config
-	KBAPI      kb.ClientConfig
-	S2S        s2s.Config
+	OpenSearch   opensearch.Config
+	Queue        queue.Config
+	Agents       agents.Config
+	KBAPI        kb.ClientConfig
+	ToolRegistry tools.ClientConfig
+	S2S          s2s.Config
 }
 
 // Build constructs the agent management API, verifying the backing indices
@@ -57,9 +59,10 @@ func Build(cfg *Config) service.Builder {
 			return nil, err
 		}
 		kbClient := kb.NewClient(cfg.KBAPI, s2sRuntime.Transport(nil, "enact-kb-api"))
+		toolsClient := tools.NewClient(cfg.ToolRegistry, s2sRuntime.Transport(nil, "enact-tool-registry"))
 		producer := queue.NewProducer(cfg.Queue)
-		logger.Info("agent api initialized", "stream", cfg.Queue.Stream, "kb_api", cfg.KBAPI.BaseURL, "s2s_key_id", cfg.S2S.KeyID)
-		ws := newAgentAPI(agentRepo, rags, kbClient, producer, logger).WebService()
+		logger.Info("agent api initialized", "stream", cfg.Queue.Stream, "kb_api", cfg.KBAPI.BaseURL, "tool_registry", cfg.ToolRegistry.BaseURL, "s2s_key_id", cfg.S2S.KeyID)
+		ws := newAgentAPI(agentRepo, rags, kbClient, toolsClient, producer, logger).WebService()
 		if s2sRuntime.Enabled() {
 			ws.Filter(s2sRuntime.Filter)
 		}

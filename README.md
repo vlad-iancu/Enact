@@ -22,7 +22,9 @@ and Apache Tika. Agents can be grounded in documents two ways, independently:
 | `enact-kb-api`                  | Create/delete knowledge bases; upload **context documents**. Raw file bytes are base64-encoded and pushed onto the Redis queue, **not** processed inline. |
 | `enact-kb-document-indexer`     | Consumes the queue and extracts text via Tika. KB context documents are stored whole; agent RAG documents are chunked + embedded (Bedrock Titan) into the k-NN index. No public API (health probe only). |
 | `enact-agent-management-api`    | CRUD for agents (`model`, `system_prompt`, `knowledge_base_ids`); upload **RAG documents** to an agent (`POST /v1/agents/{id}/rag/documents`). |
-| `enact-model-inference`         | `POST /v1/inference`. Accepts `agent_id`; resolves the agent's model, loads the KB context files whole, retrieves top-k chunks from the agent's RAG collection, and augments the system prompt. |
+| `enact-model-inference`         | `POST /v1/inference`. Accepts `agent_id`; resolves the agent's model, loads the KB context files whole, retrieves top-k chunks from the agent's RAG collection, and augments the system prompt. Agents with MCP `tools` run a Bedrock tool-use loop (max `MAX_TURNS`, default 10): tool calls execute through the registry's MCP proxy and stream as `toolCall` / `toolCallResult` SSE events. |
+| `enact-external-identities`     | Credentials the platform holds on a user's behalf at third parties (Google Workspace, GitHub, JIRA). Registers providers (`POST /v1/providers/oauth` with well-known discovery, `POST /v1/providers/pat`), owns the OAuth consent flow (`/v1/oauth/authorize` + `/v1/oauth/callback`), serves usable credentials to services, and refreshes tokens on a background sweep. Credentials are AES-256-GCM sealed at rest (ADR-0013). |
+| `enact-tool-registry`           | MCP servers on the platform: register (`POST /v1/servers/create`, health-checked), partial update, list, and a cached tool catalogue (`GET /v1/servers/tools`, refreshed every `REFRESH_AT`). `/v1/servers/{id}/mcp` and `/{id}/sse` are spec-compliant MCP proxies to the underlying server. |
 
 Every service also exposes `GET /healthz`, a home page at `/`, and Swagger UI
 at `/swagger-ui/` for free (via `internal/service`).
@@ -250,8 +252,41 @@ docker compose -f docker-compose.app.yml logs -f enact-main
 
 Only `enact-main` (8000) is published; `enact-tests` listens on
 `127.0.0.1:8006` (reach it via `ssh -L 8006:127.0.0.1:8006 <vm>` to trigger
-the integration suite). Put a TLS reverse proxy in front of 8000 before real
-use (`SECURE_COOKIES=true`, and `COOKIE_SAMESITE=none` requires HTTPS).
+the integration suite).
+
+### Hosting the frontend on the same machine
+
+The stack ships an optional web entry point (`--profile web`): a Caddy
+container that serves the SPA build and proxies `/api/*` to enact-main —
+one origin, so CORS never comes into play and cookies stay `SameSite=lax`.
+With a domain in the Caddyfile, Let's Encrypt TLS is automatic (open ports
+80+443 in the EC2 security group).
+
+```sh
+# On the VM, next to the compose file:
+cp Caddyfile.example Caddyfile   # then pick the domain or bare-IP block
+
+# From the frontend repo on the dev machine:
+npm run build
+rsync -av --delete dist/ user@vm:/opt/enact/www/
+
+# Point the browser-facing URLs at the proxy in enact-main.env:
+#   PUBLIC_BASE_URL=https://<domain>/api
+#   OAUTH_REDIRECT_URL=https://<domain>/api/google/oauth/callback   (register
+#     this exact URL in the Google Cloud console)
+#   FRONTEND_URL=https://<domain>
+#   SECURE_COOKIES=true
+# ...and set the frontend's API base URL to /api when building it.
+
+docker compose -f docker-compose.app.yml --profile web up -d
+```
+
+`make docker-deploy` detects a `Caddyfile` on the VM and enables the
+profile automatically. Frontend updates are just a rebuild + rsync of
+`www/` — no container restart needed (Caddy serves the files live). Once
+the proxy fronts everything, consider re-binding enact-main's port to
+loopback (`127.0.0.1:8000:8000` in the compose file) so nothing bypasses
+TLS.
 
 To update: `make docker-push REGISTRY=...` on the dev machine, bump
 `ENACT_TAG` in `/opt/enact/.env`, then `docker compose pull && docker compose
@@ -265,6 +300,197 @@ compose file and run `infrastructure.sh provision` against that cluster
 free tier the cluster powers off when idle; the services then crash-loop
 (`restart: unless-stopped`) until it is powered back on — expected recovery
 behavior, not a bug.
+
+## Per-user credentials for MCP tools
+
+A registered MCP server can declare, per tool, which third-party credentials
+the tool needs and how to present them. At call time the inference service
+resolves the **calling user's** credentials, renders them, and injects them;
+if the user has not connected the account yet the call parks and the UI is
+told (ADR-0014).
+
+```json
+{
+  "id": "github-mcp",
+  "url": "https://api.githubcopilot.com/mcp/",
+  "transport_type": "streamable-http",
+  "tool_access_requirements": {
+    "list_issues": [{ "provider": "github", "access_level": "read" }]
+  },
+  "tool_authorizations": {
+    "list_issues": {
+      "headers_authorization": [
+        { "header_name": "Authorization", "header_template": "Bearer {{ (cred \"github\").Credentials }}" }
+      ],
+      "param_authorization": [
+        { "param_name": "api_key", "param_template": "{{ (cred \"github\").Credentials }}" }
+      ]
+    }
+  }
+}
+```
+
+**`"*"` stands for every tool the server offers** — the ordinary case, where
+one server talks to one third party and every tool needs the same
+credential. It works in both maps, and a key naming a tool outright beats it
+for that tool, *whole*: the specific entry replaces the wildcard's rather
+than adding to it, so what a tool sends is always one list read from one
+place. A tool needing the wildcard's credentials plus its own restates both.
+The two maps are resolved independently, so a tool may declare its own
+requirements and still inherit the wildcard's authorization — registration
+validates that combination by rendering the inherited templates against that
+tool's own requirements.
+
+```json
+"tool_access_requirements": { "*": [{ "provider": "github", "access_level": "read" }] },
+"tool_authorizations": { "*": { "headers_authorization": [
+  { "header_name": "Authorization", "header_template": "Bearer {{ (cred \"github\").Credentials }}" }
+]}}
+```
+
+A tool may require several providers but **one access level per provider**.
+`access_level` may be **omitted**, and then the requirement is only "the user
+has connected this provider" with no coverage check — which is the whole
+contract for a credential that has nothing to say about scope, such as a
+plain API key.
+
+Provider registration differs by type. A **PAT** provider needs nothing but a
+name: the user pastes a token whose scope the platform can neither see nor
+influence, so `access_levels` there is optional labelling. An **OAuth**
+provider must declare `scopes` or `access_levels` — consent is a list of
+permissions shown to a user, so a provider naming none describes nothing a
+caller could request.
+Credentials belong to the **provider**, not to the server: a user connects
+GitHub once and every server that declares a GitHub requirement uses that
+one identity — so registering a server is enough to reach a user's
+credential for any provider it declares, and disconnecting a provider
+revokes it everywhere at once.
+
+**Templates** are Go `text/template` over the resolved credentials, keyed by
+provider name (`.Credentials`, `.Username`, `.TokenType`, `.AccessLevel`).
+Use **`cred "name"`** rather than a field selector: provider names may
+contain `-`, and `{{ .my-provider.Credentials }}` does not parse. `b64` is
+available for Basic auth:
+`Basic {{ b64 (printf "%s:%s" (cred "jira").Username (cred "jira").Credentials) }}`.
+Registration validates every template by rendering it against sentinel
+credentials, so a configuration that registers is one that will render.
+
+**When a credential is missing**, the stream emits
+`toolCallWaitingAuthorization` with `status` `waiting` → `resolved` |
+`timeout`:
+
+```json
+{ "server_id": "github-mcp", "tool": "list_issues", "tool_use_id": "…",
+  "status": "waiting",
+  "missing": [{ "provider": "github", "access_level": "read", "reason": "not_connected" }] }
+```
+
+It carries coordinates, not a URL — the inference service does not know the
+frontend's origin. The UI builds
+`/identities/connect?provider=…&access_level=…` (OAuth) or posts
+`/identities/pat`. The moment the credential lands, the identity
+service publishes on Redis and the parked call resumes (measured at ~20ms);
+`TOOL_AUTH_RECHECK_INTERVAL` is the fallback and `TOOL_AUTH_WAIT_TIMEOUT`
+(default 5m) the ceiling.
+
+**Tool calls are persisted** on the assistant message of a conversation
+(`tool_calls`: server, tool, `tool_use_id`, the model's arguments, the result
+text and `is_error`), so reopening a thread shows what the agent did, not
+only what it concluded. The arguments stored are the model's own — credential
+injection happens after the record is made, so a stored conversation never
+carries a user's token. They are stored but **not indexed**: a tool's
+arguments are arbitrary JSON, and dynamic mapping would turn every argument
+name into an index field.
+
+They are also **replayed into the model's context** on later turns, as a
+transcript rather than a summary. Each record carries its `turn` (the
+tool-loop round it belongs to), the assistant's own `text` in that round, and
+the result as the tool returned it — prose in `content`, structure in
+`structured_content`. Replay rebuilds the rounds in order:
+
+```
+assistant { text, tool_use }    round 1
+user      { tool_result }
+assistant { text, tool_use }    round 2 — made KNOWING round 1's results
+user      { tool_result }
+assistant { text }              the answer
+```
+
+Collapsing the rounds would tell the model something untrue about its own
+reasoning, so they are kept apart. Structured results are sent as native
+`ToolResultContentBlockMemberJson` blocks, so the model reads JSON as JSON;
+a tool that returned both prose and data contributes both blocks. The
+pairing is validated upstream — a `tool_use` with no matching `tool_result`
+in the next message is rejected — so both halves are built from one record
+and dropped together, and a call whose tool the agent no longer has is
+skipped with only its text surviving. The cost is real: those tool results
+are re-sent, and re-charged as input tokens, on every subsequent turn.
+
+The UI can also ask **before** a conversation starts:
+`GET /agents/{id}/required-identities` returns every credential the agent's
+tools need, joined with whether the logged-in user has it
+(`connected`, `reason`, plus `provider_type` and `access_levels` so the
+screen knows whether to redirect into OAuth or show a token form), and a
+top-level `satisfied` for a simple "can I run this agent?" check. Entries
+are one per (provider, access level) across all of the agent's servers,
+listing the `servers` and `tools` that need each — one prompt per account to
+connect, not one per server.
+
+**Re-connecting never narrows a credential.** Because one identity serves
+every server, an OAuth authorization asks for the scopes the user already
+granted *plus* the newly requested ones; connecting at `read` cannot strip
+the `admin` access another server depends on.
+
+**Disconnecting revokes.** `DELETE /identities/{provider}` asks the provider
+to invalidate the tokens (RFC 7009, against the record's `revoke_url` —
+taken from the well-known document's `revocation_endpoint` when registration
+does not name one) *before* deleting the platform's copy, so disconnecting
+ends the access rather than merely forgetting it. Revocation is best effort
+by design: a PAT has no revocation API (the user deletes it at the provider),
+and a provider outage must never leave a user unable to delete a credential —
+so the local copy always goes, and the outcome is logged as
+`revocation=revoked|unsupported|failed`.
+
+**Deleting an account deletes its credentials.** `POST /admin/delete-user`
+calls `DELETE /v1/identities/all` first, revoking each credential and
+removing it; unlike the avatar cleanup this step is allowed to fail the whole
+deletion, because a credential nobody can map back to a user is a live grant
+that the refresh sweep would keep alive indefinitely.
+
+**Every deletion path revokes**, through one choke point (`revokeAll`): a
+user disconnecting, an account being deleted, and an admin force-deleting a
+provider — which revokes *before* the cascade, since the provider record it
+is about to delete holds the revocation endpoint and the client secret.
+Re-authorizing is the deliberate exception: replacing a credential does not
+revoke the one it replaces, because most providers revoke the whole grant
+and a re-authorization often returns the same refresh token.
+
+**Servers that authenticate their handshake** — GitHub's answers 401 before
+the JSON-RPC body is parsed, so `initialize` and `tools/list` are refused,
+not just tool calls — are configured with two further keys, `"/initialize"`
+and `"/list-tools"`. They lead with `/` because an MCP tool name never does.
+
+```json
+"tool_access_requirements": { "/initialize": [{ "provider": "github", "access_level": "read" }] },
+"tool_authorizations": { "/initialize": { "headers_authorization": [
+  { "header_name": "Authorization", "header_template": "Bearer {{ (cred \"github\").Credentials }}" }
+]}}
+```
+
+These are resolved against the server's **owner**, everywhere: at
+registration, on the background refresh where no user exists at all, and
+inside a caller's agent session, where the owner's headers go *underneath*
+the caller's — the tool's own headers win a name clash. They are the key to
+the door; the caller's credentials decide who they are once inside. So a
+gated server is usable by people who have no account at that third party,
+which is the point, and it does mean an agent reaches it on the owner's
+access.
+
+Declaring one phase covers both. They never inherit `"*"` — a wildcard is
+about tools, and inheriting it would quietly start spending the owner's
+credential on platform traffic. Registration and any update that changes
+them re-probes the server, so fixing a broken credential is proved rather
+than assumed.
 
 ## End-to-end example
 

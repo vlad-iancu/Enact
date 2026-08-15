@@ -50,7 +50,41 @@ rules:
   # person and the admin filter requires the ADMIN_EMAIL account.
   - route: "POST /admin/create-user"
     allow: [anonymous, "*"]
+  - route: "GET /admin/users"
+    allow: [anonymous, "*"]
+  - route: "POST /admin/identity-providers/oauth"
+    allow: [anonymous, "*"]
+  - route: "POST /admin/identity-providers/pat"
+    allow: [anonymous, "*"]
+  - route: "DELETE /admin/identity-providers/{name}"
+    allow: [anonymous, "*"]
   - route: "POST /admin/delete-user"
+    allow: [anonymous, "*"]
+
+  # MCP server management: browser-facing; sessions authenticate people and
+  # ownership is enforced in the handlers.
+  - route: "POST /mcp-servers"
+    allow: [anonymous, "*"]
+  - route: "GET /mcp-servers"
+    allow: [anonymous, "*"]
+  - route: "GET /mcp-servers/tools"
+    allow: [anonymous, "*"]
+  - route: "PUT /mcp-servers/{id}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /mcp-servers/{id}"
+    allow: [anonymous, "*"]
+
+  # Connected third-party accounts: browser-facing; the session decides
+  # whose credentials are touched, never the request.
+  - route: "GET /identities"
+    allow: [anonymous, "*"]
+  - route: "GET /identities/providers"
+    allow: [anonymous, "*"]
+  - route: "POST /identities/pat"
+    allow: [anonymous, "*"]
+  - route: "GET /identities/connect"
+    allow: [anonymous, "*"]
+  - route: "DELETE /identities/{provider}"
     allow: [anonymous, "*"]
 
   # Agent & knowledge-base management: browser-facing; sessions authenticate
@@ -64,6 +98,8 @@ rules:
   - route: "DELETE /agents/{id}"
     allow: [anonymous, "*"]
   - route: "GET /agents/{id}"
+    allow: [anonymous, "*"]
+  - route: "GET /agents/{id}/required-identities"
     allow: [anonymous, "*"]
   - route: "GET /agents/{id}/rag/documents"
     allow: [anonymous, "*"]

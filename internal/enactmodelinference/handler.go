@@ -19,6 +19,7 @@ import (
 	"enact/internal/models"
 	"enact/internal/rag"
 	"enact/internal/requesthelper"
+	"enact/internal/tools"
 )
 
 // defaultRetrievalTopK is how many RAG chunks are retrieved when the request
@@ -58,12 +59,31 @@ type InferenceAPI struct {
 	agents     *agents.Client
 	rags       *agents.RAGRepository
 	kb         *kb.Client
+	tools      *tools.Client
 	embedModel string
-	logger     *logging.Logger
+	// toolAuth resolves the caller's third-party credentials for tools that
+	// declare requirements, and parks a call until they exist.
+	toolAuth *toolAuthorizer
+	// maxTurns caps how many tool-execution rounds one inference may run.
+	maxTurns int
+	logger   *logging.Logger
 }
 
-func newInferenceAPI(client *bedrock.Client, agentClient *agents.Client, rags *agents.RAGRepository, kbClient *kb.Client, embedModel string, logger *logging.Logger) *InferenceAPI {
-	return &InferenceAPI{client: client, agents: agentClient, rags: rags, kb: kbClient, embedModel: embedModel, logger: logger}
+func newInferenceAPI(client *bedrock.Client, agentClient *agents.Client, rags *agents.RAGRepository, kbClient *kb.Client, toolsClient *tools.Client, toolAuth *toolAuthorizer, embedModel string, maxTurns int, logger *logging.Logger) *InferenceAPI {
+	if maxTurns <= 0 {
+		maxTurns = 10
+	}
+	return &InferenceAPI{
+		client:     client,
+		agents:     agentClient,
+		rags:       rags,
+		kb:         kbClient,
+		tools:      toolsClient,
+		toolAuth:   toolAuth,
+		embedModel: embedModel,
+		maxTurns:   maxTurns,
+		logger:     logger,
+	}
 }
 
 func (a *InferenceAPI) WebService() *restful.WebService {
@@ -139,10 +159,14 @@ func (a *InferenceAPI) infer(req *restful.Request, resp *restful.Response) {
 	// retrieve knowledge-base context. Otherwise the caller must supply a
 	// friendly model name, which is resolved against the registry the same way
 	// agent.Model is.
+	var bindings map[string]toolBinding
 	if body.AgentID != "" {
 		logger = logger.WithFields("agent_id", body.AgentID)
 		logger.Info("Applying agent")
-		if status, msg := a.applyAgent(req, logger, &body, bedReq); status != 0 {
+		var status int
+		var msg string
+		bindings, status, msg = a.applyAgent(req, logger, &body, bedReq)
+		if status != 0 {
 			writeError(req, resp, status, msg)
 			return
 		}
@@ -162,30 +186,60 @@ func (a *InferenceAPI) infer(req *restful.Request, resp *restful.Response) {
 	}
 	logger = logger.WithFields("model", bedReq.Model)
 
+	// Rebuild the history now that the agent's tools are known: a past turn
+	// that used tools is replayed as the tool_use/tool_result pair the model
+	// originally saw, not just the sentence it ended with.
+	bedReq.Messages = expandToolHistory(body.Messages, bindings, logger)
+
 	if body.Stream {
-		a.stream(req, resp, logger, bedReq)
+		a.stream(req, resp, logger, bedReq, bindings)
 		return
 	}
 
 	logger.Info("running inference", "messages", len(body.Messages))
-	out, err := a.client.Converse(req.Request.Context(), bedReq)
-	if err != nil {
-		logger.Error("bedrock converse failed", "err", err)
-		writeError(req, resp, http.StatusBadGateway, fmt.Sprintf("bedrock error: %v", err))
-		return
+	ctx := req.Request.Context()
+	response := &InferenceResponse{Model: bedReq.Model}
+	// The tool loop: each turn either finishes the response or requests
+	// tool calls, whose results feed the next turn.
+	for turn := 0; ; turn++ {
+		out, err := a.client.Converse(ctx, bedReq)
+		if err != nil {
+			logger.Error("bedrock converse failed", "err", err)
+			writeError(req, resp, http.StatusBadGateway, fmt.Sprintf("bedrock error: %v", err))
+			return
+		}
+		response.StopReason = out.StopReason
+		response.InputTokens += out.InputTokens
+		response.OutputTokens += out.OutputTokens
+		if out.StopReason != "tool_use" || len(out.ToolUses) == 0 {
+			response.Content = out.Content
+			break
+		}
+		if turn >= a.maxTurns {
+			logger.Warn("max tool turns exceeded", "max_turns", a.maxTurns)
+			writeError(req, resp, http.StatusBadGateway, fmt.Sprintf("tool loop exceeded the maximum of %d turns", a.maxTurns))
+			return
+		}
+		logger.Info("model requested tool calls", "turn", turn+1, "calls", len(out.ToolUses))
+		resultsMsg, records, err := a.executeToolUses(ctx, logger, turn+1, bindings, out.ToolUses, nil)
+		if err != nil {
+			logger.Error("tool execution failed", "err", err)
+			writeError(req, resp, http.StatusBadGateway, fmt.Sprintf("tool execution failed: %v", err))
+			return
+		}
+		response.ToolCalls = append(response.ToolCalls, records...)
+		bedReq.Messages = append(bedReq.Messages,
+			bedrock.Message{Role: "assistant", Content: out.Content, ToolUses: out.ToolUses},
+			resultsMsg,
+		)
 	}
 	logger.Info("inference completed",
-		"stop_reason", out.StopReason,
-		"input_tokens", out.InputTokens,
-		"output_tokens", out.OutputTokens,
+		"stop_reason", response.StopReason,
+		"tool_calls", len(response.ToolCalls),
+		"input_tokens", response.InputTokens,
+		"output_tokens", response.OutputTokens,
 	)
-	requesthelper.WriteJSON(req, resp, http.StatusOK, &InferenceResponse{
-		Model:        bedReq.Model,
-		Content:      out.Content,
-		StopReason:   out.StopReason,
-		InputTokens:  out.InputTokens,
-		OutputTokens: out.OutputTokens,
-	})
+	requesthelper.WriteJSON(req, resp, http.StatusOK, response)
 }
 
 // convertContextFiles validates a request's context files and converts them
@@ -264,16 +318,16 @@ func sanitizeDocumentName(filename string, index int) string {
 }
 
 // applyAgent loads the agent referenced by body.AgentID, resolves its model,
-// and augments bedReq's system prompt with (1) the full text of every
-// document in the agent's knowledge bases and (2) chunks retrieved from the
-// agent's RAG collection. It returns (0, "") on success, or an HTTP status
-// and message on failure.
-func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, body *InferenceRequest, bedReq *bedrock.ConverseRequest) (int, string) {
+// augments bedReq's system prompt with (1) the full text of every document
+// in the agent's knowledge bases and (2) chunks retrieved from the agent's
+// RAG collection, and advertises the agent's MCP tools. It returns the tool
+// bindings and (0, "") on success, or an HTTP status and message on failure.
+func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, body *InferenceRequest, bedReq *bedrock.ConverseRequest) (map[string]toolBinding, int, string) {
 	ctx := req.Request.Context()
 	agent, found, err := a.agents.Get(ctx, body.AgentID)
 	if err != nil {
 		logger.Error("failed to load agent", "err", err)
-		return http.StatusBadGateway, "failed to load agent"
+		return nil, http.StatusBadGateway, "failed to load agent"
 	}
 	logger = logger.WithFields(
 		"agent_id", agent.ID,
@@ -281,17 +335,30 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 	)
 	if !found {
 		logger.Warn("agent not found")
-		return http.StatusNotFound, fmt.Sprintf("agent %q not found", body.AgentID)
+		return nil, http.StatusNotFound, fmt.Sprintf("agent %q not found", body.AgentID)
 	}
-	logger.Info("agent loaded", "knowledge_base_ids", agent.KnowledgeBaseIDs, "system_prompt_chars", len(agent.SystemPrompt))
+	logger.Info("agent loaded", "knowledge_base_ids", agent.KnowledgeBaseIDs, "tools", agent.Tools, "system_prompt_chars", len(agent.SystemPrompt))
 
 	modelID, ok := models.Resolve(agent.Model)
 	if !ok {
 		logger.Error("agent references unknown model", "model", agent.Model)
-		return http.StatusInternalServerError, fmt.Sprintf("agent references unknown model %q", agent.Model)
+		return nil, http.StatusInternalServerError, fmt.Sprintf("agent references unknown model %q", agent.Model)
 	}
 	bedReq.Model = modelID
 	logger.Info("model resolved", "model_id", modelID)
+
+	// MCP tools: resolve the agent's server list against the registry's
+	// cache into Bedrock tool specs plus the execution bindings.
+	var bindings map[string]toolBinding
+	if len(agent.Tools) > 0 {
+		specs, b, err := a.buildToolBindings(ctx, logger, agent.Tools)
+		if err != nil {
+			logger.Error("failed to build tool bindings", "err", err)
+			return nil, http.StatusBadGateway, "failed to resolve agent tools"
+		}
+		bedReq.Tools = specs
+		bindings = b
+	}
 
 	var blocks []string
 
@@ -306,7 +373,7 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 			docs, found, err := a.kb.ListDocuments(ownerCtx, kbID)
 			if err != nil {
 				logger.Error("failed to load context documents", "kb_id", kbID, "err", err)
-				return http.StatusBadGateway, "failed to load knowledge-base documents"
+				return nil, http.StatusBadGateway, "failed to load knowledge-base documents"
 			}
 			if !found {
 				// The KB was deleted after the agent was created; degrade to
@@ -331,7 +398,7 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 	hasRAG, err := a.rags.HasChunks(ctx, agent.UserID, agent.ID)
 	if err != nil {
 		logger.Error("failed to check rag collection", "err", err)
-		return http.StatusBadGateway, "failed to check RAG collection"
+		return nil, http.StatusBadGateway, "failed to check RAG collection"
 	}
 	logger.Info("rag collection checked", "has_chunks", hasRAG)
 	if query := lastUserMessage(body.Messages); hasRAG && query != "" {
@@ -342,13 +409,13 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 		vector, err := a.client.Embed(ctx, a.embedModel, query)
 		if err != nil {
 			logger.Error("failed to embed retrieval query", "err", err)
-			return http.StatusBadGateway, "failed to embed query for retrieval"
+			return nil, http.StatusBadGateway, "failed to embed query for retrieval"
 		}
 		logger.Info("query embedded", "dimensions", len(vector))
 		retrieved, err := a.rags.Search(ctx, agent.UserID, agent.ID, vector, topK)
 		if err != nil {
 			logger.Error("failed to retrieve rag context", "err", err)
-			return http.StatusBadGateway, "failed to retrieve RAG context"
+			return nil, http.StatusBadGateway, "failed to retrieve RAG context"
 		}
 		logger.Info("rag context retrieved", "chunks", len(retrieved), "top_k", topK)
 		texts := make([]string, len(retrieved))
@@ -365,7 +432,7 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 	}
 	bedReq.SystemPrompt = strings.Join(blocks, "\n\n")
 	logger.Info("system prompt assembled", "blocks", len(blocks), "total_chars", len(bedReq.SystemPrompt))
-	return 0, ""
+	return bindings, 0, ""
 }
 
 // lastUserMessage returns the content of the last user-role message, falling
@@ -382,7 +449,7 @@ func lastUserMessage(msgs []Message) string {
 	return ""
 }
 
-func (a *InferenceAPI) stream(req *restful.Request, resp *restful.Response, logger *logging.Logger, bedReq *bedrock.ConverseRequest) {
+func (a *InferenceAPI) stream(req *restful.Request, resp *restful.Response, logger *logging.Logger, bedReq *bedrock.ConverseRequest, bindings map[string]toolBinding) {
 	flusher, ok := resp.ResponseWriter.(http.Flusher)
 	if !ok {
 		logger.Error("streaming not supported by underlying writer")
@@ -424,13 +491,27 @@ func (a *InferenceAPI) stream(req *restful.Request, resp *restful.Response, logg
 		flusher.Flush()
 		return nil
 	}
-
-	if err := a.client.ConverseStream(req.Request.Context(), bedReq, send); err != nil {
+	// emit publishes a named SSE event (toolCall / toolCallResult): plain
+	// data-chunk consumers never see named events, so the delta protocol is
+	// unchanged for clients that ignore tools.
+	emit := func(event string, payload any) error {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			logger.Error("failed to marshal event", "event", event, "err", err)
+			return err
+		}
+		if _, err := fmt.Fprintf(resp, "event: %s\ndata: %s\n\n", event, b); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+	fail := func(err error) {
 		if errors.Is(err, req.Request.Context().Err()) {
 			logger.Info("streaming inference cancelled by client", "err", err)
 			return
 		}
-		logger.Error("bedrock converse stream failed", "err", err)
+		logger.Error("streaming inference failed", "err", err)
 		// The error event carries the meta block (fresh, so execution_time_ms
 		// reflects when the failure happened): a user reporting a mid-stream
 		// failure has the trace id right next to the error.
@@ -440,8 +521,39 @@ func (a *InferenceAPI) stream(req *restful.Request, resp *restful.Response, logg
 		})
 		_, _ = fmt.Fprintf(resp, "event: error\ndata: %s\n\n", errBody)
 		flusher.Flush()
-		return
 	}
+
+	// The tool loop: each Bedrock turn streams its text deltas live; a
+	// tool_use stop executes the requested calls (announced via toolCall /
+	// toolCallResult events) and feeds their results into the next turn.
+	ctx := req.Request.Context()
+	for turn := 0; ; turn++ {
+		result, err := a.client.ConverseStream(ctx, bedReq, send)
+		if err != nil {
+			fail(err)
+			return
+		}
+		if result.StopReason != "tool_use" || len(result.ToolUses) == 0 {
+			break
+		}
+		if turn >= a.maxTurns {
+			fail(fmt.Errorf("tool loop exceeded the maximum of %d turns", a.maxTurns))
+			return
+		}
+		logger.Info("model requested tool calls", "turn", turn+1, "calls", len(result.ToolUses))
+		resultsMsg, _, err := a.executeToolUses(ctx, logger, turn+1, bindings, result.ToolUses, emit)
+		if err != nil {
+			fail(err)
+			return
+		}
+		bedReq.Messages = append(bedReq.Messages,
+			bedrock.Message{Role: "assistant", Content: result.Content, ToolUses: result.ToolUses},
+			resultsMsg,
+		)
+	}
+	// End-of-response marker, previously emitted by the bedrock client;
+	// with tool turns in play only the handler knows when it is over.
+	_ = send(bedrock.StreamChunk{Done: true})
 	logger.Info("streaming inference completed")
 }
 

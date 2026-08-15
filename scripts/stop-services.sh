@@ -21,6 +21,8 @@ SERVICES=(
   enact-model-inference
   enact-model-management
   enact-tests
+  enact-tool-registry
+  enact-external-identities
 )
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

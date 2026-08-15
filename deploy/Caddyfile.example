@@ -1,0 +1,87 @@
+# Web entry point for the enact platform: serves the frontend SPA and
+# proxies the API, both on ONE origin — which is what keeps cookies
+# SameSite=lax and CORS entirely out of the picture.
+#
+# Copy to Caddyfile next to the compose file (gitignored) and pick ONE site
+# block. The frontend build output (Vite dist/) goes in ./www.
+#
+# Routing contract:
+#   /api          -> redirected to /api/ (Caddy's /api/* matcher does NOT
+#                    match the bare path, which would otherwise fall through
+#                    to the SPA)
+#   /api/*        -> enact-main:8000 with the /api prefix STRIPPED
+#                    (/api/auth/me reaches the service as /auth/me)
+#   /swagger-ui/*,
+#   /api_docs.json-> enact-main unstripped: the service's built-in home page
+#                    links to these at the ORIGIN ROOT, so they must live
+#                    there for its Swagger iframe to load
+#   /identities/* -> enact-external-identities with the prefix STRIPPED, so
+#                    third-party OAuth providers can redirect the user's
+#                    browser back to /identities/v1/oauth/callback. Set
+#                    IDENTITIES_PUBLIC_URL=https://<domain>/identities to
+#                    match, and register that callback in each provider.
+#   /*            -> the SPA; unknown paths fall back to index.html so
+#                    client-side routing works on refresh/deep links
+#
+# The matching enact-main.env settings for this setup:
+#   PUBLIC_BASE_URL=https://<domain>/api
+#   OAUTH_REDIRECT_URL=https://<domain>/api/google/oauth/callback
+#   FRONTEND_URL=https://<domain>
+#   SECURE_COOKIES=true
+# and the frontend's API base URL is simply /api.
+
+# --- Option A: you have a domain pointing at this machine ------------------
+# Caddy obtains and renews a Let's Encrypt certificate automatically; ports
+# 80 and 443 must be reachable from the internet.
+#
+# example.com {
+# 	redir /api /api/
+# 	handle_path /api/* {
+# 		# flush_interval -1 disables buffering so SSE token streaming
+# 		# (chat responses, toolCall events) reaches the browser as it is
+# 		# generated.
+# 		reverse_proxy enact-main:8000 {
+# 			flush_interval -1
+# 		}
+# 	}
+# 	handle /swagger-ui/* {
+# 		reverse_proxy enact-main:8000
+# 	}
+# 	handle /api_docs.json {
+# 		reverse_proxy enact-main:8000
+# 	}
+# 	handle_path /identities/* {
+# 		reverse_proxy enact-external-identities:8008
+# 	}
+# 	handle {
+# 		root * /srv/www
+# 		try_files {path} /index.html
+# 		file_server
+# 	}
+# }
+
+# --- Option B: no domain yet (bare IP, plain HTTP) -------------------------
+# Same routing without TLS. Use http:// URLs in enact-main.env and keep
+# SECURE_COOKIES=false until you switch to option A.
+:80 {
+	redir /api /api/
+	handle_path /api/* {
+		reverse_proxy enact-main:8000 {
+			flush_interval -1
+		}
+	}
+	handle /swagger-ui/* {
+		reverse_proxy enact-main:8000
+	}
+	handle /api_docs.json {
+		reverse_proxy enact-main:8000
+	}
+	handle_path /identities/* {
+		reverse_proxy enact-external-identities:8008
+	}
+	handle {
+		root * /srv/www
+		try_files {path} /index.html
+		file_server
+	}
+}

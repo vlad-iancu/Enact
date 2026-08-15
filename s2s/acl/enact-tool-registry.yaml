@@ -1,0 +1,40 @@
+# Access control list for enact-tool-registry.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# Management routes are service-to-service only: enact-main fronts them for
+# people, and the agent/inference services consult the registry directly.
+# The MCP proxy routes additionally accept anonymous callers — they exist
+# precisely so that spec-compliant MCP clients (which cannot sign platform
+# tokens) can reach registered servers through the platform.
+service: enact-tool-registry
+rules:
+  - route: "POST /v1/servers/create"
+    allow: ["*"]
+  - route: "PUT /v1/servers/update"
+    allow: ["*"]
+  - route: "GET /v1/servers"
+    allow: ["*"]
+  - route: "DELETE /v1/servers"
+    allow: ["*"]
+  - route: "GET /v1/servers/tools"
+    allow: ["*"]
+
+  # MCP proxy: reachable by MCP clients without platform credentials.
+  - route: "GET /v1/servers/{server-id}/mcp"
+    allow: [anonymous, "*"]
+  - route: "POST /v1/servers/{server-id}/mcp"
+    allow: [anonymous, "*"]
+  - route: "DELETE /v1/servers/{server-id}/mcp"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/servers/{server-id}/sse"
+    allow: [anonymous, "*"]
+  - route: "POST /v1/servers/{server-id}/sse"
+    allow: [anonymous, "*"]
+  - route: "DELETE /v1/servers/{server-id}/sse"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/servers/{server-id}/{subpath:*}"
+    allow: [anonymous, "*"]
+  - route: "POST /v1/servers/{server-id}/{subpath:*}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /v1/servers/{server-id}/{subpath:*}"
+    allow: [anonymous, "*"]

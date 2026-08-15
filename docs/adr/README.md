@@ -17,3 +17,9 @@ See [template.md](template.md) to add one manually.
 | [0010](0010-titan-v2-embeddings.md) | Amazon Titan Text Embeddings v2 as the embedding model | accepted | 2026-08-02 |
 | [0011](0011-s2s-authentication.md) | Service-to-service authentication with per-service Ed25519 JWTs and YAML-distributed JWKS/ACLs | accepted | 2026-08-04 |
 | [0012](0012-integration-tests-as-a-service.md) | Integration tests as a platform service with lifecycle-structured cases | accepted | 2026-08-05 |
+| [0013](0013-external-identity-credentials-encrypted-at-rest.md) | External identity credentials are encrypted at rest with an application key | accepted | 2026-08-12 |
+| [0014](0014-per-user-credentials-for-mcp-tools.md) | Per-user credentials for MCP tool calls | accepted | 2026-08-13 |
+| [0015](0015-provider-scoped-identities.md) | Identities are scoped to a provider, not to a consumer | accepted | 2026-08-14 |
+| [0016](0016-mcp-tool-registry-with-cache-and-proxy.md) | MCP servers are registered in a registry service that caches their tools and proxies their traffic | accepted | 2026-08-15 |
+| [0017](0017-owner-scoped-probe-credentials.md) | A gated MCP server is reached with its owner's credentials | accepted | 2026-08-15 |
+| [0018](0018-conversations-record-and-replay-tool-calls.md) | Conversations record tool calls and replay them into the model's context | accepted | 2026-08-15 |

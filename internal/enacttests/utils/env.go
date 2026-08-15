@@ -14,6 +14,16 @@ type Env struct {
 	InferenceAPIURL string
 	ModelsAPIURL    string
 	MainAPIURL      string
+	ToolRegistryURL string
+	IdentitiesURL   string
+
+	// MCPFixtureURL is the embedded MCP fixture server's endpoint AS THE
+	// REGISTRY REACHES IT (in compose, the tests container's hostname).
+	MCPFixtureURL string
+
+	// OAuthFixtureURL is the embedded fixture authorization server AS THE
+	// IDENTITY SERVICE REACHES IT.
+	OAuthFixtureURL string
 
 	// UserID is sent as the X-User-Id header on every test request so test
 	// data stays isolated from real users' data.

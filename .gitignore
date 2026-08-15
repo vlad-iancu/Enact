@@ -9,6 +9,9 @@ s2s/private-keys.yaml
 deploy/.env
 deploy/app.env
 deploy/enact-main.env
+# VM-specific web entry config and the frontend build output it serves.
+deploy/Caddyfile
+deploy/www/
 .DS_Store
 .idea/
 # local symlink for compose-relative s2s mount

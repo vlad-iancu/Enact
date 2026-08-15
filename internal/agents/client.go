@@ -92,6 +92,7 @@ type CreateAgentRequest struct {
 	Model            string   `json:"model"`
 	SystemPrompt     string   `json:"system_prompt"`
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+	Tools            []string `json:"tools,omitempty"`
 }
 
 // do issues one JSON request and decodes the response. It maps 404 to

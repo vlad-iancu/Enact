@@ -4,7 +4,7 @@
   ],
   "priority": 100,
   "_meta": {
-    "description": "Chat conversations: per-user message threads. Deliberately not bound to an agent or model \u2014 each message records what it was answered by."
+    "description": "Chat conversations: per-user message threads. Deliberately not bound to an agent or model \u2014 each message records what it was answered by, and an assistant message records the MCP tool calls it made. tool_calls is stored but NOT indexed: a tool's arguments are arbitrary model JSON, and dynamic mapping would turn every argument name into an index field."
   },
   "template": {
     "settings": {
@@ -46,6 +46,10 @@
             },
             "attachments": {
               "type": "keyword"
+            },
+            "tool_calls": {
+              "type": "object",
+              "enabled": false
             }
           }
         },

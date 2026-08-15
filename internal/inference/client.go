@@ -27,6 +27,26 @@ type ClientConfig struct {
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls are the MCP tools an assistant message used. Replayed into
+	// the model's context so a later turn can see what was already done and
+	// what it returned, rather than only the answer that came out of it.
+	ToolCalls []MessageToolCall `json:"tool_calls,omitempty"`
+}
+
+// MessageToolCall is one recorded tool invocation being replayed. Arguments
+// are the model's own, as it produced them.
+type MessageToolCall struct {
+	ServerID          string          `json:"server_id"`
+	Tool              string          `json:"tool"`
+	ToolUseID         string          `json:"tool_use_id"`
+	Arguments         json.RawMessage `json:"arguments,omitempty"`
+	Content           string          `json:"content,omitempty"`
+	StructuredContent json.RawMessage `json:"structured_content,omitempty"`
+	IsError           bool            `json:"is_error,omitempty"`
+	// Turn is the tool-loop round; Text is the assistant's words in that
+	// round, before the call.
+	Turn int    `json:"turn,omitempty"`
+	Text string `json:"text,omitempty"`
 }
 
 // ContextFile is one ad-hoc document attached to a request; Content is the

@@ -14,6 +14,7 @@ import (
 	"enact/internal/agents"
 	"enact/internal/cloudfront"
 	"enact/internal/conversations"
+	"enact/internal/extidentities"
 	"enact/internal/inference"
 	"enact/internal/kb"
 	"enact/internal/logging"
@@ -21,6 +22,7 @@ import (
 	"enact/internal/requesthelper"
 	"enact/internal/s3"
 	"enact/internal/ses"
+	"enact/internal/tools"
 	"enact/internal/users"
 )
 
@@ -54,6 +56,12 @@ type MainAPI struct {
 	// adminEmail (normalized) designates the administrator account: it gets
 	// the /admin endpoints and is_admin=true on /auth/me. Empty means none.
 	adminEmail string
+	// toolRegistry fronts the MCP tool registry for user-scoped server
+	// management.
+	toolRegistry *tools.Client
+	// identities fronts the external identity service for user-scoped
+	// third-party account management.
+	identities *extidentities.Client
 	logger     *logging.Logger
 }
 
@@ -255,7 +263,7 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 		auth, callback, app, login,
 		a.conversationsWebService(), a.modelsWebService(),
 		a.agentsWebService(), a.kbWebService(), a.inferenceWebService(),
-		a.adminWebService(),
+		a.adminWebService(), a.mcpServersWebService(), a.identitiesWebService(),
 	}
 }
 
