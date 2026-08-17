@@ -111,6 +111,38 @@ func (r *Repository) GetByEmail(ctx context.Context, email string) (User, bool, 
 	return u, found, err
 }
 
+// ByIDs fetches users by their ids, returned as a map for lookup. Documents
+// are keyed by email, so this is a search rather than a get — one round trip
+// for the whole set, not one per member.
+//
+// Ids that match no account are simply absent from the result: a membership
+// can outlive the account it names, and a listing must still render.
+func (r *Repository) ByIDs(ctx context.Context, ids []string) (map[string]User, error) {
+	out := map[string]User{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	body, err := json.Marshal(map[string]any{
+		"size":  len(ids),
+		"query": map[string]any{"terms": map[string]any{"id": ids}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("users: marshal by-ids query: %w", err)
+	}
+	result, err := r.os.SearchWithAggregations(ctx, r.index, body)
+	if err != nil {
+		return nil, err
+	}
+	for _, hit := range result.Hits {
+		var u User
+		if err := json.Unmarshal(hit.Source, &u); err != nil {
+			return nil, fmt.Errorf("users: decode %s: %w", hit.ID, err)
+		}
+		out[u.ID] = u
+	}
+	return out, nil
+}
+
 // Save persists a user record keyed by its normalized email, overwriting
 // any previous version.
 func (r *Repository) Save(ctx context.Context, u User) error {

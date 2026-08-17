@@ -101,6 +101,13 @@ const maxWorkers = 32
 // tests regex and not matching the skip regex, executed by numWorkers
 // concurrent workers. It returns the execution id immediately.
 func (r *Runner) Start(tests, skip string, numWorkers int) (string, int, error) {
+	// Before anything runs, make sure the test user holds the permissions
+	// the suite needs. Failing here fails the whole run deliberately: every
+	// case would otherwise fail with an unrelated 403 and bury the real
+	// cause.
+	if err := r.env.EnsurePermissions(context.Background(), r.logger); err != nil {
+		return "", 0, err
+	}
 	if tests == "" {
 		tests = ".*"
 	}

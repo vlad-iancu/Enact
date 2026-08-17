@@ -15,6 +15,7 @@ func All() []utils.Factory {
 		NewAgentRejectsUnknownModel,
 		NewAgentGetMissing,
 		NewAgentDeleteIsolation,
+		NewRBACCrossOrg,
 		NewAgentNameLifecycle,
 		NewAgentRAGUploadListDelete,
 

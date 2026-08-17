@@ -32,6 +32,7 @@ var services = []string{
 	"enact-tests",
 	"enact-tool-registry",
 	"enact-external-identities",
+	"enact-rbac",
 }
 
 func main() {

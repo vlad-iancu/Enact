@@ -83,6 +83,14 @@ func (a *MainAPI) conversationsWebService() *restful.WebService {
 		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
+	ws.Route(ws.DELETE("/{id}").
+		To(a.deleteConversation).
+		Param(ws.PathParameter("id", "conversation id")).
+		Doc("Delete a conversation and its messages, including the tool calls recorded in them. Permanent").
+		Returns(http.StatusNoContent, "Deleted", nil).
+		Returns(http.StatusNotFound, "Not found", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
 	ws.Route(ws.GET("/{id}").
 		To(a.getConversation).
 		Param(ws.PathParameter("id", "conversation id")).
@@ -127,7 +135,11 @@ func (a *MainAPI) listConversations(req *restful.Request, resp *restful.Response
 	sess := sessionAttr(req)
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID)
 	logger.Info("list conversations requested")
-	list, err := a.conversations.ListByUser(req.Request.Context(), sess.UserID)
+	organizationID, ok := a.conversationOrganization(req, resp)
+	if !ok {
+		return
+	}
+	list, err := a.conversations.ListByUser(req.Request.Context(), organizationID, sess.UserID)
 	if err != nil {
 		logger.Error("failed to list conversations", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to list conversations")
@@ -137,18 +149,41 @@ func (a *MainAPI) listConversations(req *restful.Request, resp *restful.Response
 	requesthelper.WriteJSON(req, resp, http.StatusOK, listConversationsResponse{Conversations: list})
 }
 
+// conversationOrganization resolves the caller's organization for a scoped
+// lookup, writing the refusal itself when they have none. Conversations are
+// private to a person, but the organization is the outer boundary — see
+// conversations.Repository.Get.
+func (a *MainAPI) conversationOrganization(req *restful.Request, resp *restful.Response) (string, bool) {
+	effective, err := a.rbac.Effective(req.Request.Context(), sessionAttr(req).UserID)
+	if err != nil {
+		relayRBACErr(req, resp, err, "resolve your organization")
+		return "", false
+	}
+	if effective.OrganizationID == "" {
+		requesthelper.WriteError(req, resp, http.StatusForbidden,
+			"you do not belong to an organization yet; request one and ask an administrator to approve it")
+		return "", false
+	}
+	return effective.OrganizationID, true
+}
+
 func (a *MainAPI) createConversation(req *restful.Request, resp *restful.Response) {
 	sess := sessionAttr(req)
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID)
 	logger.Info("create conversation requested")
+	organizationID, ok := a.conversationOrganization(req, resp)
+	if !ok {
+		return
+	}
 	now := time.Now().UTC()
 	conv := conversations.Conversation{
-		ID:        uuid.NewString(),
-		UserID:    sess.UserID,
-		Title:     "New conversation",
-		Messages:  []conversations.Message{},
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:             uuid.NewString(),
+		UserID:         sess.UserID,
+		OrganizationID: organizationID,
+		Title:          "New conversation",
+		Messages:       []conversations.Message{},
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	if err := a.conversations.Save(req.Request.Context(), conv); err != nil {
 		logger.Error("failed to create conversation", "err", err)
@@ -164,7 +199,11 @@ func (a *MainAPI) getConversation(req *restful.Request, resp *restful.Response) 
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID, "conversation_id", id)
 	logger.Info("get conversation requested")
-	conv, found, err := a.conversations.Get(req.Request.Context(), sess.UserID, id)
+	organizationID, ok := a.conversationOrganization(req, resp)
+	if !ok {
+		return
+	}
+	conv, found, err := a.conversations.Get(req.Request.Context(), organizationID, sess.UserID, id)
 	if err != nil {
 		logger.Error("failed to get conversation", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to get conversation")
@@ -182,13 +221,49 @@ func (a *MainAPI) getConversation(req *restful.Request, resp *restful.Response) 
 // updateConversation partially updates a conversation's own fields —
 // currently only the title. A custom title also stops the automatic
 // first-message title derivation from ever overwriting it.
+// deleteConversation removes one of the caller's own conversations.
+//
+// A hard delete, not a flag: the record holds the user's messages and, since
+// ADR-0018, the verbatim results of every tool call made on their behalf.
+// "Deleted" has to mean gone for that to be an honest answer.
+func (a *MainAPI) deleteConversation(req *restful.Request, resp *restful.Response) {
+	sess := sessionAttr(req)
+	id := req.PathParameter("id")
+	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID, "conversation_id", id)
+	logger.Info("delete conversation requested")
+
+	organizationID, ok := a.conversationOrganization(req, resp)
+	if !ok {
+		return
+	}
+	deleted, err := a.conversations.Delete(req.Request.Context(), organizationID, sess.UserID, id)
+	if err != nil {
+		logger.Error("failed to delete conversation", "err", err)
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to delete conversation")
+		return
+	}
+	if !deleted {
+		// Somebody else's conversation, another organization's, or none at
+		// all — all indistinguishable on purpose.
+		logger.Warn("conversation not found")
+		requesthelper.WriteError(req, resp, http.StatusNotFound, "conversation not found")
+		return
+	}
+	logger.Info("conversation deleted")
+	resp.WriteHeader(http.StatusNoContent)
+}
+
 func (a *MainAPI) updateConversation(req *restful.Request, resp *restful.Response) {
 	sess := sessionAttr(req)
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID, "conversation_id", id)
 	logger.Info("update conversation requested")
 
-	conv, found, err := a.conversations.Get(req.Request.Context(), sess.UserID, id)
+	organizationID, ok := a.conversationOrganization(req, resp)
+	if !ok {
+		return
+	}
+	conv, found, err := a.conversations.Get(req.Request.Context(), organizationID, sess.UserID, id)
 	if err != nil {
 		logger.Error("failed to load conversation", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to load conversation")
@@ -273,7 +348,11 @@ func (a *MainAPI) addMessage(req *restful.Request, resp *restful.Response) {
 		return
 	}
 
-	conv, found, err := a.conversations.Get(req.Request.Context(), sess.UserID, id)
+	organizationID, ok := a.conversationOrganization(req, resp)
+	if !ok {
+		return
+	}
+	conv, found, err := a.conversations.Get(req.Request.Context(), organizationID, sess.UserID, id)
 	if err != nil {
 		logger.Error("failed to load conversation", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to load conversation")

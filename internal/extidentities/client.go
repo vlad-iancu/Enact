@@ -190,7 +190,8 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body []byte, w
 		return true, nil
 	case http.StatusNotFound:
 		return false, nil
-	case http.StatusBadRequest, http.StatusConflict, http.StatusFailedDependency, http.StatusBadGateway:
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusConflict,
+		http.StatusFailedDependency, http.StatusBadGateway:
 		var apiErr struct {
 			Error string `json:"error"`
 		}
@@ -203,6 +204,11 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body []byte, w
 			return false, &ConflictError{Message: apiErr.Error}
 		case http.StatusFailedDependency:
 			return false, &ProviderGoneError{Message: apiErr.Error}
+		case http.StatusForbidden:
+			// An authorization refusal, which the caller must relay as 403
+			// naming the permission. Folded into the generic branch it would
+			// surface as a 502 and read as an outage.
+			return false, &requesthelper.ForbiddenError{Message: apiErr.Error}
 		}
 		return false, &requesthelper.BadRequestError{Message: apiErr.Error}
 	default:

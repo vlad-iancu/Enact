@@ -15,6 +15,7 @@ import (
 	"enact/internal/extidentities"
 	"enact/internal/logging"
 	"enact/internal/opensearch"
+	"enact/internal/rbac"
 	"enact/internal/s2s"
 	"enact/internal/service"
 	"enact/internal/tools"
@@ -29,6 +30,7 @@ type Config struct {
 	// Identities resolves the credentials a server's owner configured for
 	// the platform's own probes (tools.ProbeInitialize / ProbeListTools).
 	Identities extidentities.ClientConfig
+	RBAC       rbac.ClientConfig
 
 	// RefreshAt is the interval on which every registered server's tool
 	// cache is re-fetched.
@@ -58,6 +60,7 @@ func Build(cfg *Config) service.Builder {
 			return nil, err
 		}
 
+		rbacClient := rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
 		api := &RegistryAPI{
 			repo:       repo,
 			mcpTimeout: cfg.MCPTimeout,
@@ -65,6 +68,8 @@ func Build(cfg *Config) service.Builder {
 			// client timeout; the per-request context bounds them instead.
 			proxyClient: &http.Client{},
 			identities:  extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities")),
+			rbac:        rbacClient,
+			enforcer:    rbac.NewEnforcer(rbacClient, cfg.RBAC),
 			// Probes talk to third-party MCP servers directly, so this client
 			// carries no S2S signing — only whatever the owner's credential
 			// configuration renders.

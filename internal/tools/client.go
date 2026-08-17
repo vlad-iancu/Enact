@@ -46,8 +46,12 @@ type Client struct {
 func NewClient(cfg ClientConfig, base http.RoundTripper) *Client {
 	transport := requesthelper.NewTransport(base)
 	return &Client{
-		http:    &http.Client{Transport: transport, Timeout: cfg.Timeout},
-		mcpHTTP: &http.Client{Transport: transport, Timeout: cfg.CallTimeout},
+		http: &http.Client{Transport: transport, Timeout: cfg.Timeout},
+		// identityTransport wraps the S2S transport so MCP traffic carries the
+		// caller as well as the service. The proxy resolves a server within
+		// the caller's organization, so without it every proxied tool call
+		// arrives anonymous and resolves nothing.
+		mcpHTTP: &http.Client{Transport: &identityTransport{base: transport}, Timeout: cfg.CallTimeout},
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
 	}
 }
@@ -99,13 +103,16 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body []byte, w
 		return true, nil
 	case http.StatusNotFound:
 		return false, nil
-	case http.StatusBadRequest, http.StatusConflict, http.StatusBadGateway:
+	case http.StatusBadRequest, http.StatusConflict, http.StatusBadGateway, http.StatusForbidden:
 		var apiErr struct {
 			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		if apiErr.Error == "" {
 			apiErr.Error = http.StatusText(resp.StatusCode)
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			return false, &requesthelper.ForbiddenError{Message: apiErr.Error}
 		}
 		return false, &requesthelper.BadRequestError{Message: apiErr.Error}
 	default:
@@ -180,8 +187,11 @@ func (c *Client) Get(ctx context.Context, id string) (Server, bool, error) {
 
 // ListTools returns the cached tool definitions, optionally filtered to the
 // given server ids.
-func (c *Client) ListTools(ctx context.Context, serverIDs []string) ([]Tool, error) {
+func (c *Client) ListTools(ctx context.Context, organizationID string, serverIDs []string) ([]Tool, error) {
 	params := url.Values{}
+	if organizationID != "" {
+		params.Set("organization_id", organizationID)
+	}
 	for _, id := range serverIDs {
 		params.Add("ids", id)
 	}
@@ -246,6 +256,28 @@ func (c *Client) CallTool(ctx context.Context, server Server, name string, argum
 	}
 	defer func() { _ = session.Close() }()
 	return session.CallTool(ctx, name, arguments)
+}
+
+// identityTransport carries the calling USER on every request of an MCP
+// session, taken from the request context.
+//
+// The service identity is signed by the S2S transport underneath; this is the
+// person on whose behalf the call is made, which is what the registry's proxy
+// resolves the server's organization from. A session issues several requests
+// (initialize, tools/call, the stream), and all of them need it — hence a
+// transport rather than a header set once.
+type identityTransport struct{ base http.RoundTripper }
+
+func (t *identityTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if user := identity.FromContext(r.Context()); user != "" {
+		r = r.Clone(r.Context())
+		r.Header.Set(identity.Header, user)
+	}
+	return base.RoundTrip(r)
 }
 
 // authHeaderTransport attaches the tool-auth envelope to every request of

@@ -19,6 +19,7 @@ import (
 	"enact/internal/kb"
 	"enact/internal/logging"
 	"enact/internal/models"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/s3"
 	"enact/internal/ses"
@@ -59,6 +60,9 @@ type MainAPI struct {
 	// toolRegistry fronts the MCP tool registry for user-scoped server
 	// management.
 	toolRegistry *tools.Client
+	// rbac is the authorization service: organizations, roles and the rules
+	// that decide what a session may do.
+	rbac *rbac.Client
 	// identities fronts the external identity service for user-scoped
 	// third-party account management.
 	identities *extidentities.Client
@@ -264,6 +268,7 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 		a.conversationsWebService(), a.modelsWebService(),
 		a.agentsWebService(), a.kbWebService(), a.inferenceWebService(),
 		a.adminWebService(), a.mcpServersWebService(), a.identitiesWebService(),
+		a.organizationsWebService(),
 	}
 }
 

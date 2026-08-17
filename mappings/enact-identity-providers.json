@@ -16,6 +16,12 @@
         "name": {
           "type": "keyword"
         },
+        "organization_id": {
+          "type": "keyword"
+        },
+        "created_by": {
+          "type": "keyword"
+        },
         "type": {
           "type": "keyword"
         },

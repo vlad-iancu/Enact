@@ -12,6 +12,9 @@ import (
 	restful "github.com/emicklei/go-restful/v3"
 
 	"enact/internal/extidentities"
+	"enact/internal/identity"
+	"enact/internal/logging"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 )
 
@@ -162,6 +165,11 @@ func (a *IdentitiesAPI) providersWebService() *restful.WebService {
 func (a *IdentitiesAPI) registerOAuthProvider(req *restful.Request, resp *restful.Response) {
 	logger := requesthelper.Logger(req, a.logger)
 	logger.Info("oauth provider registration requested")
+	if err := a.enforcer.Require(req.Request.Context(), rbac.Permission(rbac.ResourceProvider, rbac.ActionCreate, "*")); err != nil {
+		logger.Warn("oauth provider registration denied", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
 
 	var body registerOAuthProviderRequest
 	dec := json.NewDecoder(req.Request.Body)
@@ -210,7 +218,13 @@ func (a *IdentitiesAPI) registerOAuthProvider(req *restful.Request, resp *restfu
 			"an oauth provider must declare what it can request: give scopes, or access_levels naming the scopes each level stands for")
 		return
 	}
-	if _, exists, err := a.repo.GetProvider(req.Request.Context(), body.Name); err != nil {
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		logger.Warn("register provider: no organization", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	if _, exists, err := a.repo.GetProvider(req.Request.Context(), organizationID, body.Name); err != nil {
 		logger.Error("failed to check existing provider", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to register provider")
 		return
@@ -279,17 +293,23 @@ func (a *IdentitiesAPI) registerOAuthProvider(req *restful.Request, resp *restfu
 
 	now := time.Now().UTC()
 	rec := extidentities.ProviderRecord{
-		Name:         body.Name,
-		Type:         extidentities.ProviderTypeOAuth,
-		DisplayName:  body.DisplayName,
-		OAuth:        &oauthCfg,
-		AccessLevels: body.AccessLevels,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		Name:           body.Name,
+		OrganizationID: organizationID,
+		CreatedBy:      identity.FromContext(req.Request.Context()),
+		Type:           extidentities.ProviderTypeOAuth,
+		DisplayName:    body.DisplayName,
+		OAuth:          &oauthCfg,
+		AccessLevels:   body.AccessLevels,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	if err := a.repo.SaveProvider(req.Request.Context(), rec); err != nil {
 		logger.Error("failed to store provider", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to register provider")
+		return
+	}
+	if !a.recordProviderOwnership(req, logger, organizationID, rec.Name) {
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to record ownership of the provider")
 		return
 	}
 	logger.Info("oauth provider registered", "name", rec.Name, "authorize_url", oauthCfg.AuthorizeURL,
@@ -300,6 +320,11 @@ func (a *IdentitiesAPI) registerOAuthProvider(req *restful.Request, resp *restfu
 func (a *IdentitiesAPI) registerPATProvider(req *restful.Request, resp *restful.Response) {
 	logger := requesthelper.Logger(req, a.logger)
 	logger.Info("pat provider registration requested")
+	if err := a.enforcer.Require(req.Request.Context(), rbac.Permission(rbac.ResourceProvider, rbac.ActionCreate, "*")); err != nil {
+		logger.Warn("pat provider registration denied", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
 
 	var body registerPATProviderRequest
 	dec := json.NewDecoder(req.Request.Body)
@@ -320,7 +345,13 @@ func (a *IdentitiesAPI) registerPATProvider(req *restful.Request, resp *restful.
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, exists, err := a.repo.GetProvider(req.Request.Context(), body.Name); err != nil {
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		logger.Warn("register provider: no organization", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	if _, exists, err := a.repo.GetProvider(req.Request.Context(), organizationID, body.Name); err != nil {
 		logger.Error("failed to check existing provider", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to register provider")
 		return
@@ -331,21 +362,55 @@ func (a *IdentitiesAPI) registerPATProvider(req *restful.Request, resp *restful.
 
 	now := time.Now().UTC()
 	rec := extidentities.ProviderRecord{
-		Name:         body.Name,
-		Type:         extidentities.ProviderTypePAT,
-		DisplayName:  body.DisplayName,
-		PAT:          &extidentities.PATConfig{Scheme: body.Scheme, HeaderName: body.HeaderName, DocsURL: body.DocsURL},
-		AccessLevels: body.AccessLevels,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		Name:           body.Name,
+		OrganizationID: organizationID,
+		CreatedBy:      identity.FromContext(req.Request.Context()),
+		Type:           extidentities.ProviderTypePAT,
+		DisplayName:    body.DisplayName,
+		PAT:            &extidentities.PATConfig{Scheme: body.Scheme, HeaderName: body.HeaderName, DocsURL: body.DocsURL},
+		AccessLevels:   body.AccessLevels,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	if err := a.repo.SaveProvider(req.Request.Context(), rec); err != nil {
 		logger.Error("failed to store provider", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to register provider")
 		return
 	}
+	if !a.recordProviderOwnership(req, logger, organizationID, rec.Name) {
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to record ownership of the provider")
+		return
+	}
 	logger.Info("pat provider registered", "name", rec.Name)
 	requesthelper.WriteJSON(req, resp, http.StatusCreated, a.toProviderResponse(rec))
+}
+
+// recordProviderOwnership makes the registrar the owner of the provider they
+// just created, exactly as every other service does for the resources it
+// creates.
+//
+// It matters more here than it looks: an organization owner may delegate
+// enact:provider:create through a role, and without an ownership rule that
+// delegate could register a provider and then be unable to delete it, because
+// deletion checks enact:provider:delete:<name>. Owners are unaffected either
+// way — they pass by bypass.
+//
+// Failing to record ownership fails the request: a provider nobody owns is
+// worse than no provider, and the caller can retry.
+func (a *IdentitiesAPI) recordProviderOwnership(req *restful.Request, logger *logging.Logger, organizationID, name string) bool {
+	if err := a.rbac.Grant(req.Request.Context(), rbac.GrantRequest{
+		UserID:         identity.FromContext(req.Request.Context()),
+		OrganizationID: organizationID,
+		Resource:       rbac.ResourceProvider,
+		ResourceID:     name,
+	}); err != nil {
+		logger.Error("failed to record provider ownership", "name", name, "err", err)
+		return false
+	}
+	// The registrar's cached rules predate this grant — see
+	// rbac.Enforcer.Forget.
+	a.enforcer.Forget(identity.FromContext(req.Request.Context()))
+	return true
 }
 
 func (a *IdentitiesAPI) listProviders(req *restful.Request, resp *restful.Response) {
@@ -353,7 +418,13 @@ func (a *IdentitiesAPI) listProviders(req *restful.Request, resp *restful.Respon
 	providerType := req.QueryParameter("type")
 	logger.Info("list providers requested", "type", providerType)
 
-	records, err := a.repo.ListProviders(req.Request.Context(), providerType)
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		logger.Warn("list providers: no organization", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	records, err := a.repo.ListProviders(req.Request.Context(), organizationID, providerType)
 	if err != nil {
 		logger.Error("failed to list providers", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to list providers")
@@ -372,7 +443,13 @@ func (a *IdentitiesAPI) getProvider(req *restful.Request, resp *restful.Response
 	name := req.PathParameter("name")
 	logger.Info("get provider requested", "name", name)
 
-	rec, found, err := a.repo.GetProvider(req.Request.Context(), name)
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		logger.Warn("get provider: no organization", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	rec, found, err := a.repo.GetProvider(req.Request.Context(), organizationID, name)
 	if err != nil {
 		logger.Error("failed to get provider", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to get provider")
@@ -390,8 +467,19 @@ func (a *IdentitiesAPI) deleteProvider(req *restful.Request, resp *restful.Respo
 	name := req.PathParameter("name")
 	force := req.QueryParameter("force") == "true"
 	logger.Info("delete provider requested", "name", name, "force", force)
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceProvider, rbac.ActionDelete, name); err != nil {
+		logger.Warn("delete provider denied", "err", err)
+		rbac.WriteDenied(req, resp, err, fmt.Sprintf("provider %q not found", name))
+		return
+	}
 
-	_, found, err := a.repo.GetProvider(req.Request.Context(), name)
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		logger.Warn("delete provider: no organization", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	rec, found, err := a.repo.GetProvider(req.Request.Context(), organizationID, name)
 	if err != nil {
 		logger.Error("failed to load provider", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to delete provider")
@@ -447,10 +535,25 @@ func (a *IdentitiesAPI) deleteProvider(req *restful.Request, resp *restful.Respo
 		logger.Info("forced provider deletion removed identities", "name", name, "identities", deleted,
 			"revoked", tally.Revoked, "revocation_unsupported", tally.Unsupported, "revocation_failed", tally.Failed)
 	}
-	if err := a.repo.DeleteProvider(req.Request.Context(), name); err != nil {
+	if err := a.repo.DeleteProvider(req.Request.Context(), organizationID, name); err != nil {
 		logger.Error("failed to delete provider", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to delete provider")
 		return
+	}
+	// The ownership rule goes with the record. Warned rather than failed:
+	// the provider is already gone, and a stale rule naming a provider that
+	// no longer exists grants access to nothing.
+	if rec.CreatedBy != "" {
+		if err := a.rbac.Revoke(req.Request.Context(), rbac.GrantRequest{
+			UserID:         rec.CreatedBy,
+			OrganizationID: organizationID,
+			Resource:       rbac.ResourceProvider,
+			ResourceID:     name,
+		}); err != nil {
+			logger.Warn("failed to revoke provider ownership; the rule now points at nothing",
+				"name", name, "err", err)
+		}
+		a.enforcer.Forget(rec.CreatedBy)
 	}
 	logger.Info("provider deleted", "name", name, "identities_deleted", count)
 	resp.WriteHeader(http.StatusNoContent)

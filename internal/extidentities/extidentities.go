@@ -66,6 +66,16 @@ type Identity struct {
 	UserID       string       `json:"user_id"`
 	Provider     string       `json:"provider"`
 	ProviderType ProviderType `json:"provider_type"`
+	// OrganizationID qualifies Provider: provider names are unique only
+	// within an organization, so the pair is what identifies the record this
+	// credential was obtained through.
+	//
+	// It is stored rather than inferred from UserID for one reason: the
+	// refresh sweep runs with no caller and would otherwise need a
+	// membership lookup per credential to know which provider to refresh
+	// against. It is NOT an authorization input — access to an identity is
+	// still decided by the user it belongs to.
+	OrganizationID string `json:"organization_id,omitempty"`
 	// Credentials is the SEALED envelope. Plaintext never reaches this
 	// field: Repository.SaveIdentity seals and GetIdentity opens.
 	Credentials string `json:"credentials"`
@@ -94,10 +104,21 @@ type Identity struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// ProviderRecord describes a registered identity provider; Name is the
-// document id ("google", "github", "jira").
+// ProviderRecord describes a registered identity provider. It is the one
+// resource whose organization is STORED rather than inferred: a provider is
+// organization-level configuration with no owning user to infer from. The
+// document id is ProviderDocID(OrganizationID, Name), so two organizations
+// may each register their own "google" with different clients and scopes.
 type ProviderRecord struct {
-	Name        string       `json:"name"`
+	Name string `json:"name"`
+	// OrganizationID is the organization that registered this provider and
+	// the only one that can see or use it.
+	OrganizationID string `json:"organization_id"`
+	// CreatedBy is the user who registered it, kept so their ownership rule
+	// can be revoked when the provider is deleted. Without it a deleted
+	// provider would leave a rule pointing at nothing. Empty on records
+	// written before providers recorded ownership.
+	CreatedBy   string       `json:"created_by,omitempty"`
 	Type        ProviderType `json:"type"`
 	DisplayName string       `json:"display_name,omitempty"`
 	OAuth       *OAuthConfig `json:"oauth,omitempty"`
@@ -153,6 +174,13 @@ type PATConfig struct {
 
 // DocID derives an identity's document id from its uniqueness pair. The NUL
 // separator keeps ("ab","c") distinct from ("a","bc").
+// ProviderDocID keys a provider by organization and name. The separator is
+// ":" — excluded from provider names by providerNamePattern and from
+// organization ids by rbac.ValidateName, so the pair cannot collide.
+func ProviderDocID(organizationID, name string) string {
+	return organizationID + ":" + name
+}
+
 func DocID(userID, provider string) string {
 	sum := sha256.Sum256([]byte(userID + "\x00" + provider))
 	return hex.EncodeToString(sum[:])

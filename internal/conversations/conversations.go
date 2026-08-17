@@ -68,8 +68,14 @@ type ToolCall struct {
 // Conversation is one user's message thread. MessageCount is denormalized so
 // listings (which exclude the messages themselves) can still show it.
 type Conversation struct {
-	ID           string    `json:"id"`
-	UserID       string    `json:"user_id"`
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+	// OrganizationID is the organization this conversation belongs to. Stored rather
+	// than inferred from the owner: every read compares it, and an owner
+	// bypasses permission checks, so this is the only thing keeping one
+	// organization out of another's data.
+	OrganizationID string `json:"organization_id"`
+
 	Title        string    `json:"title"`
 	MessageCount int       `json:"message_count"`
 	Messages     []Message `json:"messages"`
@@ -114,11 +120,17 @@ func (r *Repository) EnsureIndex(ctx context.Context) error {
 // Get fetches a conversation by id, scoped to its owner: a conversation
 // belonging to another user is reported as not found, so existence is not
 // leaked across users. Lookup is realtime (GET by id).
-func (r *Repository) Get(ctx context.Context, userID, id string) (Conversation, bool, error) {
+func (r *Repository) Get(ctx context.Context, organizationID, userID, id string) (Conversation, bool, error) {
 	var c Conversation
 	found, err := r.os.GetSource(ctx, r.index, id, &c)
 	if err != nil || !found {
 		return Conversation{}, false, err
+	}
+	// The organization is checked alongside the owner, not instead of it: a
+	// conversation is private to one person, and the organization is the
+	// outer boundary that an owner's permission bypass must not cross.
+	if organizationID == "" || c.OrganizationID != organizationID {
+		return Conversation{}, false, nil
 	}
 	if c.UserID != userID {
 		return Conversation{}, false, nil
@@ -129,12 +141,15 @@ func (r *Repository) Get(ctx context.Context, userID, id string) (Conversation, 
 // ListByUser returns the user's conversation summaries, most recently
 // updated first. The (potentially large) message bodies are excluded at the
 // OpenSearch level.
-func (r *Repository) ListByUser(ctx context.Context, userID string) ([]Summary, error) {
+func (r *Repository) ListByUser(ctx context.Context, organizationID, userID string) ([]Summary, error) {
 	body, err := json.Marshal(map[string]any{
 		"size":    1000,
 		"_source": map[string]any{"excludes": []string{"messages"}},
-		"query":   map[string]any{"term": map[string]any{"user_id": userID}},
-		"sort":    []any{map[string]any{"updated_at": map[string]any{"order": "desc"}}},
+		"query": map[string]any{"bool": map[string]any{"filter": []any{
+			map[string]any{"term": map[string]any{"organization_id": organizationID}},
+			map[string]any{"term": map[string]any{"user_id": userID}},
+		}}},
+		"sort": []any{map[string]any{"updated_at": map[string]any{"order": "desc"}}},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("conversations: marshal list query: %w", err)
@@ -156,6 +171,64 @@ func (r *Repository) ListByUser(ctx context.Context, userID string) ([]Summary, 
 
 // Save persists a conversation, overwriting any previous version and
 // keeping the denormalized message count in step.
+// Delete removes one conversation, scoped to its owner and organization.
+// The boolean reports whether it existed to delete.
+//
+// Scoped through Get rather than deleting by id: the same check that makes
+// another organization's conversation invisible must make it undeletable,
+// and an owner's permission bypass would otherwise reach it.
+func (r *Repository) Delete(ctx context.Context, organizationID, userID, id string) (bool, error) {
+	_, found, err := r.Get(ctx, organizationID, userID, id)
+	if err != nil || !found {
+		return false, err
+	}
+	if err := r.os.DeleteDoc(ctx, r.index, id); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// DeleteByUser removes every conversation of one user and reports how many.
+//
+// Used when an account is deleted: a conversation outliving its owner keeps a
+// valid organization_id, so it stays inside the boundary while belonging to
+// nobody — and since ADR-0018 it holds tool calls and results verbatim, which
+// may include data pulled from that user's connected accounts.
+func (r *Repository) DeleteByUser(ctx context.Context, userID string) (int, error) {
+	counted, err := r.countByUser(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+	body, err := json.Marshal(map[string]any{
+		"query": map[string]any{"term": map[string]any{"user_id": userID}},
+	})
+	if err != nil {
+		return 0, err
+	}
+	if err := r.os.DeleteByQuery(ctx, r.index, body); err != nil {
+		return 0, err
+	}
+	return counted, nil
+}
+
+// countByUser reports how many conversations a user holds, so the deletion
+// can say what it removed.
+func (r *Repository) countByUser(ctx context.Context, userID string) (int, error) {
+	body, err := json.Marshal(map[string]any{
+		"size":    0,
+		"_source": false,
+		"query":   map[string]any{"term": map[string]any{"user_id": userID}},
+	})
+	if err != nil {
+		return 0, err
+	}
+	result, err := r.os.SearchWithAggregations(ctx, r.index, body)
+	if err != nil {
+		return 0, err
+	}
+	return result.Total, nil
+}
+
 func (r *Repository) Save(ctx context.Context, c Conversation) error {
 	c.MessageCount = len(c.Messages)
 	body, err := json.Marshal(c)

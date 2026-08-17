@@ -9,6 +9,7 @@ import (
 	restful "github.com/emicklei/go-restful/v3"
 
 	"enact/internal/kb"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 )
 
@@ -16,8 +17,16 @@ import (
 // service, matching its own limit.
 const kbUploadMaxBytes = 50 << 20
 
+// kbListItem is a knowledge base plus what the caller may do with it; see
+// resourceFlags. "Usable" for a knowledge base means retrieving from it —
+// what an agent does at inference time — as distinct from editing the record.
+type kbListItem struct {
+	kb.KnowledgeBase
+	resourceFlags
+}
+
 type listKBsResponse struct {
-	KnowledgeBases []kb.KnowledgeBase `json:"knowledge_bases"`
+	KnowledgeBases []kbListItem `json:"knowledge_bases"`
 }
 
 // createKBRequest names the knowledge base being created.
@@ -101,7 +110,15 @@ func (a *MainAPI) listKBs(req *restful.Request, resp *restful.Response) {
 		return
 	}
 	logger.Info("knowledge bases listed", "count", len(list))
-	requesthelper.WriteJSON(req, resp, http.StatusOK, listKBsResponse{KnowledgeBases: list})
+	effective := a.effectiveFor(req, logger, sess.UserID)
+	out := make([]kbListItem, 0, len(list))
+	for _, record := range list {
+		out = append(out, kbListItem{
+			KnowledgeBase: record,
+			resourceFlags: flagsFor(effective, rbac.ResourceKB, record.ID),
+		})
+	}
+	requesthelper.WriteJSON(req, resp, http.StatusOK, listKBsResponse{KnowledgeBases: out})
 }
 
 func (a *MainAPI) createKB(req *restful.Request, resp *restful.Response) {
@@ -177,6 +194,8 @@ func (a *MainAPI) getKB(req *restful.Request, resp *restful.Response) {
 		requesthelper.WriteError(req, resp, http.StatusNotFound, "knowledge base not found")
 		return
 	}
+	effective := a.effectiveFor(req, logger, sess.UserID)
+	body = withFlags(body, flagsFor(effective, rbac.ResourceKB, id))
 	logger.Info("knowledge base fetched", "bytes", len(body))
 	writeRawJSON(resp, http.StatusOK, body)
 }

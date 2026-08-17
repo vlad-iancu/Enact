@@ -16,7 +16,15 @@ import (
 type MainSession struct {
 	client  *http.Client
 	baseURL string
+	// userID is the authenticated account's id, resolved at login. Cases
+	// that then call a service DIRECTLY need it: a service call carries
+	// whatever user id it is told to, and using the suite's default would
+	// act as a different person than the one that created the fixtures.
+	userID string
 }
+
+// UserID is the authenticated account's id.
+func (s *MainSession) UserID() string { return s.userID }
 
 // NewMainSession returns a fresh, unauthenticated session client.
 func (t *T) NewMainSession() *MainSession {
@@ -90,7 +98,6 @@ func (s *MainSession) RegisterOrLogin(t *T, displayName, email, password string)
 	status := s.DoJSON(t, http.MethodPost, "/auth/register", strings.NewReader(body), nil)
 	switch status {
 	case http.StatusCreated:
-		return
 	case http.StatusConflict:
 		login := fmt.Sprintf(`{"email":%q,"password":%q}`, email, password)
 		if st := s.DoJSON(t, http.MethodPost, "/auth/login", strings.NewReader(login), nil); st != http.StatusOK {
@@ -99,6 +106,35 @@ func (s *MainSession) RegisterOrLogin(t *T, displayName, email, password string)
 	default:
 		t.Fatalf("register %s: got HTTP %d, want 201 or 409", email, status)
 	}
+	s.provision(t, email)
+}
+
+// provision places a freshly authenticated fixture account in the suite's
+// organization and gives it the create rules.
+//
+// A self-registered account belongs to no organization, and since RBAC
+// landed that means it can do nothing at all — not create a resource, not
+// even connect an identity, because a provider is resolved through the
+// caller's organization. Every case that logs in as a person needs this, so
+// it happens here rather than being repeated (and forgotten) per case.
+//
+// Only CREATE rules are granted. The isolation cases depend on a fixture
+// account being unable to reach another account's resources, so anything
+// broader would quietly stop them proving anything.
+func (s *MainSession) provision(t *T, email string) {
+	var me struct {
+		ID string `json:"id"`
+	}
+	if st := s.DoJSON(t, http.MethodGet, "/auth/me", nil, &me); st != http.StatusOK || me.ID == "" {
+		t.Fatalf("resolve the id of %s: got HTTP %d (id=%q)", email, st, me.ID)
+	}
+	if err := t.Env.PlaceInOrganization(t.Context(), me.ID); err != nil {
+		t.Fatalf("place %s in the suite's organization: %v", email, err)
+	}
+	if err := t.Env.GrantRules(t.Context(), me.ID, TestRules()); err != nil {
+		t.Fatalf("grant create permissions to %s: %v", email, err)
+	}
+	s.userID = me.ID
 }
 
 // DoJSONRaw is DoJSON plus the raw response body, for assertions about what

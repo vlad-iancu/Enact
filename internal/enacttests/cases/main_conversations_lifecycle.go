@@ -88,4 +88,37 @@ func (c *mainConversationsLifecycleCase) Run(t *utils.T) {
 	if st := other.DoJSON(t, http.MethodPut, "/conversations/"+convID, strings.NewReader(`{"title":"hijack"}`), nil); st != http.StatusNotFound {
 		t.Errorf("other user rename: got HTTP %d, want 404", st)
 	}
+	// ...and cannot delete it either, which matters more than the read: a
+	// 404 that still destroyed the record would be the worst of both.
+	if st := other.DoJSON(t, http.MethodDelete, "/conversations/"+convID, nil, nil); st != http.StatusNotFound {
+		t.Errorf("other user delete: got HTTP %d, want 404", st)
+	}
+	if st := s.DoJSON(t, http.MethodGet, "/conversations/"+convID, nil, nil); st != http.StatusOK {
+		t.Errorf("conversation did not survive another user's delete: got HTTP %d, want 200", st)
+	}
+
+	// The owner deletes it: gone from the listing, gone by id, and deleting
+	// it twice is a 404 rather than a silent success.
+	if st := s.DoJSON(t, http.MethodDelete, "/conversations/"+convID, nil, nil); st != http.StatusNoContent {
+		t.Fatalf("delete conversation: got HTTP %d, want 204", st)
+	}
+	if st := s.DoJSON(t, http.MethodGet, "/conversations/"+convID, nil, nil); st != http.StatusNotFound {
+		t.Errorf("deleted conversation still fetchable: got HTTP %d, want 404", st)
+	}
+	if st := s.DoJSON(t, http.MethodDelete, "/conversations/"+convID, nil, nil); st != http.StatusNotFound {
+		t.Errorf("deleting twice: got HTTP %d, want 404", st)
+	}
+	var after struct {
+		Conversations []struct {
+			ID string `json:"id"`
+		} `json:"conversations"`
+	}
+	if st := s.DoJSON(t, http.MethodGet, "/conversations", nil, &after); st != http.StatusOK {
+		t.Fatalf("list after delete: got HTTP %d, want 200", st)
+	}
+	for _, item := range after.Conversations {
+		if item.ID == convID {
+			t.Errorf("deleted conversation still listed")
+		}
+	}
 }

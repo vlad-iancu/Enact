@@ -46,9 +46,11 @@ func (a *MainAPI) adminWebService() *restful.WebService {
 		Returns(http.StatusBadRequest, "Invalid pagination", errorResponse{}).
 		Returns(http.StatusForbidden, "Not the administrator", errorResponse{}))
 
-	// Identity-provider administration lives here too: it is the same
-	// "platform-wide, administrator-only" class of action.
-	a.registerAdminIdentityRoutes(ws)
+	// Identity providers used to be administered here. They are now
+	// organization-scoped (keyed by organization and name), so registering
+	// one is an act inside ONE organization rather than a platform-wide one
+	// — it lives on the identities surface, gated by enact:provider:create.
+	a.registerAdminOrganizationRoutes(ws)
 
 	ws.Route(ws.POST("/delete-user").
 		To(a.adminDeleteUser).
@@ -281,6 +283,22 @@ func (a *MainAPI) adminDeleteUser(req *restful.Request, resp *restful.Response) 
 	logger.Info("stored credentials deleted", "user_id", user.ID, "deleted", deleted.Deleted,
 		"revoked", deleted.Revoked, "revocation_unsupported", deleted.RevocationUnsupported,
 		"revocation_failed", deleted.RevocationFailed)
+
+	// Conversations go with the account, and like credentials this is
+	// allowed to fail the whole delete. A conversation outliving its owner
+	// keeps a valid organization_id, so it stays inside the organization
+	// while belonging to nobody — and since ADR-0018 it holds the verbatim
+	// results of every tool call made on that user's behalf, which may carry
+	// data from the accounts just disconnected above. Failing here leaves a
+	// consistent, retryable state instead of a silent remnant.
+	conversations, err := a.conversations.DeleteByUser(req.Request.Context(), user.ID)
+	if err != nil {
+		logger.Error("failed to delete the user's conversations", "user_id", user.ID, "err", err)
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError,
+			"failed to delete the account's conversations")
+		return
+	}
+	logger.Info("conversations deleted", "user_id", user.ID, "count", conversations)
 
 	// Avatar cleanup is best-effort, like avatar replacement: an orphaned
 	// object must never block the account deletion.

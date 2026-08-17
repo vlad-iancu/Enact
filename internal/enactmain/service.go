@@ -23,6 +23,7 @@ import (
 	"enact/internal/logging"
 	"enact/internal/models"
 	"enact/internal/opensearch"
+	"enact/internal/rbac"
 	"enact/internal/s2s"
 	"enact/internal/s3"
 	"enact/internal/service"
@@ -44,6 +45,7 @@ type Config struct {
 	Agents        agents.ClientConfig
 	KB            kb.ClientConfig
 	ToolRegistry  tools.ClientConfig
+	RBAC          rbac.ClientConfig
 	Identities    extidentities.ClientConfig
 	S2S           s2s.Config
 	Storage       s3.Config
@@ -178,6 +180,7 @@ func Build(cfg *Config) service.Builder {
 		api.publicBaseURL = strings.TrimRight(cfg.PublicBaseURL, "/")
 		api.adminEmail = users.NormalizeEmail(cfg.AdminEmail)
 		api.toolRegistry = tools.NewClient(cfg.ToolRegistry, s2sRuntime.Transport(nil, "enact-tool-registry"))
+		api.rbac = rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
 		api.identities = extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities"))
 		services := api.WebServices()
 		if s2sRuntime.Enabled() {

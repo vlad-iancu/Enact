@@ -1,0 +1,30 @@
+{
+  "index_patterns": [
+    "enact-organization-requests"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Requests to create an organization. A user submits one; the platform administrator approves it, which is when the organization comes into existence."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id": { "type": "keyword" },
+        "name": { "type": "text" },
+        "requested_by": { "type": "keyword" },
+        "requested_by_email": { "type": "keyword" },
+        "justification": { "type": "text", "index": false },
+        "status": { "type": "keyword" },
+        "decided_by": { "type": "keyword" },
+        "decided_at": { "type": "date" },
+        "reason": { "type": "text", "index": false },
+        "organization_id": { "type": "keyword" },
+        "created_at": { "type": "date" }
+      }
+    }
+  }
+}

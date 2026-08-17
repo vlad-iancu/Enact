@@ -1,0 +1,68 @@
+# Access control list for enact-rbac.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# Every route is service-to-service: enact-main fronts the browser surface,
+# and the resource services call /v1/effective and /v1/grants on every
+# request they serve. There is no anonymous access to any of it.
+#
+# Note what this ACL does NOT decide: whether the CALLING USER may do the
+# thing. Owner-gated routes check the caller's own membership inside the
+# service; the administrator-only routes (deciding organization requests) are
+# gated by enact-main, which is the component that knows who ADMIN_EMAIL is.
+service: enact-rbac
+rules:
+  # The hot path: resolving a user's organization and rules, and the
+  # single-shot check.
+  - route: "GET /v1/effective"
+    allow: ["*"]
+  - route: "POST /v1/authorize"
+    allow: ["*"]
+  # A user reading their own roles, for the profile page. Caller-scoped
+  # inside the service, so this grants no view of anyone else's.
+  - route: "GET /v1/roles/mine"
+    allow: ["*"]
+
+  # Organization requests. Submitting is any user's right (through
+  # enact-main); deciding is the administrator's.
+  - route: "POST /v1/organizations/requests"
+    allow: ["*"]
+  - route: "GET /v1/organizations/requests"
+    allow: ["*"]
+  - route: "POST /v1/organizations/requests/{id}/approve"
+    allow: ["*"]
+  - route: "POST /v1/organizations/requests/{id}/reject"
+    allow: ["*"]
+
+  # Organizations, members and roles.
+  - route: "GET /v1/organizations"
+    allow: ["*"]
+  - route: "GET /v1/organizations/{id}"
+    allow: ["*"]
+  - route: "GET /v1/organizations/{id}/members"
+    allow: ["*"]
+  - route: "POST /v1/organizations/{id}/members"
+    allow: ["*"]
+  - route: "DELETE /v1/organizations/{id}/members/{user}"
+    allow: ["*"]
+  - route: "GET /v1/organizations/{id}/roles"
+    allow: ["*"]
+  - route: "POST /v1/organizations/{id}/roles"
+    allow: ["*"]
+  - route: "DELETE /v1/organizations/{id}/roles/{name}"
+    allow: ["*"]
+  - route: "POST /v1/organizations/{id}/roles/{name}/assign"
+    allow: ["*"]
+  - route: "POST /v1/organizations/{id}/roles/{name}/unassign"
+    allow: ["*"]
+
+  # Provisioning: placing a user in an organization without an owner check.
+  # Service-only by this ACL, and enact-main relays no route to it, so no
+  # person can reach it.
+  - route: "POST /v1/memberships"
+    allow: ["*"]
+
+  # Ownership bookkeeping, written by whichever service created the resource.
+  - route: "POST /v1/grants"
+    allow: ["*"]
+  - route: "POST /v1/grants/revoke"
+    allow: ["*"]

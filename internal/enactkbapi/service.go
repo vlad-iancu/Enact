@@ -14,6 +14,7 @@ import (
 	"enact/internal/logging"
 	"enact/internal/opensearch"
 	"enact/internal/queue"
+	"enact/internal/rbac"
 	"enact/internal/s2s"
 	"enact/internal/service"
 )
@@ -30,6 +31,7 @@ type Config struct {
 	OpenSearch opensearch.Config
 	Queue      queue.Config
 	KB         kb.Config
+	RBAC       rbac.ClientConfig
 	S2S        s2s.Config
 }
 
@@ -62,7 +64,11 @@ func Build(cfg *Config) service.Builder {
 		}
 		producer := queue.NewProducer(cfg.Queue)
 		logger.Info("kb api initialized", "stream", cfg.Queue.Stream, "s2s_key_id", cfg.S2S.KeyID)
-		ws := newKBAPI(kbs, documents, producer, logger).WebService()
+		// This service checks its own permissions: it is reachable by any
+		// signed service caller, not only through enact-main.
+		rbacClient := rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
+		enforcer := rbac.NewEnforcer(rbacClient, cfg.RBAC)
+		ws := newKBAPI(kbs, documents, producer, rbacClient, enforcer, logger).WebService()
 		if s2sRuntime.Enabled() {
 			ws.Filter(s2sRuntime.Filter)
 		}

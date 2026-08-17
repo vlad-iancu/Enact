@@ -47,7 +47,7 @@ TIKA_URL="${TIKA_URL:-http://localhost:9998}"
 BEDROCK_EMBEDDING_DIM="${BEDROCK_EMBEDDING_DIM:-1024}"
 
 # Indices, paired with their template files in mappings/.
-INDICES=(enact-knowledge-bases enact-agents enact-kb-documents enact-agent-rag-chunks enact-users enact-conversations enact-tool-servers enact-tool-cache enact-identities enact-identity-providers)
+INDICES=(enact-knowledge-bases enact-agents enact-kb-documents enact-agent-rag-chunks enact-users enact-conversations enact-tool-servers enact-tool-cache enact-identities enact-identity-providers enact-organizations enact-organization-requests enact-memberships enact-roles)
 
 # --- helpers ---------------------------------------------------------------
 
@@ -157,12 +157,14 @@ register_templates() {
 # field to an existing mapping is an idempotent, always-allowed operation.
 update_live_mappings() {
   put_live_mapping enact-agent-rag-chunks '{"properties":{"filename":{"type":"keyword"}}}'
-  put_live_mapping enact-knowledge-bases '{"properties":{"name":{"type":"text"},"updated_at":{"type":"date"}}}'
-  put_live_mapping enact-agents '{"properties":{"name":{"type":"text"},"tools":{"type":"keyword"}}}'
+  put_live_mapping enact-knowledge-bases '{"properties":{"name":{"type":"text"},"updated_at":{"type":"date"},"organization_id":{"type":"keyword"}}}'
+  put_live_mapping enact-agents '{"properties":{"name":{"type":"text"},"tools":{"type":"keyword"},"organization_id":{"type":"keyword"}}}'
   put_live_mapping enact-conversations '{"properties":{"messages":{"properties":{"attachments":{"type":"keyword"},"tool_calls":{"type":"object","enabled":false}}}}}'
-  put_live_mapping enact-tool-servers '{"properties":{"tool_access_requirements":{"type":"object","enabled":false},"tool_authorizations":{"type":"object","enabled":false}}}'
-  put_live_mapping enact-identities '{"properties":{"access_level":{"type":"keyword"}}}'
-  put_live_mapping enact-identity-providers '{"properties":{"access_levels":{"type":"object","enabled":false}}}'
+  put_live_mapping enact-tool-servers '{"properties":{"tool_access_requirements":{"type":"object","enabled":false},"tool_authorizations":{"type":"object","enabled":false},"organization_id":{"type":"keyword"}}}'
+  put_live_mapping enact-conversations '{"properties":{"organization_id":{"type":"keyword"}}}'
+  put_live_mapping enact-tool-cache '{"properties":{"organization_id":{"type":"keyword"}}}'
+  put_live_mapping enact-identities '{"properties":{"access_level":{"type":"keyword"},"organization_id":{"type":"keyword"}}}'
+  put_live_mapping enact-identity-providers '{"properties":{"access_levels":{"type":"object","enabled":false},"organization_id":{"type":"keyword"},"created_by":{"type":"keyword"}}}'
   put_live_mapping enact-users '{"properties":{"avatar_key":{"type":"keyword"},"verification_token_hash":{"type":"keyword","index":false},"verification_expires_at":{"type":"date"}}}'
 }
 

@@ -9,6 +9,7 @@ import (
 
 	restful "github.com/emicklei/go-restful/v3"
 
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/tools"
 )
@@ -64,8 +65,15 @@ func (a *MainAPI) mcpServersWebService() *restful.WebService {
 	return ws
 }
 
+// mcpServerItem is a registered server plus what the caller may do with it;
+// see resourceFlags. "Usable" means an agent of theirs may call its tools.
+type mcpServerItem struct {
+	tools.Server
+	resourceFlags
+}
+
 type mcpServersResponse struct {
-	Servers []tools.Server `json:"servers"`
+	Servers []mcpServerItem `json:"servers"`
 }
 
 type mcpToolsResponse struct {
@@ -110,8 +118,16 @@ func (a *MainAPI) listMCPServers(req *restful.Request, resp *restful.Response) {
 		relayToolsErr(req, resp, err, "list MCP servers")
 		return
 	}
-	logger.Info("mcp servers listed", "count", len(servers))
-	requesthelper.WriteJSON(req, resp, http.StatusOK, mcpServersResponse{Servers: servers})
+	effective := a.effectiveFor(req, logger, sess.UserID)
+	out := make([]mcpServerItem, 0, len(servers))
+	for _, server := range servers {
+		out = append(out, mcpServerItem{
+			Server:        server,
+			resourceFlags: flagsFor(effective, rbac.ResourceMCPServer, server.ID),
+		})
+	}
+	logger.Info("mcp servers listed", "count", len(out))
+	requesthelper.WriteJSON(req, resp, http.StatusOK, mcpServersResponse{Servers: out})
 }
 
 func (a *MainAPI) listMCPTools(req *restful.Request, resp *restful.Response) {
@@ -133,7 +149,11 @@ func (a *MainAPI) listMCPTools(req *restful.Request, resp *restful.Response) {
 	for i, s := range servers {
 		ids[i] = s.ID
 	}
-	defs, err := a.toolRegistry.ListTools(req.Request.Context(), ids)
+	organizationID, ok := a.conversationOrganization(req, resp)
+	if !ok {
+		return
+	}
+	defs, err := a.toolRegistry.ListTools(req.Request.Context(), organizationID, ids)
 	if err != nil {
 		logger.Error("failed to list mcp tools", "err", err)
 		relayToolsErr(req, resp, err, "list MCP tools")
@@ -215,6 +235,14 @@ func (a *MainAPI) deleteMCPServer(req *restful.Request, resp *restful.Response) 
 // validation/conflict/unreachable-server messages pass through as 400,
 // everything else is a 502.
 func relayToolsErr(req *restful.Request, resp *restful.Response, err error, action string) {
+	var forbidden *requesthelper.ForbiddenError
+	if errors.As(err, &forbidden) {
+		// A downstream refusal, relayed as one. Flattening it into the 502
+		// below would tell a user their platform is broken when in fact they
+		// need a role.
+		requesthelper.WriteError(req, resp, http.StatusForbidden, forbidden.Message)
+		return
+	}
 	var badReq *requesthelper.BadRequestError
 	if errors.As(err, &badReq) {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, badReq.Message)

@@ -66,7 +66,10 @@ var bedrockToolNameInvalid = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 // tool specs to advertise and the name→(server, tool) map needed to execute
 // calls. Bedrock tool names are "<server>__<tool>", sanitized and
 // de-duplicated, so distinct servers can expose same-named tools.
-func (a *InferenceAPI) buildToolBindings(ctx context.Context, logger *logging.Logger, serverIDs []string) ([]bedrock.ToolSpec, map[string]toolBinding, error) {
+// The organization is the AGENT's, not the caller's: the tools an agent may
+// reach are fixed by where the agent lives, and the tool loop runs on its
+// behalf.
+func (a *InferenceAPI) buildToolBindings(ctx context.Context, logger *logging.Logger, organizationID string, serverIDs []string) ([]bedrock.ToolSpec, map[string]toolBinding, error) {
 	servers, err := a.tools.List(ctx, serverIDs, "")
 	if err != nil {
 		return nil, nil, fmt.Errorf("list MCP servers: %w", err)
@@ -82,7 +85,7 @@ func (a *InferenceAPI) buildToolBindings(ctx context.Context, logger *logging.Lo
 			logger.Warn("agent references missing mcp server", "server_id", id)
 		}
 	}
-	defs, err := a.tools.ListTools(ctx, serverIDs)
+	defs, err := a.tools.ListTools(ctx, organizationID, serverIDs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list MCP tools: %w", err)
 	}
@@ -132,32 +135,37 @@ func (a *InferenceAPI) executeToolUses(ctx context.Context, logger *logging.Logg
 	results := bedrock.Message{Role: "user"}
 	records := make([]ToolCallRecord, 0, len(uses))
 
-	// Phase 1: resolve every credentialed tool up front, so a turn needing
-	// two authorizations can ask for both at once instead of making the
-	// user connect one account, wait, and then connect another.
-	pending := a.resolveTurn(ctx, logger, bindings, uses, emit)
-	// One deadline for the whole turn: N tools must not multiply how long
-	// a single request can hang.
+	// Phase 1: announce every call of the turn, then resolve credentials for
+	// all of them before executing any.
+	//
+	// The announcement comes FIRST so a client can read the stream in
+	// arrival order. Per tool_use_id the sequence is always
+	//
+	//	toolCall → [toolCallWaitingAuthorization …] → toolCallResult
+	//
+	// Announcing after resolution would put a "waiting" before the "call"
+	// it refers to, and a UI rendering toolCall as "running" would show a
+	// blocked call as executing unless it knew to let an earlier event
+	// override a later one.
+	//
+	// Resolution stays batched: a turn needing two accounts asks for both at
+	// once rather than making the user connect one, wait, and then discover
+	// another.
+	if err := announceToolCalls(turn, bindings, uses, emit); err != nil {
+		return bedrock.Message{}, nil, err
+	}
+	// One deadline for the whole turn: N tools must not multiply how long a
+	// single request can hang. Computed BEFORE the announcements so each one
+	// states the time actually left, not the nominal window — for the second
+	// tool of a turn those differ.
 	turnDeadline := time.Now().Add(a.toolAuth.waitFor)
+	pending := a.resolveTurn(ctx, logger, bindings, uses, turnDeadline, emit)
 
 	for _, use := range uses {
 		binding, known := bindings[use.Name]
 		serverID, toolName := binding.Server.ID, binding.ToolName
 		if !known {
 			serverID, toolName = "", use.Name
-		}
-		if emit != nil {
-			// The model's ORIGINAL arguments: injected credentials must
-			// never reach the client or the conversation record.
-			if err := emit("toolCall", toolCallEvent{
-				ServerID:  serverID,
-				Tool:      toolName,
-				ToolUseID: use.ID,
-				Arguments: use.Input,
-				Turn:      turn,
-			}); err != nil {
-				return bedrock.Message{}, nil, err
-			}
 		}
 		logger.Info("executing tool call", "server_id", serverID, "tool", toolName, "tool_use_id", use.ID, "arguments_bytes", len(use.Input))
 
@@ -292,10 +300,40 @@ func (a *InferenceAPI) executeToolUses(ctx context.Context, logger *logging.Logg
 	return results, records, nil
 }
 
+// announceToolCalls emits one toolCall per use, before anything is resolved
+// or executed.
+//
+// The arguments are the model's ORIGINAL ones: injected credentials must
+// never reach the client or the conversation record.
+func announceToolCalls(turn int, bindings map[string]toolBinding, uses []bedrock.ToolUse, emit func(event string, payload any) error) error {
+	if emit == nil {
+		return nil
+	}
+	for _, use := range uses {
+		binding, known := bindings[use.Name]
+		serverID, toolName := binding.Server.ID, binding.ToolName
+		if !known {
+			// An unknown tool is still announced: the client asked for it,
+			// and the result event that follows explains why it failed.
+			serverID, toolName = "", use.Name
+		}
+		if err := emit("toolCall", toolCallEvent{
+			ServerID:  serverID,
+			Tool:      toolName,
+			ToolUseID: use.ID,
+			Arguments: use.Input,
+			Turn:      turn,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // resolveTurn resolves credentials for every tool in the turn that declares
 // requirements, and announces the ones that cannot proceed yet. Tools
 // without requirements never reach the identity service at all.
-func (a *InferenceAPI) resolveTurn(ctx context.Context, logger *logging.Logger, bindings map[string]toolBinding, uses []bedrock.ToolUse, emit func(event string, payload any) error) map[string]resolved {
+func (a *InferenceAPI) resolveTurn(ctx context.Context, logger *logging.Logger, bindings map[string]toolBinding, uses []bedrock.ToolUse, deadline time.Time, emit func(event string, payload any) error) map[string]resolved {
 	pending := map[string]resolved{}
 	for _, use := range uses {
 		binding, known := bindings[use.Name]
@@ -305,7 +343,9 @@ func (a *InferenceAPI) resolveTurn(ctx context.Context, logger *logging.Logger, 
 		state := a.toolAuth.resolve(ctx, logger, binding.Server, binding.ToolName)
 		pending[use.ID] = state
 		// Announce every unmet call before executing any of them, so the UI
-		// can render all the "connect" prompts at once.
+		// can render all the "connect" prompts at once. This is the ONLY
+		// opening announcement a waiting call gets — the wait loop adds
+		// heartbeats, not a second identical event.
 		if emit != nil && state.Fatal == nil && len(state.Missing) > 0 {
 			_ = emit("toolCallWaitingAuthorization", toolCallWaitingAuthorizationEvent{
 				ServerID:    binding.Server.ID,
@@ -313,7 +353,7 @@ func (a *InferenceAPI) resolveTurn(ctx context.Context, logger *logging.Logger, 
 				ToolUseID:   use.ID,
 				Status:      waitStatusWaiting,
 				Missing:     state.Missing,
-				WaitSeconds: int(a.toolAuth.waitFor.Seconds()),
+				WaitSeconds: int(time.Until(deadline).Seconds()),
 			})
 		}
 	}

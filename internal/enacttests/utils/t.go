@@ -163,6 +163,14 @@ func buildMultipart(filename string, content []byte) (io.Reader, string, error) 
 // JSON response body into out (unless nil), and returns the status code. It
 // stamps the test user id; a transport-level failure aborts the phase.
 func (t *T) DoJSON(as, audience, method, url string, body io.Reader, out any) int {
+	return t.DoJSONAs(t.Env.UserID, as, audience, method, url, body, out)
+}
+
+// DoJSONAs is DoJSON acting as a specific user rather than the suite's
+// default. Needed wherever a case creates something through a browser
+// session and then calls a service directly about it: the two must be the
+// same person, or authorization correctly refuses.
+func (t *T) DoJSONAs(userID, as, audience, method, url string, body io.Reader, out any) int {
 	client, err := t.Env.Client(as, audience)
 	if err != nil {
 		t.Fatalf("build client for %q: %v", as, err)
@@ -174,7 +182,7 @@ func (t *T) DoJSON(as, audience, method, url string, body io.Reader, out any) in
 	// Always JSON, even with an empty body: go-restful 415s a bodyless POST
 	// to a Consumes(JSON) route when the header is missing.
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-User-Id", t.Env.UserID)
+	req.Header.Set("X-User-Id", userID)
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, url, err)

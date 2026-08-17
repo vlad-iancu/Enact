@@ -129,13 +129,19 @@ func (c *Client) do(ctx context.Context, method, url string, body []byte, wantSt
 		return true, nil
 	case http.StatusNotFound:
 		return false, nil
-	case http.StatusBadRequest:
+	case http.StatusBadRequest, http.StatusForbidden:
 		var apiErr struct {
 			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		if apiErr.Error == "" {
 			apiErr.Error = "bad request"
+		}
+		// A refusal must reach the caller AS a refusal. Folding it into the
+		// generic branch would turn "you may not" into "something broke",
+		// and the person who needs a role would go looking for an outage.
+		if resp.StatusCode == http.StatusForbidden {
+			return false, &requesthelper.ForbiddenError{Message: apiErr.Error}
 		}
 		return false, &requesthelper.BadRequestError{Message: apiErr.Error}
 	default:

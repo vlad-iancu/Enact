@@ -190,16 +190,23 @@ func (z *toolAuthorizer) waitForAuthorization(ctx context.Context, logger *loggi
 
 	current := first
 	if current = z.resolve(ctx, logger, server, toolName); len(current.Missing) == 0 || current.Fatal != nil {
+		// The credential landed between the turn's announcement and this
+		// wait. The client was told the call was waiting, so it must be told
+		// the wait is over — otherwise the status never leaves "waiting"
+		// until the result arrives.
+		if current.Fatal == nil {
+			_ = emit("toolCallWaitingAuthorization", toolCallWaitingAuthorizationEvent{
+				ServerID: server.ID, Tool: toolName, ToolUseID: toolUseID,
+				Status: waitStatusResolved,
+			})
+		}
 		return current, current.Fatal
 	}
 
-	if err := emit("toolCallWaitingAuthorization", toolCallWaitingAuthorizationEvent{
-		ServerID: server.ID, Tool: toolName, ToolUseID: toolUseID,
-		Status: waitStatusWaiting, Missing: current.Missing,
-		WaitSeconds: int(time.Until(deadline).Seconds()),
-	}); err != nil {
-		return current, err
-	}
+	// No opening announcement here: resolveTurn already emitted one for this
+	// call, with the same missing credentials and the same deadline. A second
+	// identical event a moment later tells the client nothing and reads as a
+	// duplicate. What follows are heartbeats and status changes only.
 	logger.Info("tool call waiting for authorization", "tool", toolName,
 		"missing", len(current.Missing), "deadline", deadline, "pending_waiters", z.waiters.Pending())
 

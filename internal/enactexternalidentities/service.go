@@ -19,6 +19,7 @@ import (
 	"enact/internal/identityevents"
 	"enact/internal/logging"
 	"enact/internal/opensearch"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/s2s"
 	"enact/internal/service"
@@ -36,6 +37,7 @@ type Config struct {
 	Identities     extidentities.Config
 	Crypto         extidentities.CryptoConfig
 	IdentityEvents identityevents.Config
+	RBAC           rbac.ClientConfig
 	S2S            s2s.Config
 
 	// RefreshAt is how often the sweep runs.
@@ -91,6 +93,7 @@ func Build(cfg *Config) service.Builder {
 			refreshWindow = minWindow
 		}
 
+		rbacClient := rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
 		api := &IdentitiesAPI{
 			repo:         repo,
 			flows:        newFlowStore(cfg.FlowTTL),
@@ -99,6 +102,8 @@ func Build(cfg *Config) service.Builder {
 			// missing one resumes. Constructing it opens no connection, so a
 			// Redis outage cannot stop this service from starting.
 			events:        identityevents.NewPublisher(cfg.IdentityEvents),
+			enforcer:      rbac.NewEnforcer(rbacClient, cfg.RBAC),
+			rbac:          rbacClient,
 			refreshWindow: refreshWindow,
 			publicURL:     strings.TrimRight(cfg.PublicURL, "/"),
 			logger:        logger,

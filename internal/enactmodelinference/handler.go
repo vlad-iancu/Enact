@@ -18,6 +18,7 @@ import (
 	"enact/internal/logging"
 	"enact/internal/models"
 	"enact/internal/rag"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/tools"
 )
@@ -66,10 +67,12 @@ type InferenceAPI struct {
 	toolAuth *toolAuthorizer
 	// maxTurns caps how many tool-execution rounds one inference may run.
 	maxTurns int
+	// enforcer answers whether the caller may run the agent they named.
+	enforcer *rbac.Enforcer
 	logger   *logging.Logger
 }
 
-func newInferenceAPI(client *bedrock.Client, agentClient *agents.Client, rags *agents.RAGRepository, kbClient *kb.Client, toolsClient *tools.Client, toolAuth *toolAuthorizer, embedModel string, maxTurns int, logger *logging.Logger) *InferenceAPI {
+func newInferenceAPI(client *bedrock.Client, agentClient *agents.Client, rags *agents.RAGRepository, kbClient *kb.Client, toolsClient *tools.Client, toolAuth *toolAuthorizer, enforcer *rbac.Enforcer, embedModel string, maxTurns int, logger *logging.Logger) *InferenceAPI {
 	if maxTurns <= 0 {
 		maxTurns = 10
 	}
@@ -80,6 +83,7 @@ func newInferenceAPI(client *bedrock.Client, agentClient *agents.Client, rags *a
 		kb:         kbClient,
 		tools:      toolsClient,
 		toolAuth:   toolAuth,
+		enforcer:   enforcer,
 		embedModel: embedModel,
 		maxTurns:   maxTurns,
 		logger:     logger,
@@ -162,6 +166,14 @@ func (a *InferenceAPI) infer(req *restful.Request, resp *restful.Response) {
 	var bindings map[string]toolBinding
 	if body.AgentID != "" {
 		logger = logger.WithFields("agent_id", body.AgentID)
+		// Running an agent is using it: the caller must hold `use` on this
+		// agent, or a stranger could run someone else's — and with it their
+		// knowledge bases and their MCP servers.
+		if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionUse, body.AgentID); err != nil {
+			logger.Warn("inference denied", "err", err)
+			rbac.WriteDenied(req, resp, err, "agent not found")
+			return
+		}
 		logger.Info("Applying agent")
 		var status int
 		var msg string
@@ -351,7 +363,7 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 	// cache into Bedrock tool specs plus the execution bindings.
 	var bindings map[string]toolBinding
 	if len(agent.Tools) > 0 {
-		specs, b, err := a.buildToolBindings(ctx, logger, agent.Tools)
+		specs, b, err := a.buildToolBindings(ctx, logger, agent.OrganizationID, agent.Tools)
 		if err != nil {
 			logger.Error("failed to build tool bindings", "err", err)
 			return nil, http.StatusBadGateway, "failed to resolve agent tools"

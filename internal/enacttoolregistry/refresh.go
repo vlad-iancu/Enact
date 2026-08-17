@@ -29,6 +29,8 @@ func (a *RegistryAPI) refreshLoop(ctx context.Context, interval time.Duration) {
 
 // refreshAll refreshes the cache of every registered server.
 func (a *RegistryAPI) refreshAll(ctx context.Context) {
+	// No organization filter: the sweep serves no caller and refreshes
+	// every organization's servers.
 	servers, err := a.repo.ListServers(ctx, nil, "")
 	if err != nil {
 		a.logger.Error("refresh: failed to list servers", "err", err)
@@ -36,13 +38,13 @@ func (a *RegistryAPI) refreshAll(ctx context.Context) {
 	}
 	a.logger.Info("refreshing tool caches", "servers", len(servers))
 	for _, server := range servers {
-		a.refreshServer(ctx, server.ID)
+		a.refreshServer(ctx, server.OrganizationID, server.ID)
 	}
 }
 
 // refreshServer re-fetches one server's tools and replaces its cache entry.
-func (a *RegistryAPI) refreshServer(ctx context.Context, id string) {
-	server, found, err := a.repo.GetServer(ctx, id)
+func (a *RegistryAPI) refreshServer(ctx context.Context, organizationID, id string) {
+	server, found, err := a.repo.GetServer(ctx, organizationID, id)
 	if err != nil || !found {
 		a.logger.Warn("refresh: server lookup failed", "id", id, "found", found, "err", err)
 		return
@@ -54,7 +56,7 @@ func (a *RegistryAPI) refreshServer(ctx context.Context, id string) {
 		a.logger.Warn("refresh: mcp server probe failed; keeping cached tools", "id", id, "url", server.URL, "err", err)
 		return
 	}
-	if err := a.repo.ReplaceTools(ctx, server.ID, defs); err != nil {
+	if err := a.repo.ReplaceTools(ctx, server.OrganizationID, server.ID, defs); err != nil {
 		a.logger.Error("refresh: failed to replace cached tools", "id", id, "err", err)
 		return
 	}

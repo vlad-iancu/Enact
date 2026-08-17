@@ -16,6 +16,9 @@
         "server_id": {
           "type": "keyword"
         },
+        "organization_id": {
+          "type": "keyword"
+        },
         "name": {
           "type": "keyword"
         },

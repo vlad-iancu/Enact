@@ -13,6 +13,7 @@ import (
 
 	"enact/internal/extidentities"
 	"enact/internal/logging"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 )
 
@@ -108,7 +109,13 @@ func (a *IdentitiesAPI) authorize(req *restful.Request, resp *restful.Response) 
 	logger.Info("oauth authorization requested", "user_id", userID, "provider", providerName,
 		"scopes", scopes, "access_level", accessLevel, "redirect_uri", redirectURI)
 
-	rec, provider, found, err := a.resolveProvider(req, providerName)
+	organizationID, err := a.organizationOf(req.Request.Context(), userID)
+	if err != nil {
+		logger.Warn("authorize: cannot resolve the user's organization", "user_id", userID, "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	rec, provider, found, err := a.resolveProvider(req, organizationID, providerName)
 	if err != nil {
 		logger.Error("failed to resolve provider", "provider", providerName, "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to resolve provider")
@@ -234,7 +241,13 @@ func (a *IdentitiesAPI) callback(req *restful.Request, resp *restful.Response) {
 	logger = logger.WithFields("user_id", f.UserID, "provider", f.Provider)
 	logger.Info("callback state resolved")
 
-	rec, provider, found, err := a.resolveProvider(req, f.Provider)
+	organizationID, orgErr := a.organizationOf(req.Request.Context(), f.UserID)
+	if orgErr != nil {
+		logger.Warn("callback: cannot resolve the user's organization", "err", orgErr)
+		a.finishCallback(req, resp, logger, f, http.StatusForbidden, "your account is no longer in an organization", nil)
+		return
+	}
+	rec, provider, found, err := a.resolveProvider(req, organizationID, f.Provider)
 	if err != nil || !found {
 		logger.Error("failed to resolve provider for callback", "found", found, "err", err)
 		a.finishCallback(req, resp, logger, f, http.StatusBadRequest, "the provider is no longer registered", nil)

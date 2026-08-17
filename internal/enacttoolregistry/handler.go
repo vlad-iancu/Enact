@@ -15,6 +15,7 @@ import (
 	"enact/internal/identity"
 	"enact/internal/logging"
 	"enact/internal/mcp"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/tools"
 )
@@ -33,6 +34,8 @@ type RegistryAPI struct {
 	// credentials a server's owner configured for it.
 	probeClient *http.Client
 	identities  *extidentities.Client
+	rbac        *rbac.Client
+	enforcer    *rbac.Enforcer
 	logger      *logging.Logger
 }
 
@@ -142,6 +145,11 @@ func (a *RegistryAPI) WebServices() []*restful.WebService {
 func (a *RegistryAPI) createServer(req *restful.Request, resp *restful.Response) {
 	logger := requesthelper.Logger(req, a.logger)
 	logger.Info("server registration requested")
+	if err := a.enforcer.Require(req.Request.Context(), rbac.Permission(rbac.ResourceMCPServer, rbac.ActionCreate, "*")); err != nil {
+		logger.Warn("server registration denied", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
 
 	var body createServerRequest
 	dec := json.NewDecoder(req.Request.Body)
@@ -169,7 +177,16 @@ func (a *RegistryAPI) createServer(req *restful.Request, resp *restful.Response)
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, err.Error())
 		return
 	}
-	_, exists, err := a.repo.GetServer(req.Request.Context(), body.ID)
+	// The id is unique within an ORGANIZATION, not platform-wide: the same
+	// name may be registered in two organizations, and neither refusal
+	// discloses the other's existence.
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		logger.Warn("register server: no organization", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	_, exists, err := a.repo.GetServer(req.Request.Context(), organizationID, body.ID)
 	if err != nil {
 		logger.Error("failed to check existing server", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to register server")
@@ -184,6 +201,7 @@ func (a *RegistryAPI) createServer(req *restful.Request, resp *restful.Response)
 	now := time.Now().UTC()
 	server := tools.Server{
 		ID:                     body.ID,
+		OrganizationID:         organizationID,
 		URL:                    body.URL,
 		TransportType:          body.TransportType,
 		Description:            body.Description,
@@ -206,12 +224,25 @@ func (a *RegistryAPI) createServer(req *restful.Request, resp *restful.Response)
 	server.ToolCount = len(defs)
 	logger.Info("mcp server probed", "id", body.ID, "tool_count", len(defs))
 	warnUnknownConfiguredTools(logger, server, defs)
+	// The registrant owns it.
+	if err := a.rbac.Grant(req.Request.Context(), rbac.GrantRequest{
+		UserID:     server.Owner,
+		Resource:   rbac.ResourceMCPServer,
+		ResourceID: server.ID,
+	}); err != nil {
+		logger.Error("failed to record ownership", "id", server.ID, "err", err)
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to record ownership of the server")
+		return
+	}
+	// Drop the owner's cached rules, which predate this grant — see
+	// rbac.Enforcer.Forget.
+	a.enforcer.Forget(server.Owner)
 	if err := a.repo.SaveServer(req.Request.Context(), server); err != nil {
 		logger.Error("failed to store server", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to register server")
 		return
 	}
-	if err := a.repo.ReplaceTools(req.Request.Context(), server.ID, defs); err != nil {
+	if err := a.repo.ReplaceTools(req.Request.Context(), server.OrganizationID, server.ID, defs); err != nil {
 		logger.Error("failed to cache tools", "id", server.ID, "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to cache tools")
 		return
@@ -240,7 +271,21 @@ func (a *RegistryAPI) updateServer(req *restful.Request, resp *restful.Response)
 		"requirements_provided", body.ToolAccessRequirements != nil,
 		"authorizations_provided", body.ToolAuthorizations != nil)
 
-	server, found, err := a.repo.GetServer(req.Request.Context(), id)
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceMCPServer, rbac.ActionEdit, id); err != nil {
+		logger.Warn("server update denied", "err", err)
+		rbac.WriteDenied(req, resp, err, fmt.Sprintf("server %q not found", id))
+		return
+	}
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		logger.Warn("no organization", "err", err)
+		rbac.WriteDenied(req, resp, err, fmt.Sprintf("server %q not found", id))
+		return
+	}
+	// Looking up by (organization, id) is what keeps another organization's
+	// server invisible: it is simply not found, with no separate check to
+	// forget.
+	server, found, err := a.repo.GetServer(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to load server", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to update server")
@@ -295,7 +340,7 @@ func (a *RegistryAPI) updateServer(req *restful.Request, resp *restful.Response)
 			requesthelper.WriteError(req, resp, http.StatusBadGateway, fmt.Sprintf("MCP server could not be probed: %v", err))
 			return
 		}
-		if err := a.repo.ReplaceTools(req.Request.Context(), server.ID, defs); err != nil {
+		if err := a.repo.ReplaceTools(req.Request.Context(), server.OrganizationID, server.ID, defs); err != nil {
 			logger.Error("failed to refresh tool cache", "id", server.ID, "err", err)
 			requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to refresh tools")
 			return
@@ -320,13 +365,42 @@ func (a *RegistryAPI) listServers(req *restful.Request, resp *restful.Response) 
 	owner := req.QueryParameter("owner")
 	logger.Info("server list requested", "ids", ids, "owner", owner)
 
-	servers, err := a.repo.ListServers(req.Request.Context(), ids, owner)
+	// owner set means "a person is browsing their servers": widen the
+	// candidates to their organization and let their rules decide. Left
+	// empty it stays a service-side lookup (the agent runtime resolving ids,
+	// the refresh sweep), which carries no user to authorize.
+	var organizationID string
+	var effective rbac.Effective
+	if owner != "" {
+		var err error
+		if organizationID, err = a.enforcer.Organization(req.Request.Context()); err != nil {
+			rbac.WriteDeniedForbidden(req, resp, err)
+			return
+		}
+		if effective, err = a.enforcer.CallerEffective(req.Request.Context()); err != nil {
+			rbac.WriteDeniedForbidden(req, resp, err)
+			return
+		}
+	}
+
+	servers, err := a.repo.ListServers(req.Request.Context(), ids, organizationID)
 	if err != nil {
 		logger.Error("failed to list servers", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to list servers")
 		return
 	}
-	logger.Info("servers listed", "count", len(servers))
+	if owner != "" {
+		visible := make([]tools.Server, 0, len(servers))
+		for _, s := range servers {
+			if effective.Allows(rbac.Permission(rbac.ResourceMCPServer, rbac.ActionView, s.ID)) {
+				visible = append(visible, s)
+			}
+		}
+		logger.Info("servers listed", "candidates", len(servers), "visible", len(visible))
+		servers = visible
+	} else {
+		logger.Info("servers listed", "count", len(servers))
+	}
 	requesthelper.WriteJSON(req, resp, http.StatusOK, serversResponse{Servers: servers})
 }
 
@@ -334,8 +408,19 @@ func (a *RegistryAPI) deleteServer(req *restful.Request, resp *restful.Response)
 	logger := requesthelper.Logger(req, a.logger)
 	id := req.QueryParameter("id")
 	logger.Info("server deletion requested", "id", id)
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceMCPServer, rbac.ActionDelete, id); err != nil {
+		logger.Warn("server deletion denied", "err", err)
+		rbac.WriteDenied(req, resp, err, fmt.Sprintf("server %q not found", id))
+		return
+	}
 
-	_, found, err := a.repo.GetServer(req.Request.Context(), id)
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		logger.Warn("no organization", "err", err)
+		rbac.WriteDenied(req, resp, err, fmt.Sprintf("server %q not found", id))
+		return
+	}
+	server, found, err := a.repo.GetServer(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to load server", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to delete server")
@@ -346,16 +431,27 @@ func (a *RegistryAPI) deleteServer(req *restful.Request, resp *restful.Response)
 		requesthelper.WriteError(req, resp, http.StatusNotFound, fmt.Sprintf("server %q not found", id))
 		return
 	}
-	if err := a.repo.DeleteTools(req.Request.Context(), id); err != nil {
+	if err := a.repo.DeleteTools(req.Request.Context(), organizationID, id); err != nil {
 		logger.Error("failed to delete cached tools", "id", id, "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to delete server")
 		return
 	}
-	if err := a.repo.DeleteServer(req.Request.Context(), id); err != nil {
+	if err := a.repo.DeleteServer(req.Request.Context(), organizationID, id); err != nil {
 		logger.Error("failed to delete server", "id", id, "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to delete server")
 		return
 	}
+	// The ownership rule outlives nothing: drop it with the server.
+	if err := a.rbac.Revoke(req.Request.Context(), rbac.GrantRequest{
+		UserID:     server.Owner,
+		Resource:   rbac.ResourceMCPServer,
+		ResourceID: id,
+	}); err != nil {
+		logger.Warn("failed to revoke ownership; the rule now points at nothing", "id", id, "err", err)
+	}
+	// And again on the way out, so the rule stops being honoured now
+	// rather than at the end of the TTL.
+	a.enforcer.Forget(server.Owner)
 	logger.Info("server deleted", "id", id)
 	resp.WriteHeader(http.StatusNoContent)
 }
@@ -363,9 +459,14 @@ func (a *RegistryAPI) deleteServer(req *restful.Request, resp *restful.Response)
 func (a *RegistryAPI) listTools(req *restful.Request, resp *restful.Response) {
 	logger := requesthelper.Logger(req, a.logger)
 	ids := req.Request.URL.Query()["ids"]
-	logger.Info("tool list requested", "ids", ids)
+	organizationID := req.QueryParameter("organization_id")
+	logger.Info("tool list requested", "ids", ids, "organization_id", organizationID)
 
-	defs, err := a.repo.ListTools(req.Request.Context(), ids)
+	// The organization is a parameter rather than the caller's, because the
+	// inference tool loop asks on behalf of an agent: the organization that
+	// matters is the AGENT's, not whichever identity the request carries.
+	// Empty means unfiltered, for callers that already hold qualified ids.
+	defs, err := a.repo.ListTools(req.Request.Context(), organizationID, ids)
 	if err != nil {
 		logger.Error("failed to list tools", "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to list tools")

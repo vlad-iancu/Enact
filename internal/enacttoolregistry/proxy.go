@@ -11,6 +11,7 @@ import (
 
 	"enact/internal/identity"
 	"enact/internal/logging"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/tools"
 )
@@ -65,7 +66,14 @@ func (a *RegistryAPI) proxySubpath(req *restful.Request, resp *restful.Response)
 // proxyTarget resolves the {server-id} path parameter to its record.
 func (a *RegistryAPI) proxyTarget(req *restful.Request, resp *restful.Response) (tools.Server, bool) {
 	id := req.PathParameter("server-id")
-	server, found, err := a.repo.GetServer(req.Request.Context(), id)
+	// Resolved within the caller's organization, so a server of another
+	// organization is not proxied — it is simply not found.
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		rbac.WriteDenied(req, resp, err, "server not found")
+		return tools.Server{}, false
+	}
+	server, found, err := a.repo.GetServer(req.Request.Context(), organizationID, id)
 	if err != nil {
 		requesthelper.Logger(req, a.logger).Error("failed to load server for proxy", "id", id, "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to resolve server")

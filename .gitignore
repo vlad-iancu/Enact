@@ -16,3 +16,10 @@ deploy/www/
 .idea/
 # local symlink for compose-relative s2s mount
 deploy/s2s
+# Local MCP debugging client: holds hand-pasted tokens and endpoints, and is
+# not part of the platform.
+cmd/mcpprobe/
+# Downloaded Google OAuth client definitions — these carry a client_secret.
+*client*.json
+# Tokens the local MCP probe caches after a consent flow.
+cmd/mcpprobe/token.json

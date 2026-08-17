@@ -138,13 +138,16 @@ func (c *Client) Create(ctx context.Context, name string) (KnowledgeBase, error)
 			return KnowledgeBase{}, fmt.Errorf("kb: decode create response: %w", err)
 		}
 		return record, nil
-	case http.StatusBadRequest:
+	case http.StatusBadRequest, http.StatusForbidden:
 		var apiErr struct {
 			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		if apiErr.Error == "" {
 			apiErr.Error = "bad request"
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			return KnowledgeBase{}, &requesthelper.ForbiddenError{Message: apiErr.Error}
 		}
 		return KnowledgeBase{}, &requesthelper.BadRequestError{Message: apiErr.Error}
 	default:
@@ -179,13 +182,16 @@ func (c *Client) Update(ctx context.Context, id string, rawBody json.RawMessage)
 		return record, true, nil
 	case http.StatusNotFound:
 		return KnowledgeBase{}, false, nil
-	case http.StatusBadRequest:
+	case http.StatusBadRequest, http.StatusForbidden:
 		var apiErr struct {
 			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		if apiErr.Error == "" {
 			apiErr.Error = "bad request"
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			return KnowledgeBase{}, false, &requesthelper.ForbiddenError{Message: apiErr.Error}
 		}
 		return KnowledgeBase{}, false, &requesthelper.BadRequestError{Message: apiErr.Error}
 	default:

@@ -43,6 +43,7 @@ type Config struct {
 	MainAPIURL      string `env:"MAIN_API_URL, default=http://localhost:8000"`
 	ToolRegistryURL string `env:"TOOL_REGISTRY_API_URL, default=http://localhost:8007"`
 	IdentitiesURL   string `env:"EXTERNAL_IDENTITIES_API_URL, default=http://localhost:8008"`
+	RBACURL         string `env:"RBAC_API_URL, default=http://localhost:8009"`
 
 	// MCPFixtureListen is where the embedded MCP fixture server listens;
 	// MCPFixtureURL is that server as the REGISTRY reaches it (differs in
@@ -78,6 +79,7 @@ func Build(cfg *Config) service.Builder {
 			MainAPIURL:      cfg.MainAPIURL,
 			ToolRegistryURL: cfg.ToolRegistryURL,
 			IdentitiesURL:   cfg.IdentitiesURL,
+			RBACURL:         cfg.RBACURL,
 			MCPFixtureURL:   cfg.MCPFixtureURL,
 			OAuthFixtureURL: cfg.OAuthFixtureURL,
 			UserID:          cfg.TestUserID,

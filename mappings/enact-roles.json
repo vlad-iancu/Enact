@@ -1,0 +1,27 @@
+{
+  "index_patterns": [
+    "enact-roles"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Roles and the rules they grant, scoped to one organization (doc id <org>:<name>). A role named after a user id is the hidden record of what that user owns."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "organization_id": { "type": "keyword" },
+        "name": { "type": "keyword" },
+        "rules": { "type": "keyword" },
+        "members": { "type": "keyword" },
+        "hidden": { "type": "boolean" },
+        "description": { "type": "text", "index": false },
+        "created_at": { "type": "date" },
+        "updated_at": { "type": "date" }
+      }
+    }
+  }
+}

@@ -13,6 +13,7 @@ import (
 	"enact/internal/logging"
 	"enact/internal/opensearch"
 	"enact/internal/queue"
+	"enact/internal/rbac"
 	"enact/internal/s2s"
 	"enact/internal/service"
 	"enact/internal/tools"
@@ -28,6 +29,7 @@ type Config struct {
 	Agents       agents.Config
 	KBAPI        kb.ClientConfig
 	ToolRegistry tools.ClientConfig
+	RBAC         rbac.ClientConfig
 	S2S          s2s.Config
 }
 
@@ -60,9 +62,15 @@ func Build(cfg *Config) service.Builder {
 		}
 		kbClient := kb.NewClient(cfg.KBAPI, s2sRuntime.Transport(nil, "enact-kb-api"))
 		toolsClient := tools.NewClient(cfg.ToolRegistry, s2sRuntime.Transport(nil, "enact-tool-registry"))
+		// Authorization is this service's own job: it is reachable by any
+		// signed service caller, so a check that lives only in enact-main is
+		// a check a second caller walks around.
+		rbacClient := rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
+		enforcer := rbac.NewEnforcer(rbacClient, cfg.RBAC)
 		producer := queue.NewProducer(cfg.Queue)
-		logger.Info("agent api initialized", "stream", cfg.Queue.Stream, "kb_api", cfg.KBAPI.BaseURL, "tool_registry", cfg.ToolRegistry.BaseURL, "s2s_key_id", cfg.S2S.KeyID)
-		ws := newAgentAPI(agentRepo, rags, kbClient, toolsClient, producer, logger).WebService()
+		logger.Info("agent api initialized", "stream", cfg.Queue.Stream, "kb_api", cfg.KBAPI.BaseURL,
+			"tool_registry", cfg.ToolRegistry.BaseURL, "rbac", cfg.RBAC.BaseURL, "s2s_key_id", cfg.S2S.KeyID)
+		ws := newAgentAPI(agentRepo, rags, kbClient, toolsClient, producer, rbacClient, enforcer, logger).WebService()
 		if s2sRuntime.Enabled() {
 			ws.Filter(s2sRuntime.Filter)
 		}

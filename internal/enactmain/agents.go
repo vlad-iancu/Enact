@@ -10,6 +10,7 @@ import (
 	restful "github.com/emicklei/go-restful/v3"
 
 	"enact/internal/agents"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 )
 
@@ -17,8 +18,16 @@ import (
 // service, matching its own limit.
 const agentUploadMaxBytes = 50 << 20
 
+// agentListItem is an agent plus what the caller may do with it. The agent's
+// own fields are embedded, so the JSON is the agent object with two extra
+// keys rather than a wrapper the UI has to unpack.
+type agentListItem struct {
+	agents.Agent
+	resourceFlags
+}
+
 type listAgentsResponse struct {
-	Agents []agents.Agent `json:"agents"`
+	Agents []agentListItem `json:"agents"`
 }
 
 type listAgentRAGDocumentsResponse struct {
@@ -115,6 +124,14 @@ func (a *MainAPI) agentsWebService() *restful.WebService {
 // relayAgentErr maps a downstream client error onto the right HTTP reply:
 // validation messages pass through as 400s, everything else is a 502.
 func relayAgentErr(req *restful.Request, resp *restful.Response, err error, action string) {
+	var forbidden *requesthelper.ForbiddenError
+	if errors.As(err, &forbidden) {
+		// A downstream refusal, relayed as one. Flattening it into the 502
+		// below would tell a user their platform is broken when in fact they
+		// need a role.
+		requesthelper.WriteError(req, resp, http.StatusForbidden, forbidden.Message)
+		return
+	}
 	var badReq *requesthelper.BadRequestError
 	if errors.As(err, &badReq) {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, badReq.Message)
@@ -133,8 +150,25 @@ func (a *MainAPI) listAgents(req *restful.Request, resp *restful.Response) {
 		relayAgentErr(req, resp, err, "list agents")
 		return
 	}
-	logger.Info("agents listed", "count", len(list))
-	requesthelper.WriteJSON(req, resp, http.StatusOK, listAgentsResponse{Agents: list})
+	// One rules lookup for the whole page; the flags are then decided
+	// locally with the same matcher the services enforce with, so the UI
+	// cannot disagree with what a later edit or delete would answer.
+	//
+	// A failure here leaves both flags false rather than failing the
+	// listing: the agents are the answer, and a missing edit button is a
+	// better outcome than no list at all.
+	effective := a.effectiveFor(req, logger, sess.UserID)
+	out := make([]agentListItem, 0, len(list))
+	usable := 0
+	for _, agent := range list {
+		item := agentListItem{Agent: agent, resourceFlags: flagsFor(effective, rbac.ResourceAgent, agent.ID)}
+		if item.Usable {
+			usable++
+		}
+		out = append(out, item)
+	}
+	logger.Info("agents listed", "count", len(out), "usable", usable, "owner", effective.Owner)
+	requesthelper.WriteJSON(req, resp, http.StatusOK, listAgentsResponse{Agents: out})
 }
 
 func (a *MainAPI) createAgent(req *restful.Request, resp *restful.Response) {
@@ -179,8 +213,10 @@ func (a *MainAPI) getAgent(req *restful.Request, resp *restful.Response) {
 		requesthelper.WriteError(req, resp, http.StatusNotFound, "agent not found")
 		return
 	}
-	logger.Info("agent fetched", "name", agent.Name, "model", agent.Model)
-	requesthelper.WriteJSON(req, resp, http.StatusOK, agent)
+	effective := a.effectiveFor(req, logger, sess.UserID)
+	item := agentListItem{Agent: agent, resourceFlags: flagsFor(effective, rbac.ResourceAgent, agent.ID)}
+	logger.Info("agent fetched", "name", agent.Name, "model", agent.Model, "usable", item.Usable)
+	requesthelper.WriteJSON(req, resp, http.StatusOK, item)
 }
 
 func (a *MainAPI) updateAgent(req *restful.Request, resp *restful.Response) {

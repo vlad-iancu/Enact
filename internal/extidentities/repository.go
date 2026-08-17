@@ -53,27 +53,31 @@ func (r *Repository) SaveProvider(ctx context.Context, rec ProviderRecord) error
 	if err != nil {
 		return err
 	}
-	return r.os.IndexDoc(ctx, r.providers, rec.Name, body)
+	return r.os.IndexDoc(ctx, r.providers, ProviderDocID(rec.OrganizationID, rec.Name), body)
 }
 
-// GetProvider fetches a provider by name. The boolean reports existence.
-func (r *Repository) GetProvider(ctx context.Context, name string) (ProviderRecord, bool, error) {
+// GetProvider fetches one organization's provider by name. The boolean
+// reports existence — another organization's provider of the same name is
+// not found, which is the isolation the doc id buys.
+func (r *Repository) GetProvider(ctx context.Context, organizationID, name string) (ProviderRecord, bool, error) {
 	var rec ProviderRecord
-	found, err := r.os.GetSource(ctx, r.providers, name, &rec)
+	found, err := r.os.GetSource(ctx, r.providers, ProviderDocID(organizationID, name), &rec)
 	return rec, found, err
 }
 
-// DeleteProvider removes a provider record.
-func (r *Repository) DeleteProvider(ctx context.Context, name string) error {
-	return r.os.DeleteDoc(ctx, r.providers, name)
+// DeleteProvider removes one organization's provider record.
+func (r *Repository) DeleteProvider(ctx context.Context, organizationID, name string) error {
+	return r.os.DeleteDoc(ctx, r.providers, ProviderDocID(organizationID, name))
 }
 
-// ListProviders returns registered providers, optionally filtered by type.
-func (r *Repository) ListProviders(ctx context.Context, providerType string) ([]ProviderRecord, error) {
-	query := map[string]any{"match_all": map[string]any{}}
+// ListProviders returns one organization's registered providers, optionally
+// filtered by type.
+func (r *Repository) ListProviders(ctx context.Context, organizationID, providerType string) ([]ProviderRecord, error) {
+	filters := []any{map[string]any{"term": map[string]any{"organization_id": organizationID}}}
 	if providerType != "" {
-		query = map[string]any{"term": map[string]any{"type": providerType}}
+		filters = append(filters, map[string]any{"term": map[string]any{"type": providerType}})
 	}
+	query := map[string]any{"bool": map[string]any{"filter": filters}}
 	body, err := json.Marshal(map[string]any{
 		"size":  1000,
 		"query": query,

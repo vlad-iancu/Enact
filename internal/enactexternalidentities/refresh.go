@@ -50,9 +50,21 @@ func (a *IdentitiesAPI) refreshExpiring(ctx context.Context) {
 	// Provider records are stable across a sweep; resolve each once.
 	providers := map[string]extidentities.Provider{}
 	for _, record := range due {
-		provider, ok := providers[record.Provider]
+		// The sweep has no caller, so the organization comes off the record
+		// itself — the reason Identity stores it (see extidentities.Identity).
+		organizationID := record.OrganizationID
+		if organizationID == "" {
+			effective, err := a.enforcer.Effective(ctx, record.UserID)
+			if err != nil {
+				a.logger.Warn("refresh: organization unresolved", "provider", record.Provider, "err", err)
+				continue
+			}
+			organizationID = effective.OrganizationID
+		}
+		key := extidentities.ProviderDocID(organizationID, record.Provider)
+		provider, ok := providers[key]
 		if !ok {
-			rec, found, err := a.repo.GetProvider(ctx, record.Provider)
+			rec, found, err := a.repo.GetProvider(ctx, organizationID, record.Provider)
 			if err != nil || !found {
 				a.logger.Warn("refresh: provider unavailable", "provider", record.Provider, "found", found, "err", err)
 				continue
@@ -62,7 +74,7 @@ func (a *IdentitiesAPI) refreshExpiring(ctx context.Context) {
 				a.logger.Warn("refresh: provider could not be built", "provider", record.Provider, "err", err)
 				continue
 			}
-			providers[record.Provider] = provider
+			providers[key] = provider
 		}
 		a.refreshOne(ctx, provider, record)
 	}

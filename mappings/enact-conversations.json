@@ -19,6 +19,9 @@
         "user_id": {
           "type": "keyword"
         },
+        "organization_id": {
+          "type": "keyword"
+        },
         "title": {
           "type": "text"
         },

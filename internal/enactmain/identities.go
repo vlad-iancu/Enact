@@ -13,6 +13,7 @@ import (
 	"enact/internal/extidentities"
 	"enact/internal/identity"
 	"enact/internal/logging"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/tools"
 )
@@ -60,6 +61,51 @@ func (a *MainAPI) identitiesWebService() *restful.WebService {
 		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
 		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
 
+	// Provider administration. These are ORGANIZATION-level acts, not
+	// platform-level ones: a provider record is keyed by (organization,
+	// name), so registering one adds a provider to the caller's own
+	// organization and to nobody else's.
+	//
+	// The gate is the RBAC rule enact:provider:create, enforced in
+	// enact-external-identities — an owner holds it by bypass, and may
+	// delegate it through a role. enact-main adds only the session, because
+	// a second gate here would make the rule undelegatable.
+	ws.Route(ws.POST("/providers/oauth").
+		To(a.createOAuthProvider).
+		Consumes(restful.MIME_JSON).
+		Reads(extidentities.RegisterOAuthProviderRequest{}).
+		Doc("Register an OAuth identity provider for your organization (requires enact:provider:create). Give discovery_url to fill the endpoints from the provider's well-known document, or state authorize_url and token_url explicitly").
+		Returns(http.StatusCreated, "Registered", extidentities.ProviderSummary{}).
+		Returns(http.StatusBadRequest, "Invalid request, or the provider is unreachable", errorResponse{}).
+		Returns(http.StatusConflict, "Your organization already has a provider with that name", errorResponse{}).
+		Returns(http.StatusForbidden, "Not permitted to register providers", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
+	ws.Route(ws.POST("/providers/pat").
+		To(a.createPATProvider).
+		Consumes(restful.MIME_JSON).
+		Reads(extidentities.RegisterPATProviderRequest{}).
+		Doc("Register a personal-access-token provider for your organization (requires enact:provider:create): a name is all it needs, since users paste their own tokens").
+		Returns(http.StatusCreated, "Registered", extidentities.ProviderSummary{}).
+		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
+		Returns(http.StatusConflict, "Your organization already has a provider with that name", errorResponse{}).
+		Returns(http.StatusForbidden, "Not permitted to register providers", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
+	// Registered BEFORE DELETE /{provider} so the literal path segment wins
+	// over the parameterised one: without this, deleting the provider named
+	// "providers" and disconnecting an identity would be the same route.
+	ws.Route(ws.DELETE("/providers/{name}").
+		To(a.deleteIdentityProvider).
+		Param(ws.PathParameter("name", "provider name")).
+		Param(ws.QueryParameter("force", "also delete every user identity that references it").DataType("boolean")).
+		Doc("Delete one of your organization's identity providers (requires enact:provider:delete); refused while stored identities still reference it unless force=true, which revokes and deletes those users' stored credentials too").
+		Returns(http.StatusNoContent, "Deleted", nil).
+		Returns(http.StatusNotFound, "No such provider", errorResponse{}).
+		Returns(http.StatusConflict, "Identities still reference this provider; pass force=true", errorResponse{}).
+		Returns(http.StatusForbidden, "Not permitted to delete this provider", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
 	ws.Route(ws.DELETE("/{provider}").
 		To(a.disconnectIdentity).
 		Param(ws.PathParameter("provider", "provider name")).
@@ -75,8 +121,18 @@ type connectedIdentitiesResponse struct {
 	Identities []extidentities.IdentitySummary `json:"identities"`
 }
 
+// identityProviderItem is a provider plus what the caller may do with it;
+// see resourceFlags. A provider is keyed by NAME, so that is the id the
+// permission names. "Usable" means the caller may connect an account through
+// it — the distinction a viewer needs, since seeing that an organization has
+// a Google provider is not the same as being allowed to authorize against it.
+type identityProviderItem struct {
+	extidentities.ProviderSummary
+	resourceFlags
+}
+
 type identityProvidersResponse struct {
-	Providers []extidentities.ProviderSummary `json:"providers"`
+	Providers []identityProviderItem `json:"providers"`
 }
 
 type connectPATRequest struct {
@@ -125,8 +181,16 @@ func (a *MainAPI) listIdentityProviders(req *restful.Request, resp *restful.Resp
 		relayIdentitiesErr(req, resp, err, "list identity providers")
 		return
 	}
-	logger.Info("identity providers listed", "count", len(providers))
-	requesthelper.WriteJSON(req, resp, http.StatusOK, identityProvidersResponse{Providers: providers})
+	effective := a.effectiveFor(req, logger, sessionAttr(req).UserID)
+	out := make([]identityProviderItem, 0, len(providers))
+	for _, provider := range providers {
+		out = append(out, identityProviderItem{
+			ProviderSummary: provider,
+			resourceFlags:   flagsFor(effective, rbac.ResourceProvider, provider.Name),
+		})
+	}
+	logger.Info("identity providers listed", "count", len(out))
+	requesthelper.WriteJSON(req, resp, http.StatusOK, identityProvidersResponse{Providers: out})
 }
 
 func (a *MainAPI) connectPATIdentity(req *restful.Request, resp *restful.Response) {
@@ -220,6 +284,14 @@ func (a *MainAPI) disconnectIdentity(req *restful.Request, resp *restful.Respons
 // relayIdentitiesErr maps identity-service client errors onto user-facing
 // replies: validation messages pass through as 400, everything else is 502.
 func relayIdentitiesErr(req *restful.Request, resp *restful.Response, err error, action string) {
+	var forbidden *requesthelper.ForbiddenError
+	if errors.As(err, &forbidden) {
+		// A downstream refusal, relayed as one. Flattening it into the 502
+		// below would tell a user their platform is broken when in fact they
+		// need a role.
+		requesthelper.WriteError(req, resp, http.StatusForbidden, forbidden.Message)
+		return
+	}
 	var badReq *requesthelper.BadRequestError
 	if errors.As(err, &badReq) {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, badReq.Message)
@@ -246,49 +318,12 @@ func relayIdentitiesErr(req *restful.Request, resp *restful.Response, err error,
 // Administration: registering the providers everyone else connects to
 // ---------------------------------------------------------------------------
 
-// registerAdminIdentityRoutes mounts provider administration on the admin
-// web service, so it inherits the session + ADMIN_EMAIL gate.
-//
-// Creating a provider is a platform-wide act — it decides what every user
-// can connect to, and for OAuth it stores this platform's client secret —
-// so it is deliberately not an ordinary-user capability. Reading the
-// provider list is (GET /identities/providers): users must see what they
-// can connect to.
-func (a *MainAPI) registerAdminIdentityRoutes(ws *restful.WebService) {
-	ws.Route(ws.POST("/identity-providers/oauth").
-		To(a.adminCreateOAuthProvider).
-		Consumes(restful.MIME_JSON).
-		Reads(extidentities.RegisterOAuthProviderRequest{}).
-		Doc("Register an OAuth identity provider (admin only). Give discovery_url to fill the endpoints from the provider's well-known document, or state authorize_url and token_url explicitly").
-		Returns(http.StatusCreated, "Registered", extidentities.ProviderSummary{}).
-		Returns(http.StatusBadRequest, "Invalid request, or the provider is unreachable", errorResponse{}).
-		Returns(http.StatusConflict, "A provider with that name already exists", errorResponse{}).
-		Returns(http.StatusForbidden, "Not the administrator", errorResponse{}))
-
-	ws.Route(ws.POST("/identity-providers/pat").
-		To(a.adminCreatePATProvider).
-		Consumes(restful.MIME_JSON).
-		Reads(extidentities.RegisterPATProviderRequest{}).
-		Doc("Register a personal-access-token provider (admin only): a name is all it needs, since users paste their own tokens").
-		Returns(http.StatusCreated, "Registered", extidentities.ProviderSummary{}).
-		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
-		Returns(http.StatusConflict, "A provider with that name already exists", errorResponse{}).
-		Returns(http.StatusForbidden, "Not the administrator", errorResponse{}))
-
-	ws.Route(ws.DELETE("/identity-providers/{name}").
-		To(a.adminDeleteProvider).
-		Param(ws.PathParameter("name", "provider name")).
-		Param(ws.QueryParameter("force", "also delete every user identity that references it").DataType("boolean")).
-		Doc("Delete an identity provider (admin only); refused while stored identities still reference it unless force=true, which deletes those users' stored credentials too").
-		Returns(http.StatusNoContent, "Deleted", nil).
-		Returns(http.StatusNotFound, "No such provider", errorResponse{}).
-		Returns(http.StatusConflict, "Identities still reference this provider; pass force=true", errorResponse{}).
-		Returns(http.StatusForbidden, "Not the administrator", errorResponse{}))
-}
-
-func (a *MainAPI) adminCreateOAuthProvider(req *restful.Request, resp *restful.Response) {
-	logger := requesthelper.Logger(req, a.logger).WithFields("admin_id", sessionAttr(req).UserID)
-	logger.Info("admin create oauth provider requested")
+// createOAuthProvider registers an OAuth provider in the caller's
+// organization. Authorization is the identities service's to decide; this
+// handler only carries the caller's identity to it.
+func (a *MainAPI) createOAuthProvider(req *restful.Request, resp *restful.Response) {
+	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sessionAttr(req).UserID)
+	logger.Info("create oauth provider requested")
 
 	var body extidentities.RegisterOAuthProviderRequest
 	dec := json.NewDecoder(req.Request.Body)
@@ -315,9 +350,11 @@ func (a *MainAPI) adminCreateOAuthProvider(req *restful.Request, resp *restful.R
 	requesthelper.WriteJSON(req, resp, http.StatusCreated, created)
 }
 
-func (a *MainAPI) adminCreatePATProvider(req *restful.Request, resp *restful.Response) {
-	logger := requesthelper.Logger(req, a.logger).WithFields("admin_id", sessionAttr(req).UserID)
-	logger.Info("admin create pat provider requested")
+// createPATProvider registers a personal-access-token provider in the
+// caller's organization.
+func (a *MainAPI) createPATProvider(req *restful.Request, resp *restful.Response) {
+	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sessionAttr(req).UserID)
+	logger.Info("create pat provider requested")
 
 	var body extidentities.RegisterPATProviderRequest
 	dec := json.NewDecoder(req.Request.Body)
@@ -340,11 +377,14 @@ func (a *MainAPI) adminCreatePATProvider(req *restful.Request, resp *restful.Res
 	requesthelper.WriteJSON(req, resp, http.StatusCreated, created)
 }
 
-func (a *MainAPI) adminDeleteProvider(req *restful.Request, resp *restful.Response) {
+// deleteIdentityProvider removes one of the caller's organization's
+// providers. Named for the resource rather than the path, to keep it clearly
+// apart from disconnectIdentity, which deletes the caller's own credential.
+func (a *MainAPI) deleteIdentityProvider(req *restful.Request, resp *restful.Response) {
 	name := req.PathParameter("name")
 	force := req.QueryParameter("force") == "true"
-	logger := requesthelper.Logger(req, a.logger).WithFields("admin_id", sessionAttr(req).UserID, "provider", name)
-	logger.Info("admin delete provider requested", "force", force)
+	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sessionAttr(req).UserID, "provider", name)
+	logger.Info("delete provider requested", "force", force)
 
 	found, err := a.identities.DeleteProvider(identityCtx(req).Request.Context(), name, force)
 	if err != nil {
@@ -528,7 +568,13 @@ func (a *MainAPI) wildcardToolNames(ctx context.Context, logger *logging.Logger,
 		return nil
 	}
 	out := make(map[string][]string, len(ids))
-	catalogue, err := a.toolRegistry.ListTools(ctx, ids)
+	// The servers were already resolved within one organization, so take it
+	// from them rather than resolving the caller's again.
+	organizationID := ""
+	if len(servers) > 0 {
+		organizationID = servers[0].OrganizationID
+	}
+	catalogue, err := a.toolRegistry.ListTools(ctx, organizationID, ids)
 	if err != nil {
 		logger.Warn("failed to list tools for the wildcard requirements", "servers", ids, "err", err)
 	}

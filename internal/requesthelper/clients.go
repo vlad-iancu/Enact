@@ -20,6 +20,14 @@ type BadRequestError struct{ Message string }
 
 func (e *BadRequestError) Error() string { return e.Message }
 
+// ForbiddenError is a callee's 403: the caller is known and is not permitted.
+// Kept distinct from BadRequestError and from a transport failure, because
+// the three call for different answers — fix your request, get a role, or
+// wait for the service to come back.
+type ForbiddenError struct{ Message string }
+
+func (e *ForbiddenError) Error() string { return e.Message }
+
 // PostMultipart builds a multipart/form-data body (one "file" part per
 // file) and POSTs it with the caller's identity, returning the callee's 202
 // response body verbatim. 404 maps to found=false; 400 to *BadRequestError.

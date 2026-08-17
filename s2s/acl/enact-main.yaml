@@ -76,6 +76,38 @@ rules:
 
   # Connected third-party accounts: browser-facing; the session decides
   # whose credentials are touched, never the request.
+  # Organizations and RBAC (browser surface; enact-rbac enforces owner-gating).
+  - route: "GET /organizations/me"
+    allow: [anonymous, "*"]
+  - route: "POST /organizations/requests"
+    allow: [anonymous, "*"]
+  - route: "GET /organizations/requests"
+    allow: [anonymous, "*"]
+  - route: "GET /organizations/{id}/members"
+    allow: [anonymous, "*"]
+  - route: "POST /organizations/{id}/members"
+    allow: [anonymous, "*"]
+  - route: "DELETE /organizations/{id}/members/{user}"
+    allow: [anonymous, "*"]
+  - route: "POST /organizations/{id}/users"
+    allow: [anonymous, "*"]
+  - route: "GET /organizations/{id}/roles"
+    allow: [anonymous, "*"]
+  - route: "POST /organizations/{id}/roles"
+    allow: [anonymous, "*"]
+  - route: "DELETE /organizations/{id}/roles/{name}"
+    allow: [anonymous, "*"]
+  - route: "POST /organizations/{id}/roles/{name}/assign"
+    allow: [anonymous, "*"]
+  - route: "POST /organizations/{id}/roles/{name}/unassign"
+    allow: [anonymous, "*"]
+  - route: "GET /admin/organization-requests"
+    allow: [anonymous, "*"]
+  - route: "POST /admin/organization-requests/{id}/approve"
+    allow: [anonymous, "*"]
+  - route: "POST /admin/organization-requests/{id}/reject"
+    allow: [anonymous, "*"]
+
   - route: "GET /identities"
     allow: [anonymous, "*"]
   - route: "GET /identities/providers"

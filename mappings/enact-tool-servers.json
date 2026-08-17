@@ -16,6 +16,9 @@
         "id": {
           "type": "keyword"
         },
+        "organization_id": {
+          "type": "keyword"
+        },
         "url": {
           "type": "keyword"
         },

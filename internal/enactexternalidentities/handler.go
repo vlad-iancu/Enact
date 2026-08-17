@@ -14,6 +14,7 @@ import (
 	"enact/internal/identity"
 	"enact/internal/identityevents"
 	"enact/internal/logging"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 )
 
@@ -24,8 +25,18 @@ type IdentitiesAPI struct {
 	flows *flowStore
 	// providerHTTP talks to third parties: traced, but never S2S-signed —
 	// they are not platform services.
-	providerHTTP  *http.Client
-	events        *identityevents.Publisher
+	providerHTTP *http.Client
+	events       *identityevents.Publisher
+	// enforcer gates PROVIDER management. The per-user identity routes are
+	// not gated by rules: an identity IS its user, and the only way to reach
+	// someone else's is the service-only user_id override, which the S2S ACL
+	// already restricts. The refresh sweep serves no caller and is likewise
+	// ungated by construction.
+	enforcer *rbac.Enforcer
+	// rbac records who owns a provider. The enforcer answers "may they?";
+	// this writes "they do", which is a different call and a different
+	// lifecycle — see registerOAuth and deleteProvider.
+	rbac          *rbac.Client
 	refreshWindow time.Duration
 	publicURL     string
 	logger        *logging.Logger
@@ -160,9 +171,32 @@ func callerUserID(req *restful.Request) string {
 	return identity.FromContext(req.Request.Context())
 }
 
-// resolveProvider loads a provider record and builds its handler.
-func (a *IdentitiesAPI) resolveProvider(req *restful.Request, name string) (extidentities.ProviderRecord, extidentities.Provider, bool, error) {
-	rec, found, err := a.repo.GetProvider(req.Request.Context(), name)
+// organizationOf resolves which organization a user's providers come from.
+// Provider names are unique only inside an organization, so every provider
+// lookup on an identity path needs the credential owner's — not the
+// caller's, which for a service-side call is not the same person.
+func (a *IdentitiesAPI) organizationOf(ctx context.Context, userID string) (string, error) {
+	effective, err := a.enforcer.Effective(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	return effective.OrganizationID, nil
+}
+
+// organizationForIdentity prefers the organization stamped on the record and
+// falls back to the owner's membership, so a credential written before the
+// field existed still resolves its provider.
+func (a *IdentitiesAPI) organizationForIdentity(ctx context.Context, record extidentities.Identity) (string, error) {
+	if record.OrganizationID != "" {
+		return record.OrganizationID, nil
+	}
+	return a.organizationOf(ctx, record.UserID)
+}
+
+// resolveProvider loads an organization's provider record and builds its
+// handler.
+func (a *IdentitiesAPI) resolveProvider(req *restful.Request, organizationID, name string) (extidentities.ProviderRecord, extidentities.Provider, bool, error) {
+	rec, found, err := a.repo.GetProvider(req.Request.Context(), organizationID, name)
 	if err != nil || !found {
 		return extidentities.ProviderRecord{}, nil, found, err
 	}
@@ -194,7 +228,13 @@ func (a *IdentitiesAPI) storeIdentity(req *restful.Request, resp *restful.Respon
 		"access", body.Access, "access_level", body.AccessLevel,
 		"credentials_present", body.Credentials != nil)
 
-	rec, provider, found, err := a.resolveProvider(req, body.Provider)
+	organizationID, err := a.organizationOf(req.Request.Context(), userID)
+	if err != nil {
+		logger.Warn("store: cannot resolve the user's organization", "user_id", userID, "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	rec, provider, found, err := a.resolveProvider(req, organizationID, body.Provider)
 	if err != nil {
 		logger.Error("failed to resolve provider", "provider", body.Provider, "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to resolve provider")
@@ -285,17 +325,21 @@ func (a *IdentitiesAPI) persistIdentity(req *restful.Request, logger *logging.Lo
 
 	now := time.Now().UTC()
 	record := extidentities.Identity{
-		ID:           extidentities.DocID(userID, rec.Name),
-		UserID:       userID,
-		Provider:     rec.Name,
-		ProviderType: rec.Type,
-		Access:       stored.Access,
-		AccessLevel:  accessLevel,
-		ExpiresAt:    stored.ExpiresAt,
-		Refreshable:  stored.Refreshable,
-		Status:       extidentities.StatusActive,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:     extidentities.DocID(userID, rec.Name),
+		UserID: userID,
+		// Taken from the provider record rather than looked up again: it is
+		// by definition the organization whose provider produced this
+		// credential.
+		OrganizationID: rec.OrganizationID,
+		Provider:       rec.Name,
+		ProviderType:   rec.Type,
+		Access:         stored.Access,
+		AccessLevel:    accessLevel,
+		ExpiresAt:      stored.ExpiresAt,
+		Refreshable:    stored.Refreshable,
+		Status:         extidentities.StatusActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	if found {
 		record.CreatedAt = existing.CreatedAt
@@ -390,7 +434,13 @@ func (a *IdentitiesAPI) retrieveCredentials(req *restful.Request, resp *restful.
 		requesthelper.WriteError(req, resp, http.StatusConflict, "the stored credential was revoked by the provider; re-authorization is required")
 		return
 	}
-	rec, provider, providerFound, err := a.resolveProvider(req, record.Provider)
+	organizationID, err := a.organizationForIdentity(req.Request.Context(), record)
+	if err != nil {
+		logger.Warn("retrieve: cannot resolve the identity's organization", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	rec, provider, providerFound, err := a.resolveProvider(req, organizationID, record.Provider)
 	if err != nil {
 		logger.Error("failed to resolve provider for retrieval", "provider", record.Provider, "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to resolve provider")
@@ -467,14 +517,19 @@ func (a *IdentitiesAPI) revokeAll(req *restful.Request, logger *logging.Logger, 
 	var tally revocationTally
 	providers := map[string]extidentities.Provider{}
 	for _, record := range records {
-		provider, resolved := providers[record.Provider]
+		organizationID, err := a.organizationForIdentity(req.Request.Context(), record)
+		if err != nil {
+			logger.Warn("cannot revoke: organization unresolved", "provider", record.Provider, "err", err)
+		}
+		key := extidentities.ProviderDocID(organizationID, record.Provider)
+		provider, resolved := providers[key]
 		if !resolved {
-			_, p, found, err := a.resolveProvider(req, record.Provider)
+			_, p, found, err := a.resolveProvider(req, organizationID, record.Provider)
 			if err != nil || !found {
 				logger.Warn("cannot revoke: provider unavailable", "provider", record.Provider, "found", found, "err", err)
 			}
 			provider = p
-			providers[record.Provider] = p
+			providers[key] = p
 		}
 		if provider == nil {
 			tally.Failed++

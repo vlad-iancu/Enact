@@ -1,0 +1,24 @@
+{
+  "index_patterns": [
+    "enact-organizations"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Organizations: the isolation boundary. Every user belongs to exactly one, and a resource's organization is its owner's."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id": { "type": "keyword" },
+        "name": { "type": "text" },
+        "created_by": { "type": "keyword" },
+        "created_at": { "type": "date" },
+        "updated_at": { "type": "date" }
+      }
+    }
+  }
+}

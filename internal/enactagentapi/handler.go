@@ -17,6 +17,7 @@ import (
 	"enact/internal/logging"
 	"enact/internal/models"
 	"enact/internal/queue"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/tools"
 )
@@ -39,11 +40,19 @@ type AgentAPI struct {
 	kbs      *kb.Client
 	tools    *tools.Client
 	producer *queue.Producer
+	// rbac records who owns what; enforcer answers whether the caller may
+	// act. Both are needed: creating a resource grants ownership of it, and
+	// every other path checks.
+	rbac     *rbac.Client
+	enforcer *rbac.Enforcer
 	logger   *logging.Logger
 }
 
-func newAgentAPI(agentRepo *agents.Repository, rags *agents.RAGRepository, kbs *kb.Client, toolsClient *tools.Client, producer *queue.Producer, logger *logging.Logger) *AgentAPI {
-	return &AgentAPI{agents: agentRepo, rags: rags, kbs: kbs, tools: toolsClient, producer: producer, logger: logger}
+func newAgentAPI(agentRepo *agents.Repository, rags *agents.RAGRepository, kbs *kb.Client, toolsClient *tools.Client, producer *queue.Producer, rbacClient *rbac.Client, enforcer *rbac.Enforcer, logger *logging.Logger) *AgentAPI {
+	return &AgentAPI{
+		agents: agentRepo, rags: rags, kbs: kbs, tools: toolsClient, producer: producer,
+		rbac: rbacClient, enforcer: enforcer, logger: logger,
+	}
 }
 
 type agentRequest struct {
@@ -117,6 +126,18 @@ type deleteRAGDocumentResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+// organization resolves the caller's organization for a scoped lookup,
+// writing the refusal itself when they have none. Every read passes through
+// it, so no path can accidentally fetch across the boundary.
+func (a *AgentAPI) organization(req *restful.Request, resp *restful.Response, notFound string) (string, bool) {
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		rbac.WriteDenied(req, resp, err, notFound)
+		return "", false
+	}
+	return organizationID, true
 }
 
 func (a *AgentAPI) WebService() *restful.WebService {
@@ -255,6 +276,11 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 	userID := identity.FromContext(req.Request.Context())
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", userID)
 	logger.Info("create agent requested")
+	if err := a.enforcer.Require(req.Request.Context(), rbac.Permission(rbac.ResourceAgent, rbac.ActionCreate, "*")); err != nil {
+		logger.Warn("create agent denied", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
 	body, ok := decode(req, resp, logger)
 	if !ok {
 		return
@@ -265,10 +291,15 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 		return
 	}
 	logger.Info("agent validated")
+	organizationID, ok := a.organization(req, resp, "agent not found")
+	if !ok {
+		return
+	}
 	now := time.Now().UTC()
 	agent := agents.Agent{
 		ID:               uuid.NewString(),
 		UserID:           userID,
+		OrganizationID:   organizationID,
 		Name:             strings.TrimSpace(body.Name),
 		Model:            body.Model,
 		SystemPrompt:     body.SystemPrompt,
@@ -282,6 +313,22 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 		writeError(req, resp, http.StatusInternalServerError, "failed to create agent")
 		return
 	}
+	// The creator owns it. Recorded before replying, so a client that reads
+	// the agent back immediately can: a grant landing after the response
+	// would be a race the caller loses.
+	if err := a.rbac.Grant(req.Request.Context(), rbac.GrantRequest{
+		UserID:     userID,
+		Resource:   rbac.ResourceAgent,
+		ResourceID: agent.ID,
+	}); err != nil {
+		logger.Error("failed to record ownership", "agent_id", agent.ID, "err", err)
+		writeError(req, resp, http.StatusInternalServerError, "failed to record ownership of the agent")
+		return
+	}
+	// The caller's cached rules predate this grant; without dropping them
+	// they would be refused the agent they just created until the cache TTL
+	// expired.
+	a.enforcer.Forget(userID)
 	logger.Info("agent created", "agent_id", agent.ID, "name", agent.Name, "model", agent.Model, "knowledge_base_ids", agent.KnowledgeBaseIDs)
 	requesthelper.WriteJSON(req, resp, http.StatusCreated, toAgentResponse(agent))
 }
@@ -290,17 +337,35 @@ func (a *AgentAPI) list(req *restful.Request, resp *restful.Response) {
 	userID := identity.FromContext(req.Request.Context())
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", userID)
 	logger.Info("list agents requested")
-	records, err := a.agents.List(req.Request.Context(), userID)
+	// Candidates are the organization's; the caller's rules decide which of
+	// them they may see. A user with no roles still gets exactly their own,
+	// through the hidden ownership role rather than a hard-coded owner
+	// filter.
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	effective, err := a.enforcer.CallerEffective(req.Request.Context())
+	if err != nil {
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	records, err := a.agents.List(req.Request.Context(), organizationID)
 	if err != nil {
 		logger.Error("failed to list agents", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to list agents")
 		return
 	}
-	logger.Info("agents listed", "count", len(records))
 	out := make([]agentResponse, 0, len(records))
 	for _, ag := range records {
+		if !effective.Allows(rbac.Permission(rbac.ResourceAgent, rbac.ActionView, ag.ID)) {
+			continue
+		}
 		out = append(out, toAgentResponse(ag))
 	}
+	logger.Info("agents listed", "candidates", len(records), "visible", len(out),
+		"organization_id", organizationID)
 	requesthelper.WriteJSON(req, resp, http.StatusOK, listAgentsResponse{Agents: out})
 }
 
@@ -308,7 +373,16 @@ func (a *AgentAPI) get(req *restful.Request, resp *restful.Response) {
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id)
 	logger.Info("get agent requested")
-	agent, found, err := a.agents.Get(req.Request.Context(), id)
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionView, id); err != nil {
+		logger.Warn("get agent denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "agent not found")
+		return
+	}
+	organizationID, ok := a.organization(req, resp, "agent not found")
+	if !ok {
+		return
+	}
+	agent, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to get agent", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to get agent")
@@ -327,7 +401,16 @@ func (a *AgentAPI) update(req *restful.Request, resp *restful.Response) {
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id)
 	logger.Info("update agent requested")
-	existing, found, err := a.agents.Get(req.Request.Context(), id)
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionEdit, id); err != nil {
+		logger.Warn("update agent denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "agent not found")
+		return
+	}
+	organizationID, ok := a.organization(req, resp, "agent not found")
+	if !ok {
+		return
+	}
+	existing, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up agent for update", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to update agent")
@@ -405,7 +488,16 @@ func (a *AgentAPI) delete(req *restful.Request, resp *restful.Response) {
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id)
 	logger.Info("delete agent requested")
-	_, found, err := a.agents.Get(req.Request.Context(), id)
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionDelete, id); err != nil {
+		logger.Warn("delete agent denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "agent not found")
+		return
+	}
+	organizationID, ok := a.organization(req, resp, "agent not found")
+	if !ok {
+		return
+	}
+	_, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up agent for deletion", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to delete agent")
@@ -438,8 +530,18 @@ func (a *AgentAPI) uploadRAGDocument(req *restful.Request, resp *restful.Respons
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id)
 	logger.Info("rag upload requested")
+	// A RAG document belongs to its agent, so editing it is editing the agent.
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionEdit, id); err != nil {
+		logger.Warn("rag upload denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "agent not found")
+		return
+	}
 
-	agent, found, err := a.agents.Get(req.Request.Context(), id)
+	organizationID, ok := a.organization(req, resp, "agent not found")
+	if !ok {
+		return
+	}
+	agent, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up agent for rag upload", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to look up agent")
@@ -499,8 +601,17 @@ func (a *AgentAPI) listRAGDocuments(req *restful.Request, resp *restful.Response
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id)
 	logger.Info("rag document listing requested")
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionView, id); err != nil {
+		logger.Warn("rag listing denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "agent not found")
+		return
+	}
 
-	agent, found, err := a.agents.Get(req.Request.Context(), id)
+	organizationID, ok := a.organization(req, resp, "agent not found")
+	if !ok {
+		return
+	}
+	agent, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up agent for rag listing", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to look up agent")
@@ -534,8 +645,17 @@ func (a *AgentAPI) deleteRAGDocument(req *restful.Request, resp *restful.Respons
 	docID := req.PathParameter("docId")
 	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id, "document_id", docID)
 	logger.Info("rag document deletion requested")
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionEdit, id); err != nil {
+		logger.Warn("rag deletion denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "agent not found")
+		return
+	}
 
-	agent, found, err := a.agents.Get(req.Request.Context(), id)
+	organizationID, ok := a.organization(req, resp, "agent not found")
+	if !ok {
+		return
+	}
+	agent, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up agent for rag deletion", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to look up agent")

@@ -23,6 +23,7 @@ SERVICES=(
   enact-tests
   enact-tool-registry
   enact-external-identities
+  enact-rbac
 )
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

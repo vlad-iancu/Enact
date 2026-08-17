@@ -16,6 +16,10 @@ type Env struct {
 	MainAPIURL      string
 	ToolRegistryURL string
 	IdentitiesURL   string
+	RBACURL         string
+	// OrganizationID is the suite's organization, resolved from the test
+	// user at the start of a run. Cases use it to place fixture accounts.
+	OrganizationID string
 
 	// MCPFixtureURL is the embedded MCP fixture server's endpoint AS THE
 	// REGISTRY REACHES IT (in compose, the tests container's hostname).

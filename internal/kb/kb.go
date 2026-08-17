@@ -26,8 +26,14 @@ type Config struct {
 // identifier used across APIs; Name is the user-facing friendly name, given
 // at creation and updatable.
 type KnowledgeBase struct {
-	ID        string    `json:"id"`
-	UserID    string    `json:"user_id"`
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+	// OrganizationID is the organization this knowledge base belongs to. Stored rather
+	// than inferred from the owner: every read compares it, and an owner
+	// bypasses permission checks, so this is the only thing keeping one
+	// organization out of another's data.
+	OrganizationID string `json:"organization_id"`
+
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -67,18 +73,34 @@ func (r *Repository) Create(ctx context.Context, kb KnowledgeBase) error {
 	return r.os.IndexDoc(ctx, r.index, kb.ID, body)
 }
 
-// Get fetches a knowledge base by id. The boolean reports existence.
-func (r *Repository) Get(ctx context.Context, id string) (KnowledgeBase, bool, error) {
+// Get fetches a knowledge base by id, scoped to an organization.
+//
+// One belonging to a different organization is reported as ABSENT rather
+// than refused: callers already render that as 404, and "not yours" must be
+// indistinguishable from "does not exist". Scoping here rather than in the
+// handlers matters because an organization owner passes every permission
+// check by construction — see agents.Repository.Get.
+func (r *Repository) Get(ctx context.Context, organizationID, id string) (KnowledgeBase, bool, error) {
 	var kb KnowledgeBase
 	found, err := r.os.GetSource(ctx, r.index, id, &kb)
-	return kb, found, err
+	if err != nil || !found {
+		return KnowledgeBase{}, found, err
+	}
+	if organizationID == "" || kb.OrganizationID != organizationID {
+		return KnowledgeBase{}, false, nil
+	}
+	return kb, true, nil
 }
 
-// List returns all knowledge bases owned by userID.
-func (r *Repository) List(ctx context.Context, userID string) ([]KnowledgeBase, error) {
+// List returns the knowledge bases owned by any of userIDs — the caller's
+// whole organization; see agents.Repository.List for why the filter widened.
+func (r *Repository) List(ctx context.Context, organizationID string) ([]KnowledgeBase, error) {
+	if organizationID == "" {
+		return nil, nil
+	}
 	body, err := json.Marshal(map[string]any{
 		"size":  1000,
-		"query": map[string]any{"term": map[string]any{"user_id": userID}},
+		"query": map[string]any{"term": map[string]any{"organization_id": organizationID}},
 		"sort":  []any{map[string]any{"created_at": map[string]any{"order": "desc"}}},
 	})
 	if err != nil {

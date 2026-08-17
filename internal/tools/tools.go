@@ -31,8 +31,14 @@ type Server struct {
 	Description   string `json:"description"`
 	// Owner is the user id of the creator; server management in enact-main
 	// is scoped to it.
-	Owner     string `json:"owner"`
-	ToolCount int    `json:"tool_count"`
+	Owner string `json:"owner"`
+	// OrganizationID is the organization this server belongs to. Stored rather
+	// than inferred from the owner: every read compares it, and an owner
+	// bypasses permission checks, so this is the only thing keeping one
+	// organization out of another's data.
+	OrganizationID string `json:"organization_id"`
+
+	ToolCount int `json:"tool_count"`
 
 	// ToolAccessRequirements declares, per tool, which third-party
 	// credentials the tool needs. Keyed by the MCP tool's own name (not the
@@ -178,7 +184,10 @@ func (s Server) Probe(phase string) ([]AccessRequirement, ToolAuthorization, boo
 
 // Tool is one cached tool definition, keyed by server id + tool name.
 type Tool struct {
-	ServerID string `json:"server_id"`
+	// OrganizationID follows the server: the cache is derived from it, and a
+	// cached tool must not be reachable from another organization.
+	OrganizationID string `json:"organization_id"`
+	ServerID       string `json:"server_id"`
 	mcp.Tool
 	RefreshedAt time.Time `json:"refreshed_at"`
 }
@@ -210,37 +219,55 @@ func (r *Repository) EnsureIndices(ctx context.Context) error {
 	return nil
 }
 
+// ServerDocID keys a server by organization and id. The separator is ":",
+// which server ids exclude, so the pair cannot collide.
+//
+// This is what makes the id namespace per-organization. Keyed by the bare id,
+// one organization registering "github-mcp-server" would take the name from
+// every other — and the refusal would disclose that a server they cannot see
+// exists.
+func ServerDocID(organizationID, id string) string {
+	return organizationID + ":" + id
+}
+
+// CachedToolDocID keys one cached tool. It carries the organization because
+// the cache follows its server.
+func CachedToolDocID(organizationID, serverID, tool string) string {
+	return ServerDocID(organizationID, serverID) + "::" + tool
+}
+
 // SaveServer persists a server record (create or full replace).
 func (r *Repository) SaveServer(ctx context.Context, s Server) error {
 	body, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
-	return r.os.IndexDoc(ctx, r.servers, s.ID, body)
+	return r.os.IndexDoc(ctx, r.servers, ServerDocID(s.OrganizationID, s.ID), body)
 }
 
 // GetServer fetches a server by id. The boolean reports existence.
-func (r *Repository) GetServer(ctx context.Context, id string) (Server, bool, error) {
+func (r *Repository) GetServer(ctx context.Context, organizationID, id string) (Server, bool, error) {
 	var s Server
-	found, err := r.os.GetSource(ctx, r.servers, id, &s)
+	found, err := r.os.GetSource(ctx, r.servers, ServerDocID(organizationID, id), &s)
 	return s, found, err
 }
 
 // DeleteServer removes a server record (its cached tools are deleted
 // separately via DeleteTools).
-func (r *Repository) DeleteServer(ctx context.Context, id string) error {
-	return r.os.DeleteDoc(ctx, r.servers, id)
+func (r *Repository) DeleteServer(ctx context.Context, organizationID, id string) error {
+	return r.os.DeleteDoc(ctx, r.servers, ServerDocID(organizationID, id))
 }
 
 // ListServers returns servers, newest first, optionally filtered by ids
-// and/or owner (empty means no filter).
-func (r *Repository) ListServers(ctx context.Context, ids []string, owner string) ([]Server, error) {
+// and/or organization. An empty organization means no filter — the refresh
+// sweep has no caller and must see every organization's servers.
+func (r *Repository) ListServers(ctx context.Context, ids []string, organizationID string) ([]Server, error) {
 	var filters []any
 	if len(ids) > 0 {
 		filters = append(filters, map[string]any{"terms": map[string]any{"id": ids}})
 	}
-	if owner != "" {
-		filters = append(filters, map[string]any{"term": map[string]any{"owner": owner}})
+	if organizationID != "" {
+		filters = append(filters, map[string]any{"term": map[string]any{"organization_id": organizationID}})
 	}
 	query := map[string]any{"match_all": map[string]any{}}
 	if len(filters) > 0 {
@@ -271,18 +298,18 @@ func (r *Repository) ListServers(ctx context.Context, ids []string, owner string
 
 // ReplaceTools swaps the cached tool set of one server: stale entries are
 // removed and the fresh definitions indexed, keyed "<server>::<tool>".
-func (r *Repository) ReplaceTools(ctx context.Context, serverID string, defs []mcp.Tool) error {
-	if err := r.DeleteTools(ctx, serverID); err != nil {
+func (r *Repository) ReplaceTools(ctx context.Context, organizationID, serverID string, defs []mcp.Tool) error {
+	if err := r.DeleteTools(ctx, organizationID, serverID); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
 	for _, def := range defs {
-		doc := Tool{ServerID: serverID, Tool: def, RefreshedAt: now}
+		doc := Tool{OrganizationID: organizationID, ServerID: serverID, Tool: def, RefreshedAt: now}
 		body, err := json.Marshal(doc)
 		if err != nil {
 			return err
 		}
-		if err := r.os.IndexDoc(ctx, r.cache, serverID+"::"+def.Name, body); err != nil {
+		if err := r.os.IndexDoc(ctx, r.cache, CachedToolDocID(organizationID, serverID, def.Name), body); err != nil {
 			return err
 		}
 	}
@@ -290,9 +317,12 @@ func (r *Repository) ReplaceTools(ctx context.Context, serverID string, defs []m
 }
 
 // DeleteTools removes every cached tool of one server.
-func (r *Repository) DeleteTools(ctx context.Context, serverID string) error {
+func (r *Repository) DeleteTools(ctx context.Context, organizationID, serverID string) error {
 	body, err := json.Marshal(map[string]any{
-		"query": map[string]any{"term": map[string]any{"server_id": serverID}},
+		"query": map[string]any{"bool": map[string]any{"filter": []any{
+			map[string]any{"term": map[string]any{"organization_id": organizationID}},
+			map[string]any{"term": map[string]any{"server_id": serverID}},
+		}}},
 	})
 	if err != nil {
 		return err
@@ -302,10 +332,17 @@ func (r *Repository) DeleteTools(ctx context.Context, serverID string) error {
 
 // ListTools returns cached tools, optionally filtered to the given server
 // ids, sorted by server then name.
-func (r *Repository) ListTools(ctx context.Context, serverIDs []string) ([]Tool, error) {
-	query := map[string]any{"match_all": map[string]any{}}
+func (r *Repository) ListTools(ctx context.Context, organizationID string, serverIDs []string) ([]Tool, error) {
+	var filters []any
+	if organizationID != "" {
+		filters = append(filters, map[string]any{"term": map[string]any{"organization_id": organizationID}})
+	}
 	if len(serverIDs) > 0 {
-		query = map[string]any{"terms": map[string]any{"server_id": serverIDs}}
+		filters = append(filters, map[string]any{"terms": map[string]any{"server_id": serverIDs}})
+	}
+	query := map[string]any{"match_all": map[string]any{}}
+	if len(filters) > 0 {
+		query = map[string]any{"bool": map[string]any{"filter": filters}}
 	}
 	body, err := json.Marshal(map[string]any{
 		"size":  1000,

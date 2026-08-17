@@ -22,6 +22,9 @@
         "provider": {
           "type": "keyword"
         },
+        "organization_id": {
+          "type": "keyword"
+        },
         "provider_type": {
           "type": "keyword"
         },

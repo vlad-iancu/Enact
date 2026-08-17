@@ -15,6 +15,7 @@ import (
 	"enact/internal/kb"
 	"enact/internal/logging"
 	"enact/internal/queue"
+	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 )
 
@@ -32,11 +33,13 @@ type KBAPI struct {
 	kbs       *kb.Repository
 	documents *kb.DocumentRepository
 	producer  *queue.Producer
+	rbac      *rbac.Client
+	enforcer  *rbac.Enforcer
 	logger    *logging.Logger
 }
 
-func newKBAPI(kbs *kb.Repository, documents *kb.DocumentRepository, producer *queue.Producer, logger *logging.Logger) *KBAPI {
-	return &KBAPI{kbs: kbs, documents: documents, producer: producer, logger: logger}
+func newKBAPI(kbs *kb.Repository, documents *kb.DocumentRepository, producer *queue.Producer, rbacClient *rbac.Client, enforcer *rbac.Enforcer, logger *logging.Logger) *KBAPI {
+	return &KBAPI{kbs: kbs, documents: documents, producer: producer, rbac: rbacClient, enforcer: enforcer, logger: logger}
 }
 
 // createKBRequest names the knowledge base being created.
@@ -116,6 +119,18 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+// organization resolves the caller's organization for a scoped lookup,
+// writing the refusal itself when they have none. Every read passes through
+// it, so no path can accidentally fetch across the boundary.
+func (a *KBAPI) organization(req *restful.Request, resp *restful.Response, notFound string) (string, bool) {
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		rbac.WriteDenied(req, resp, err, notFound)
+		return "", false
+	}
+	return organizationID, true
+}
+
 func (a *KBAPI) WebService() *restful.WebService {
 	ws := new(restful.WebService)
 	ws.Path("/v1/knowledge-bases").
@@ -191,6 +206,11 @@ func (a *KBAPI) create(req *restful.Request, resp *restful.Response) {
 	userID := identity.FromContext(req.Request.Context())
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", userID)
 	logger.Info("create knowledge base requested")
+	if err := a.enforcer.Require(req.Request.Context(), rbac.Permission(rbac.ResourceKB, rbac.ActionCreate, "*")); err != nil {
+		logger.Warn("create knowledge base denied", "err", err)
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
 
 	var body createKBRequest
 	dec := json.NewDecoder(req.Request.Body)
@@ -206,19 +226,38 @@ func (a *KBAPI) create(req *restful.Request, resp *restful.Response) {
 		return
 	}
 
+	organizationID, ok := a.organization(req, resp, "knowledge base not found")
+	if !ok {
+		return
+	}
 	now := time.Now().UTC()
 	record := kb.KnowledgeBase{
-		ID:        uuid.NewString(),
-		UserID:    userID,
-		Name:      strings.TrimSpace(body.Name),
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID,
+		UserID:         userID,
+		Name:           strings.TrimSpace(body.Name),
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	if err := a.kbs.Create(req.Request.Context(), record); err != nil {
 		logger.Error("failed to create knowledge base", "kb_id", record.ID, "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to create knowledge base")
 		return
 	}
+	// The creator owns it, recorded before replying so a client that reads
+	// the knowledge base back immediately can.
+	if err := a.rbac.Grant(req.Request.Context(), rbac.GrantRequest{
+		UserID:     userID,
+		Resource:   rbac.ResourceKB,
+		ResourceID: record.ID,
+	}); err != nil {
+		logger.Error("failed to record ownership", "kb_id", record.ID, "err", err)
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to record ownership of the knowledge base")
+		return
+	}
+	// Drop the caller's cached rules, which predate this grant — see
+	// rbac.Enforcer.Forget.
+	a.enforcer.Forget(userID)
 	logger.Info("knowledge base created", "kb_id", record.ID, "name", record.Name)
 	requesthelper.WriteJSON(req, resp, http.StatusCreated, toKBResponse(record))
 }
@@ -227,17 +266,33 @@ func (a *KBAPI) list(req *restful.Request, resp *restful.Response) {
 	userID := identity.FromContext(req.Request.Context())
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", userID)
 	logger.Info("list knowledge bases requested")
-	records, err := a.kbs.List(req.Request.Context(), userID)
+	// See enactagentapi list: candidates come from the organization, rules
+	// decide visibility.
+	organizationID, err := a.enforcer.Organization(req.Request.Context())
+	if err != nil {
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	effective, err := a.enforcer.CallerEffective(req.Request.Context())
+	if err != nil {
+		rbac.WriteDeniedForbidden(req, resp, err)
+		return
+	}
+	records, err := a.kbs.List(req.Request.Context(), organizationID)
 	if err != nil {
 		logger.Error("failed to list knowledge bases", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to list knowledge bases")
 		return
 	}
-	logger.Info("knowledge bases listed", "count", len(records))
 	out := make([]knowledgeBaseResponse, 0, len(records))
 	for _, record := range records {
+		if !effective.Allows(rbac.Permission(rbac.ResourceKB, rbac.ActionView, record.ID)) {
+			continue
+		}
 		out = append(out, toKBResponse(record))
 	}
+	logger.Info("knowledge bases listed", "candidates", len(records), "visible", len(out),
+		"organization_id", organizationID)
 	requesthelper.WriteJSON(req, resp, http.StatusOK, listKBResponse{KnowledgeBases: out})
 }
 
@@ -247,8 +302,17 @@ func (a *KBAPI) update(req *restful.Request, resp *restful.Response) {
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("kb_id", id)
 	logger.Info("update knowledge base requested")
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceKB, rbac.ActionEdit, id); err != nil {
+		logger.Warn("update knowledge base denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "knowledge base not found")
+		return
+	}
 
-	record, found, err := a.kbs.Get(req.Request.Context(), id)
+	organizationID, ok := a.organization(req, resp, "knowledge base not found")
+	if !ok {
+		return
+	}
+	record, found, err := a.kbs.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up knowledge base for update", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to update knowledge base")
@@ -293,7 +357,16 @@ func (a *KBAPI) get(req *restful.Request, resp *restful.Response) {
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("kb_id", id)
 	logger.Info("get knowledge base requested")
-	record, found, err := a.kbs.Get(req.Request.Context(), id)
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceKB, rbac.ActionView, id); err != nil {
+		logger.Warn("get knowledge base denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "knowledge base not found")
+		return
+	}
+	organizationID, ok := a.organization(req, resp, "knowledge base not found")
+	if !ok {
+		return
+	}
+	record, found, err := a.kbs.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to get knowledge base", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to get knowledge base")
@@ -330,8 +403,17 @@ func (a *KBAPI) listDocuments(req *restful.Request, resp *restful.Response) {
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("kb_id", id)
 	logger.Info("list knowledge base documents requested")
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceKB, rbac.ActionView, id); err != nil {
+		logger.Warn("list documents denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "knowledge base not found")
+		return
+	}
 
-	record, found, err := a.kbs.Get(req.Request.Context(), id)
+	organizationID, ok := a.organization(req, resp, "knowledge base not found")
+	if !ok {
+		return
+	}
+	record, found, err := a.kbs.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up knowledge base for document listing", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to look up knowledge base")
@@ -371,7 +453,16 @@ func (a *KBAPI) delete(req *restful.Request, resp *restful.Response) {
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("kb_id", id)
 	logger.Info("delete knowledge base requested")
-	_, found, err := a.kbs.Get(req.Request.Context(), id)
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceKB, rbac.ActionDelete, id); err != nil {
+		logger.Warn("delete knowledge base denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "knowledge base not found")
+		return
+	}
+	organizationID, ok := a.organization(req, resp, "knowledge base not found")
+	if !ok {
+		return
+	}
+	_, found, err := a.kbs.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up knowledge base for deletion", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to delete knowledge base")
@@ -403,8 +494,18 @@ func (a *KBAPI) uploadDocument(req *restful.Request, resp *restful.Response) {
 	id := req.PathParameter("id")
 	logger := requesthelper.Logger(req, a.logger).WithFields("kb_id", id)
 	logger.Info("document upload requested")
+	// A document belongs to its knowledge base, so adding one is editing it.
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceKB, rbac.ActionEdit, id); err != nil {
+		logger.Warn("document upload denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "knowledge base not found")
+		return
+	}
 
-	record, found, err := a.kbs.Get(req.Request.Context(), id)
+	organizationID, ok := a.organization(req, resp, "knowledge base not found")
+	if !ok {
+		return
+	}
+	record, found, err := a.kbs.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up knowledge base for upload", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to look up knowledge base")
@@ -466,8 +567,17 @@ func (a *KBAPI) deleteDocument(req *restful.Request, resp *restful.Response) {
 	docID := req.PathParameter("docId")
 	logger := requesthelper.Logger(req, a.logger).WithFields("kb_id", id, "document_id", docID)
 	logger.Info("document deletion requested")
+	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceKB, rbac.ActionEdit, id); err != nil {
+		logger.Warn("document deletion denied", "err", err)
+		rbac.WriteDenied(req, resp, err, "knowledge base not found")
+		return
+	}
 
-	record, found, err := a.kbs.Get(req.Request.Context(), id)
+	organizationID, ok := a.organization(req, resp, "knowledge base not found")
+	if !ok {
+		return
+	}
+	record, found, err := a.kbs.Get(req.Request.Context(), organizationID, id)
 	if err != nil {
 		logger.Error("failed to look up knowledge base for document deletion", "err", err)
 		writeError(req, resp, http.StatusInternalServerError, "failed to look up knowledge base")

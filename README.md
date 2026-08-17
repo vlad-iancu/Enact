@@ -24,6 +24,7 @@ and Apache Tika. Agents can be grounded in documents two ways, independently:
 | `enact-agent-management-api`    | CRUD for agents (`model`, `system_prompt`, `knowledge_base_ids`); upload **RAG documents** to an agent (`POST /v1/agents/{id}/rag/documents`). |
 | `enact-model-inference`         | `POST /v1/inference`. Accepts `agent_id`; resolves the agent's model, loads the KB context files whole, retrieves top-k chunks from the agent's RAG collection, and augments the system prompt. Agents with MCP `tools` run a Bedrock tool-use loop (max `MAX_TURNS`, default 10): tool calls execute through the registry's MCP proxy and stream as `toolCall` / `toolCallResult` SSE events. |
 | `enact-external-identities`     | Credentials the platform holds on a user's behalf at third parties (Google Workspace, GitHub, JIRA). Registers providers (`POST /v1/providers/oauth` with well-known discovery, `POST /v1/providers/pat`), owns the OAuth consent flow (`/v1/oauth/authorize` + `/v1/oauth/callback`), serves usable credentials to services, and refreshes tokens on a background sweep. Credentials are AES-256-GCM sealed at rest (ADR-0013). |
+| `enact-rbac`                    | Organizations, memberships, roles and the rules they grant. `GET /v1/effective` is the hot path — a user's organization and every rule they hold, which services cache and evaluate locally. Also organization requests and their approval, and `POST /v1/grants`, the ownership bookkeeping every service writes when it creates a resource. |
 | `enact-tool-registry`           | MCP servers on the platform: register (`POST /v1/servers/create`, health-checked), partial update, list, and a cached tool catalogue (`GET /v1/servers/tools`, refreshed every `REFRESH_AT`). `/v1/servers/{id}/mcp` and `/{id}/sse` are spec-compliant MCP proxies to the underlying server. |
 
 Every service also exposes `GET /healthz`, a home page at `/`, and Swagger UI
@@ -75,6 +76,15 @@ which is used to create the k-NN index mapping. Change both together.
 * `enact-kb-documents` — extracted full-text context documents of KBs.
 * `enact-agent-rag-chunks` — RAG chunks with `embedding` (`knn_vector`),
   scoped by `agent_id`.
+* `enact-organizations`, `enact-organization-requests`, `enact-memberships`,
+  `enact-roles` — the authorization model. A membership's document id is the
+  user id, so belonging to exactly one organization is structural rather than
+  enforced.
+
+Every resource carries `organization_id`, and identity providers and MCP
+servers are additionally **keyed** by it (`<organization>:<name>` and
+`<organization>:<id>`) because their names are chosen by people rather than
+generated — see [Organizations and permissions](#organizations-and-permissions).
 
 Each index's mapping is defined once as an OpenSearch composable **index
 template** under `mappings/` (e.g. `mappings/enact-agent-rag-chunks.json`).
@@ -301,6 +311,77 @@ free tier the cluster powers off when idle; the services then crash-loop
 (`restart: unless-stopped`) until it is powered back on — expected recovery
 behavior, not a bug.
 
+## Organizations and permissions
+
+Every user belongs to exactly one **organization**, every resource belongs to
+exactly one, and nothing crosses. A user who belongs to none can log in, see
+their profile and ask for an organization — nothing else. Organizations are
+created by an administrator approving a request; the requester becomes the
+first owner. See ADR-0019.
+
+**Permissions are four colon-separated segments**, matched segment by segment
+with `*` as a single-segment wildcard. There is no regex:
+
+```
+enact:<resource-type>:<action>:<resource-id>
+
+enact:kb:edit:9f2a…      one knowledge base
+enact:agent:view:*       every agent
+enact:kb:*               every action on every knowledge base
+```
+
+A rule may stop early and cover everything below it. A rule with *more*
+segments than the question never matches, so a grant on one resource is never
+inherited by a question about all of them.
+
+`resource-type` is one of `kb agent mcp-server provider identity conversation
+user role organization`; `action` is one of `view edit delete create use`.
+`use` is the one that is not record management: running an agent, retrieving
+from a knowledge base, calling a server's tools, connecting an account through
+a provider. A viewer typically holds `view` without `use`.
+
+**Roles hold rules and live inside an organization.** A user's own id doubles
+as a hidden role name: creating a resource grants `enact:<type>:*:<id>` under
+the role named after its creator, so ownership uses the same grammar as
+everything else. Hidden roles never appear in role listings, cannot be edited,
+and their names are reserved so no visible role can claim one.
+
+**Owners may do anything inside their own organization** and nothing outside
+it. The bypass exists because a new organization's first owner holds no rules
+at all, and because an owner edits the roles anyway — enforcing rules against
+them would add a step, not a safeguard.
+
+### What the browser sees
+
+```
+GET /organizations/me            organization, name, owner flag, roles, rules
+GET /organizations/me/roles      the caller's own roles, with what each grants
+POST /organizations/requests     ask for an organization
+GET  /organizations/{id}/members members, with display names and avatars
+POST /organizations/{id}/roles   define a role and its rules   (owners)
+POST /organizations/{id}/roles/{name}/assign|unassign          (owners)
+POST /organizations/{id}/users   create an account in the organization (owners)
+```
+
+Listings of agents, knowledge bases, MCP servers and providers return
+`editable`, `deletable` and `usable` per item, computed from the caller's
+rules with the same matcher the services enforce with — so a control the UI
+shows and the answer a later call gives cannot disagree. They are hints: the
+gate is the call itself.
+
+### Two deliberate asymmetries
+
+**Refusals read as 404, not 403,** whenever a resource is named: "not yours"
+must be indistinguishable from "does not exist". A caller with no organization
+at all gets 403 instead, because that says nothing about what exists and is
+the one case they can act on.
+
+**Conversations carry no rules.** They are private to one person, checked by
+comparing the stored user id, and no permission is consulted — so nobody can
+be granted access to someone else's, including an owner. A conversation holds
+its author's words and the verbatim output of every tool call made on their
+behalf, which is a different thing from an organization's shared resources.
+
 ## Per-user credentials for MCP tools
 
 A registered MCP server can declare, per tool, which third-party credentials
@@ -353,6 +434,17 @@ A tool may require several providers but **one access level per provider**.
 has connected this provider" with no coverage check — which is the whole
 contract for a credential that has nothing to say about scope, such as a
 plain API key.
+
+Providers belong to an **organization**, not to the platform. The document is
+keyed by `<organization>:<name>`, so two organizations may each register their
+own `github` with different clients and scopes, and neither can see the
+other's. Registration is on the ordinary user surface —
+`POST /identities/providers/oauth|pat`, `DELETE /identities/providers/{name}` —
+gated by the rule `enact:provider:create` rather than by being the platform
+administrator. An organization owner holds it by owner bypass and may delegate
+it through a role; registering records ownership of that provider, so the
+registrar can also delete it. (These endpoints used to live under `/admin`,
+which stopped making sense once a provider stopped being platform-wide.)
 
 Provider registration differs by type. A **PAT** provider needs nothing but a
 name: the user pastes a token whose scope the platform can neither see nor

@@ -114,3 +114,33 @@ what another relies on.
   its `application = mcp/<server-id>` lookup. Everything else in it — the
   caller's credentials rather than the owner's, injection in inference, the
   `X-Enact-Tool-Auth` envelope, pub/sub resumption — stands.
+
+---
+
+## Amendment (2026-08-16): providers are organization-scoped
+
+Organizations (ADR-0019) made a provider an organization's configuration
+rather than the platform's. The record is keyed `<organization>:<name>` and
+carries `organization_id`, so the same provider name may exist in several
+organizations and a lookup in one never finds another's.
+
+Two consequences follow from that, both recorded here because they change who
+may do what:
+
+- **Registration moved off the administrator surface.** It is now
+  `POST /identities/providers/oauth|pat` and
+  `DELETE /identities/providers/{name}`, gated by `enact:provider:create` and
+  `enact:provider:delete:<name>`. Keeping it administrator-only would have
+  left every organization but the administrator's unable to obtain a provider
+  at all. An organization owner passes by owner bypass and may delegate the
+  rule through a role.
+- **Registering records ownership**, exactly as creating an agent or a
+  knowledge base does, and deleting revokes it. Without this a delegated
+  registrar could create a provider they were not permitted to remove.
+
+A stored identity carries `organization_id` too. It is not an authorization
+input — access to a credential is still decided by the user it belongs to —
+but the refresh sweep runs with no caller and would otherwise need a
+membership lookup per credential to know which provider record to refresh
+against.
+

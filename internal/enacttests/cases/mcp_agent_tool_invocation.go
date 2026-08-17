@@ -73,7 +73,9 @@ func (c *mcpAgentToolInvocationCase) Run(t *utils.T) {
 		StopReason string `json:"stop_reason"`
 		Error      string `json:"error"`
 	}
-	status := t.DoJSON("enact-main", "enact-model-inference", http.MethodPost,
+	// As the session user who created the agent: running someone else's
+	// agent is refused, and rightly so.
+	status := t.DoJSONAs(c.session.UserID(), "enact-main", "enact-model-inference", http.MethodPost,
 		t.Env.InferenceAPIURL+"/v1/inference", strings.NewReader(reqBody), &out)
 	if status != http.StatusOK {
 		t.Fatalf("inference with tools: got HTTP %d (%s), want 200", status, out.Error)

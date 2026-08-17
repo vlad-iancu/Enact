@@ -237,6 +237,63 @@ func (c *Client) SearchWithAggregations(ctx context.Context, index string, body 
 	return SearchResult{Hits: parsed.Hits.Hits, Total: parsed.Hits.Total.Value, Aggregations: parsed.Aggregations}, nil
 }
 
+// UpdateDoc applies a scripted update to one document, atomically on the
+// shard. Use it instead of read-modify-write whenever two callers may touch
+// the same document at once: a get-then-index pair silently loses one of two
+// concurrent writes.
+//
+// The body is a full update request ("script" plus optionally "upsert").
+func (c *Client) UpdateDoc(ctx context.Context, index, id string, body []byte) error {
+	req := opensearchapi.UpdateRequest{
+		Index:      index,
+		DocumentID: id,
+		Body:       bytes.NewReader(body),
+		Refresh:    "true",
+		// Concurrent scripted updates to the same document conflict; retry
+		// rather than surfacing a 409 the caller can do nothing useful with.
+		RetryOnConflict: opensearchapi.IntPtr(5),
+	}
+	res, err := req.Do(ctx, c.api)
+	if err != nil {
+		return fmt.Errorf("opensearch: update doc %s/%s: %w", index, id, err)
+	}
+	defer res.Body.Close()
+	if res.IsError() {
+		return fmt.Errorf("opensearch: update doc %s/%s: %s", index, id, res.String())
+	}
+	_, _ = io.Copy(io.Discard, res.Body)
+	return nil
+}
+
+// UpdateByQuery applies a script to every document matching the query body
+// and reports how many were updated.
+func (c *Client) UpdateByQuery(ctx context.Context, index string, body []byte) (int, error) {
+	refresh := true
+	req := opensearchapi.UpdateByQueryRequest{
+		Index:   []string{index},
+		Body:    bytes.NewReader(body),
+		Refresh: &refresh,
+	}
+	res, err := req.Do(ctx, c.api)
+	if err != nil {
+		return 0, fmt.Errorf("opensearch: update by query %q: %w", index, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotFound {
+		return 0, nil
+	}
+	if res.IsError() {
+		return 0, fmt.Errorf("opensearch: update by query %q: %s", index, res.String())
+	}
+	var parsed struct {
+		Updated int `json:"updated"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
+		return 0, fmt.Errorf("opensearch: decode update by query response: %w", err)
+	}
+	return parsed.Updated, nil
+}
+
 // DeleteByQuery deletes every document in index matching the query body.
 func (c *Client) DeleteByQuery(ctx context.Context, index string, body []byte) error {
 	refresh := true

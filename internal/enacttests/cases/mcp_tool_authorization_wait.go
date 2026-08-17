@@ -132,9 +132,15 @@ func (c *mcpToolAuthorizationWaitCase) Run(t *utils.T) {
 		Content   string `json:"content"`
 		IsError   bool   `json:"is_error"`
 	}
+	type callEvent struct {
+		ToolUseID string `json:"tool_use_id"`
+	}
 
 	var (
 		mu           sync.Mutex
+		announced    = map[string]bool{}
+		outOfOrder   []string
+		openings     = map[string]int{}
 		sawWaiting   bool
 		connectedAt  time.Time
 		resolvedSeen bool
@@ -143,9 +149,19 @@ func (c *mcpToolAuthorizationWaitCase) Run(t *utils.T) {
 		connectOnce  sync.Once
 	)
 
+	started := time.Now()
 	body := fmt.Sprintf(`{"agent_id":%q,"messages":[{"role":"user","content":"Call the secret_number_authed tool and reply with only the number it returns."}]}`, c.agentID)
 	c.session.StreamSSE(t, "/inference", strings.NewReader(body), func(event, data string) bool {
 		switch event {
+		case "toolCall":
+			var ev callEvent
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				t.Errorf("tool call event is not valid JSON: %v", err)
+				return false
+			}
+			mu.Lock()
+			announced[ev.ToolUseID] = true
+			mu.Unlock()
 		case "toolCallWaitingAuthorization":
 			var ev waitEvent
 			if err := json.Unmarshal([]byte(data), &ev); err != nil {
@@ -156,6 +172,12 @@ func (c *mcpToolAuthorizationWaitCase) Run(t *utils.T) {
 				mu.Lock()
 				sawWaiting = true
 				waitToolUse = ev.ToolUseID
+				// A client reads this stream in arrival order, so the call
+				// must be announced before anything reports on it.
+				if !announced[ev.ToolUseID] {
+					outOfOrder = append(outOfOrder, ev.ToolUseID)
+				}
+				openings[ev.ToolUseID]++
 				mu.Unlock()
 
 				// The payload must tell the UI exactly what to connect.
@@ -205,6 +227,21 @@ func (c *mcpToolAuthorizationWaitCase) Run(t *utils.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
+	// The opening announcement is made once, by resolveTurn. Heartbeats
+	// follow every 30s, so a short run sees exactly one "waiting" — a second
+	// arriving immediately would be the duplicate this asserts against.
+	for id, n := range openings {
+		if n > 1 && time.Since(started) < 30*time.Second {
+			t.Errorf("%d waiting events for %s within %s; the opening announcement is duplicated",
+				n, id, time.Since(started).Round(time.Second))
+		}
+	}
+	if len(outOfOrder) > 0 {
+		t.Errorf("toolCallWaitingAuthorization arrived before toolCall for %v; a client reading in order would see a wait for a call it has not been told about", outOfOrder)
+	}
+	if !announced[waitToolUse] {
+		t.Errorf("no toolCall event for the call that waited (%q)", waitToolUse)
+	}
 	if !sawWaiting {
 		t.Fatalf("no toolCallWaitingAuthorization event arrived; the tool ran without waiting for a credential")
 	}

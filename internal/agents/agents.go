@@ -23,8 +23,14 @@ type Config struct {
 // Agent is a configured assistant: a user-facing friendly name, a model, a
 // system prompt, and the knowledge bases it retrieves from.
 type Agent struct {
-	ID               string   `json:"id"`
-	UserID           string   `json:"user_id"`
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+	// OrganizationID is the organization this agent belongs to. Stored rather
+	// than inferred from the owner: every read compares it, and an owner
+	// bypasses permission checks, so this is the only thing keeping one
+	// organization out of another's data.
+	OrganizationID string `json:"organization_id"`
+
 	Name             string   `json:"name"`
 	Model            string   `json:"model"`
 	SystemPrompt     string   `json:"system_prompt"`
@@ -70,18 +76,41 @@ func (r *Repository) Create(ctx context.Context, a Agent) error {
 	return r.os.IndexDoc(ctx, r.index, a.ID, body)
 }
 
-// Get fetches an agent by id. The boolean reports existence.
-func (r *Repository) Get(ctx context.Context, id string) (Agent, bool, error) {
+// Get fetches one agent by id, scoped to an organization.
+//
+// An agent belonging to a different organization is reported as ABSENT
+// rather than refused: callers already render that as 404, and "not yours"
+// must be indistinguishable from "does not exist".
+//
+// The organization is a parameter rather than something the caller checks
+// afterwards because an organization owner passes every permission check by
+// construction — so if this returned the record and left the comparison to
+// the handler, one forgotten comparison would expose another organization's
+// data. Here it cannot be forgotten.
+func (r *Repository) Get(ctx context.Context, organizationID, id string) (Agent, bool, error) {
 	var a Agent
 	found, err := r.os.GetSource(ctx, r.index, id, &a)
-	return a, found, err
+	if err != nil || !found {
+		return Agent{}, found, err
+	}
+	if organizationID == "" || a.OrganizationID != organizationID {
+		return Agent{}, false, nil
+	}
+	return a, true, nil
 }
 
-// List returns all agents owned by userID.
-func (r *Repository) List(ctx context.Context, userID string) ([]Agent, error) {
+// List returns the agents owned by any of userIDs — the caller's whole
+// organization, since a resource's organization is its owner's. The caller
+// then drops what their rules do not cover; ownership alone is no longer the
+// filter. An empty list matches nothing, which is the correct answer for a
+// user who belongs to no organization.
+func (r *Repository) List(ctx context.Context, organizationID string) ([]Agent, error) {
+	if organizationID == "" {
+		return nil, nil
+	}
 	body, err := json.Marshal(map[string]any{
 		"size":  1000,
-		"query": map[string]any{"term": map[string]any{"user_id": userID}},
+		"query": map[string]any{"term": map[string]any{"organization_id": organizationID}},
 		"sort":  []any{map[string]any{"created_at": map[string]any{"order": "desc"}}},
 	})
 	if err != nil {

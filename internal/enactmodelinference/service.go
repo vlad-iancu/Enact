@@ -20,6 +20,7 @@ import (
 	"enact/internal/kb"
 	"enact/internal/logging"
 	"enact/internal/opensearch"
+	"enact/internal/rbac"
 	"enact/internal/s2s"
 	"enact/internal/service"
 	"enact/internal/tools"
@@ -42,6 +43,7 @@ type Config struct {
 	KBAPI          kb.ClientConfig
 	ToolRegistry   tools.ClientConfig
 	Identities     extidentities.ClientConfig
+	RBAC           rbac.ClientConfig
 	IdentityEvents identityevents.Config
 	S2S            s2s.Config
 	EmbeddingModel string `env:"BEDROCK_EMBEDDING_MODEL, default=amazon.titan-embed-text-v2:0"`
@@ -111,7 +113,9 @@ func Build(cfg *Config) service.Builder {
 			"max_turns", cfg.MaxTurns,
 			"s2s_key_id", cfg.S2S.KeyID,
 		)
-		api := newInferenceAPI(client, agentClient, rags, kbClient, toolsClient, toolAuth, cfg.EmbeddingModel, cfg.MaxTurns, logger)
+		rbacClient := rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
+		api := newInferenceAPI(client, agentClient, rags, kbClient, toolsClient, toolAuth,
+			rbac.NewEnforcer(rbacClient, cfg.RBAC), cfg.EmbeddingModel, cfg.MaxTurns, logger)
 
 		// Credentials landing in the identity service wake tool calls parked
 		// on them. A subscription failure must not stop this service: the

@@ -1,0 +1,24 @@
+{
+  "index_patterns": [
+    "enact-memberships"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Which organization a user belongs to, and whether they own it. The document id is the user id, so 'exactly one organization per user' is structural rather than a rule to enforce."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "user_id": { "type": "keyword" },
+        "organization_id": { "type": "keyword" },
+        "owner": { "type": "boolean" },
+        "created_at": { "type": "date" },
+        "updated_at": { "type": "date" }
+      }
+    }
+  }
+}

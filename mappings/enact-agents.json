@@ -1,5 +1,7 @@
 {
-  "index_patterns": ["enact-agents"],
+  "index_patterns": [
+    "enact-agents"
+  ],
   "priority": 100,
   "_meta": {
     "description": "Agent records: model (friendly name), system prompt, knowledge base ids."
@@ -11,14 +13,34 @@
     },
     "mappings": {
       "properties": {
-        "id":                 { "type": "keyword" },
-        "user_id":            { "type": "keyword" },
-        "name":               { "type": "text" },
-        "model":              { "type": "keyword" },
-        "system_prompt":      { "type": "text", "index": false },
-        "knowledge_base_ids": { "type": "keyword" },
-        "created_at":         { "type": "date" },
-        "updated_at":         { "type": "date" }
+        "id": {
+          "type": "keyword"
+        },
+        "user_id": {
+          "type": "keyword"
+        },
+        "organization_id": {
+          "type": "keyword"
+        },
+        "name": {
+          "type": "text"
+        },
+        "model": {
+          "type": "keyword"
+        },
+        "system_prompt": {
+          "type": "text",
+          "index": false
+        },
+        "knowledge_base_ids": {
+          "type": "keyword"
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "updated_at": {
+          "type": "date"
+        }
       }
     }
   }
