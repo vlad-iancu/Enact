@@ -150,5 +150,5 @@ func (c *mcpGatedServerCase) TearDown(t *utils.T) {
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
 		t.Env.IdentitiesURL+"/v1/identities?provider="+gatedProviderName, nil, nil)
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-		t.Env.IdentitiesURL+"/v1/providers/"+gatedProviderName+"?force=true", nil, nil)
+		t.Env.IdentitiesURL+"/v1/providers/"+gatedProviderName, nil, nil)
 }

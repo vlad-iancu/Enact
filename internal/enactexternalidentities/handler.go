@@ -12,7 +12,6 @@ import (
 
 	"enact/internal/extidentities"
 	"enact/internal/identity"
-	"enact/internal/identityevents"
 	"enact/internal/logging"
 	"enact/internal/rbac"
 	"enact/internal/requesthelper"
@@ -26,7 +25,6 @@ type IdentitiesAPI struct {
 	// providerHTTP talks to third parties: traced, but never S2S-signed —
 	// they are not platform services.
 	providerHTTP *http.Client
-	events       *identityevents.Publisher
 	// enforcer gates PROVIDER management. The per-user identity routes are
 	// not gated by rules: an identity IS its user, and the only way to reach
 	// someone else's is the service-only user_id override, which the S2S ACL
@@ -352,25 +350,6 @@ func (a *IdentitiesAPI) persistIdentity(req *restful.Request, logger *logging.Lo
 		"access", record.Access, "access_level", record.AccessLevel,
 		"access_from_provider", stored.AccessFromProvider, "refreshable", record.Refreshable, "expires_at", record.ExpiresAt)
 
-	// Wake anything parked on this credential — a tool call waiting for the
-	// user to connect this very account. Fire and forget: a publish failure
-	// must never fail a store, and waiters re-check on a timer anyway.
-	// WithoutCancel because on the OAuth path this request's context dies
-	// with the browser redirect that is already in flight.
-	if a.events != nil {
-		pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-		if err := a.events.Publish(pubCtx, identityevents.Event{
-			Type:        identityevents.TypeIdentityStored,
-			UserID:      userID,
-			Provider:    rec.Name,
-			AccessLevel: record.AccessLevel,
-			Access:      record.Access,
-			At:          now,
-		}); err != nil {
-			logger.Warn("failed to publish identity event", "err", err)
-		}
-		cancel()
-	}
 	return record, 0, ""
 }
 

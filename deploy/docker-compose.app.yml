@@ -179,6 +179,7 @@ services:
       KB_API_URL: http://enact-kb-api:8002
       TOOL_REGISTRY_API_URL: http://enact-tool-registry:8007
       EXTERNAL_IDENTITIES_API_URL: http://enact-external-identities:8008
+      WORKFLOW_API_URL: http://enact-workflows:8011
       S2S_KEY_ID: enact-main
       S2S_JWKS_FILE: /s2s/jwks.yaml
       S2S_ACL_FILE: /s2s/acl/enact-main.yaml
@@ -284,6 +285,9 @@ services:
     environment:
       <<: *infra-env
       SERVICE_NAME: enact-tool-registry
+      # Built-in servers are registered under the portless alias
+      # "enact-mcp-servers"; this is what the registry resolves it to.
+      MCP_SERVERS_URL: http://enact-mcp-servers:8010
       RBAC_API_URL: http://enact-rbac:8009
       SERVICE_PORT: "8007"
       # Probing a credential-gated MCP server needs the owner's credentials.
@@ -308,14 +312,26 @@ services:
       S2S_ACL_FILE: /s2s/acl/enact-rbac.yaml
       S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-rbac.key
 
+  # Built-in MCP servers. No datastore, no credentials of its own: every
+  # request carries the caller's third-party token, which is the only
+  # authority a tool has.
+  enact-mcp-servers:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-mcp-servers:${ENACT_TAG:-latest}
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-mcp-servers
+      SERVICE_PORT: "8010"
+      S2S_KEY_ID: enact-mcp-servers
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-mcp-servers.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-mcp-servers.key
+
   enact-external-identities:
     <<: *common
     image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-external-identities:${ENACT_TAG:-latest}
     depends_on:
       opensearch:
-        condition: service_healthy
-      # Publishes the "credential connected" signal (see enact-model-inference).
-      redis:
         condition: service_healthy
     environment:
       <<: *infra-env
@@ -352,6 +368,55 @@ services:
       S2S_ACL_FILE: /s2s/acl/enact-tests.yaml
       S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-tests.key
       S2S_PRIVATE_KEYS_FILE: /s2s/private-keys.yaml
+
+  enact-workflows:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-workflows:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-workflows
+      SERVICE_PORT: "8011"
+      # Its own stream, separate from document indexing: different work, a
+      # different consumer, and very different durations.
+      REDIS_STREAM: enact-workflow-executions
+      REDIS_GROUP: workflow-runners
+      AGENT_API_URL: http://enact-agent-management-api:8001
+      RBAC_API_URL: http://enact-rbac:8009
+      S2S_KEY_ID: enact-workflows
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-workflows.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-workflows.key
+
+  enact-workflow-runner:
+    <<: *common
+    image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-workflow-runner:${ENACT_TAG:-latest}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *infra-env
+      SERVICE_NAME: enact-workflow-runner
+      SERVICE_PORT: "8012"
+      REDIS_STREAM: enact-workflow-executions
+      REDIS_GROUP: workflow-runners
+      # A run can take far longer than an indexing job, so a delivery must sit
+      # idle longer before another consumer may claim it — otherwise a slow
+      # but healthy run is executed twice.
+      REDIS_RECLAIM_MIN_IDLE: 15m
+      INFERENCE_API_URL: http://enact-model-inference:8004
+      WORKFLOW_CODE_TIMEOUT: 5s
+      WORKFLOW_STEP_TIMEOUT: 10m
+      S2S_KEY_ID: enact-workflow-runner
+      S2S_JWKS_FILE: /s2s/jwks.yaml
+      S2S_ACL_FILE: /s2s/acl/enact-workflow-runner.yaml
+      S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-workflow-runner.key
 
 volumes:
   opensearch-data:

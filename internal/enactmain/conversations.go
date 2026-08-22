@@ -61,7 +61,7 @@ func (a *MainAPI) conversationsWebService() *restful.WebService {
 	// refused with 406.
 	ws.Path("/conversations").Produces(restful.MIME_JSON, "text/event-stream")
 	ws.Filter(a.csrfOriginFilter)
-	ws.Filter(a.requireSession)
+	ws.Filter(a.requireCaller)
 
 	ws.Route(ws.GET("").
 		To(a.listConversations).
@@ -110,9 +110,15 @@ func (a *MainAPI) conversationsWebService() *restful.WebService {
 	return ws
 }
 
-// requireSession rejects unauthenticated requests; the session is attached
-// to the request context's identity so downstream service calls (inference)
-// carry the logged-in user, scoping agents and KBs to their owner.
+// requireSession rejects anything but a browser session; the session is
+// attached to the request context's identity so downstream service calls
+// (inference) carry the logged-in user, scoping agents and KBs to their owner.
+//
+// Most groups use requireCaller instead, which also admits an API key. This
+// one remains on the groups a key must NOT reach — organizations, identities
+// (which owns providers) and admin — so the exclusion is a property of how
+// the route is registered rather than a check someone has to remember to
+// write in a handler.
 func (a *MainAPI) requireSession(req *restful.Request, resp *restful.Response, chain *restful.FilterChain) {
 	sess, ok := a.session(req)
 	if !ok {

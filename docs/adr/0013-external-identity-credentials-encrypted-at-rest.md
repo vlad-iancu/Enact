@@ -128,10 +128,13 @@ fallback.
   today by keeping every read route service-only in the ACL and having
   enact-main scope reads to the session; this is the natural first place to
   require a real caller assertion if the platform ever grows one.
-- **Provider deletion** would strand identities whose envelope no handler
-  could parse, so it is refused while any identity references the provider;
-  `force=true` deletes those identities along with it rather than leaving
-  unopenable secrets behind. Should an orphan exist anyway, retrieval
-  answers **424** naming the missing provider — deliberately not 409, which
-  in this API means "the user must re-authorize" and would park a tool call
-  waiting for a provider nobody can connect to.
+- **Provider deletion takes its identities with it**, revoking each at the
+  provider first. An identity whose provider is gone is unopenable — the
+  record is what parses the envelope — and unrevokable, because revocation
+  needs that same record's endpoint and client secret. Refusing the delete
+  while identities existed (the earlier design, with a `force=true` escape)
+  only moved the cleanup to whoever deleted them by hand, and a half-done
+  cleanup left exactly the live grants this is meant to prevent. Should an
+  orphan exist anyway, retrieval answers **424** naming the missing provider
+  — deliberately not 409, which in this API means "the user must
+  re-authorize".

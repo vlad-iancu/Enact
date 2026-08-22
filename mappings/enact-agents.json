@@ -4,7 +4,7 @@
   ],
   "priority": 100,
   "_meta": {
-    "description": "Agent records: model (friendly name), system prompt, knowledge base ids."
+    "description": "Agent records: model (friendly name), system prompt, knowledge base ids, MCP server ids, and an optional structured-output JSON Schema."
   },
   "template": {
     "settings": {
@@ -34,6 +34,13 @@
         },
         "knowledge_base_ids": {
           "type": "keyword"
+        },
+        "tools": {
+          "type": "keyword"
+        },
+        "output_schema": {
+          "type": "object",
+          "enabled": false
         },
         "created_at": {
           "type": "date"

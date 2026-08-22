@@ -6,6 +6,7 @@ package users
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -40,8 +41,42 @@ type User struct {
 	VerificationTokenHash string `json:"verification_token_hash,omitempty"`
 	// VerificationExpiresAt bounds the pending token's validity.
 	VerificationExpiresAt time.Time `json:"verification_expires_at"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	// APIKeys are the account's programmatic credentials. Each one
+	// authenticates as this user, so the set is part of the account rather
+	// than a domain of its own.
+	APIKeys   []APIKey  `json:"api_keys,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// APIKey is one programmatic credential belonging to a user.
+//
+// The key itself is NOT stored — only its SHA-256, exactly as with
+// PasswordHash and VerificationTokenHash above. A key is only ever verified,
+// never replayed to anyone, so there is nothing to gain from being able to
+// read it back and a great deal to lose: a storage leak would otherwise hand
+// over working credentials for every account.
+//
+// That choice is also what makes the lookup possible. Authentication has to
+// find the user FROM the key, and a hash is a value that can be matched;
+// an encrypted key could not be, since sealing the same input twice produces
+// different bytes.
+type APIKey struct {
+	// ID names the key for revocation. The hash cannot serve this purpose,
+	// because listing keys must not expose anything that could authenticate.
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// KeyHash is the SHA-256 (hex) of the presented key.
+	KeyHash string `json:"key_hash"`
+	// Prefix is the key's leading characters, kept so a person can tell which
+	// of their keys a row refers to. Far too short to be guessable back into
+	// the key.
+	Prefix    string    `json:"prefix"`
+	CreatedAt time.Time `json:"created_at"`
+	// LastUsedAt is written opportunistically, not on every request — see the
+	// throttle in enact-main. It answers "is this key still in use?" before a
+	// revocation, which does not need to be to-the-second.
+	LastUsedAt time.Time `json:"last_used_at,omitempty"`
 }
 
 // Repository persists users in OpenSearch. The document id is the
@@ -141,6 +176,103 @@ func (r *Repository) ByIDs(ctx context.Context, ids []string) (map[string]User, 
 		out[u.ID] = u
 	}
 	return out, nil
+}
+
+// ByAPIKeyHash finds the account holding an API key with the given hash, and
+// the key entry itself. The boolean reports whether one was found.
+//
+// A search rather than a get: documents are keyed by email, and
+// authentication starts from the key. Hashes are 256-bit values, so at most
+// one document can match — but the specific entry is still selected in Go,
+// because a match tells us which user, not which of their keys.
+func (r *Repository) ByAPIKeyHash(ctx context.Context, keyHash string) (User, APIKey, bool, error) {
+	if keyHash == "" {
+		return User{}, APIKey{}, false, nil
+	}
+	body, err := json.Marshal(map[string]any{
+		"size":  1,
+		"query": map[string]any{"term": map[string]any{"api_keys.key_hash": keyHash}},
+	})
+	if err != nil {
+		return User{}, APIKey{}, false, fmt.Errorf("users: marshal api key query: %w", err)
+	}
+	hits, err := r.os.Search(ctx, r.index, body)
+	if err != nil {
+		return User{}, APIKey{}, false, err
+	}
+	if len(hits) == 0 {
+		return User{}, APIKey{}, false, nil
+	}
+	var u User
+	if err := json.Unmarshal(hits[0].Source, &u); err != nil {
+		return User{}, APIKey{}, false, fmt.Errorf("users: decode %s: %w", hits[0].ID, err)
+	}
+	for _, k := range u.APIKeys {
+		// Constant-time: the hash of a presented key is attacker-supplied, and
+		// this is the comparison that decides whether they are someone.
+		if subtle.ConstantTimeCompare([]byte(k.KeyHash), []byte(keyHash)) == 1 {
+			return u, k, true, nil
+		}
+	}
+	// The document matched but no entry did — the index is ahead of or behind
+	// the source. Refusing is the only safe answer.
+	return User{}, APIKey{}, false, nil
+}
+
+// AddAPIKey appends a key to an account, atomically.
+//
+// A read-modify-write through Save would drop a key created concurrently —
+// the same lost-update bug fixed in the RBAC role repository. The script
+// touches only the array, so two simultaneous creations both survive.
+func (r *Repository) AddAPIKey(ctx context.Context, email string, key APIKey) error {
+	entry := map[string]any{
+		"id": key.ID, "name": key.Name, "key_hash": key.KeyHash,
+		"prefix": key.Prefix, "created_at": key.CreatedAt,
+	}
+	return r.updateAPIKeys(ctx, email, `
+		if (ctx._source.api_keys == null) { ctx._source.api_keys = []; }
+		ctx._source.api_keys.add(params.entry);`,
+		map[string]any{"entry": entry, "now": time.Now().UTC()})
+}
+
+// RemoveAPIKey deletes a key by id. Removing an id the account does not have
+// is a no-op, so a repeated revoke is not an error.
+func (r *Repository) RemoveAPIKey(ctx context.Context, email, keyID string) error {
+	return r.updateAPIKeys(ctx, email, `
+		if (ctx._source.api_keys != null) {
+			ctx._source.api_keys.removeIf(k -> k.id == params.key_id);
+		}`,
+		map[string]any{"key_id": keyID, "now": time.Now().UTC()})
+}
+
+// TouchAPIKey records that a key was used. Callers throttle this — it is a
+// write, and an unthrottled one would turn every authenticated request into
+// an index operation.
+func (r *Repository) TouchAPIKey(ctx context.Context, email, keyID string, at time.Time) error {
+	return r.updateAPIKeys(ctx, email, `
+		if (ctx._source.api_keys != null) {
+			for (k in ctx._source.api_keys) {
+				if (k.id == params.key_id) { k.last_used_at = params.at; }
+			}
+		}`,
+		map[string]any{"key_id": keyID, "at": at.UTC(), "now": time.Now().UTC()})
+}
+
+// updateAPIKeys runs a scripted update against one account's key array.
+// updated_at is stamped by every caller, so an account's audit trail reflects
+// key changes as much as profile edits.
+func (r *Repository) updateAPIKeys(ctx context.Context, email, source string, params map[string]any) error {
+	body, err := json.Marshal(map[string]any{
+		"script": map[string]any{
+			"lang":   "painless",
+			"source": source + "\nctx._source.updated_at = params.now;",
+			"params": params,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("users: marshal api key update: %w", err)
+	}
+	return r.os.UpdateDoc(ctx, r.index, NormalizeEmail(email), body)
 }
 
 // Save persists a user record keyed by its normalized email, overwriting

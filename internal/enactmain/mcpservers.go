@@ -9,6 +9,7 @@ import (
 
 	restful "github.com/emicklei/go-restful/v3"
 
+	"enact/internal/builtinmcp"
 	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/tools"
@@ -21,7 +22,7 @@ func (a *MainAPI) mcpServersWebService() *restful.WebService {
 	ws := new(restful.WebService)
 	ws.Path("/mcp-servers").Produces(restful.MIME_JSON)
 	ws.Filter(a.csrfOriginFilter)
-	ws.Filter(a.requireSession)
+	ws.Filter(a.requireCaller)
 
 	ws.Route(ws.POST("").
 		To(a.createMCPServer).
@@ -30,6 +31,15 @@ func (a *MainAPI) mcpServersWebService() *restful.WebService {
 		Doc("Register an MCP server owned by the logged-in user; the registry health-checks it and caches its tools").
 		Returns(http.StatusCreated, "Registered", tools.Server{}).
 		Returns(http.StatusBadRequest, "Invalid request or unreachable server", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
+	// Registered before GET "" so the literal segment is matched on its own
+	// terms rather than competing with the listing.
+	ws.Route(ws.GET("/built-in").
+		To(a.listBuiltInMCPServers).
+		Doc("The MCP servers the platform hosts itself, with the URL to register them at — "+
+			"so nobody has to know or type an internal address").
+		Returns(http.StatusOK, "OK", builtInServersResponse{}).
 		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
 
 	ws.Route(ws.GET("").
@@ -107,6 +117,37 @@ func (a *MainAPI) createMCPServer(req *restful.Request, resp *restful.Response) 
 	requesthelper.WriteJSON(req, resp, http.StatusCreated, created)
 }
 
+// builtInServer is a catalogue entry with its address resolved.
+type builtInServer struct {
+	builtinmcp.Server
+	// URL is what to register: an internal alias with no port, which the
+	// tool registry resolves to the real address when it dials. Fixed, so
+	// this service needs no configuration and cannot publish something the
+	// registry would fail to resolve.
+	URL string `json:"url"`
+}
+
+type builtInServersResponse struct {
+	Servers []builtInServer `json:"servers"`
+}
+
+// listBuiltInMCPServers publishes the platform's own MCP servers.
+//
+// It exists so registering one is a choice from a list rather than typing
+// "http://enact-mcp-servers:8010/mcp-servers/google-workspace/mcp" — an
+// internal hostname that is a deployment detail, differs between
+// environments, and which a user has no way to know.
+func (a *MainAPI) listBuiltInMCPServers(req *restful.Request, resp *restful.Response) {
+	logger := requesthelper.Logger(req, a.logger)
+	catalogue := builtinmcp.Servers()
+	out := make([]builtInServer, 0, len(catalogue))
+	for _, server := range catalogue {
+		out = append(out, builtInServer{Server: server, URL: server.URL(builtinmcp.AliasURL)})
+	}
+	logger.Info("built-in mcp servers listed", "count", len(out))
+	requesthelper.WriteJSON(req, resp, http.StatusOK, builtInServersResponse{Servers: out})
+}
+
 func (a *MainAPI) listMCPServers(req *restful.Request, resp *restful.Response) {
 	sess := sessionAttr(req)
 	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID)
@@ -168,7 +209,7 @@ func (a *MainAPI) listMCPTools(req *restful.Request, resp *restful.Response) {
 func (a *MainAPI) ownedMCPServer(req *restful.Request, resp *restful.Response, id string) (tools.Server, bool) {
 	sess := sessionAttr(req)
 	logger := requesthelper.Logger(req, a.logger)
-	server, found, err := a.toolRegistry.Get(req.Request.Context(), id)
+	server, found, err := a.toolRegistry.Get(req.Request.Context(), sess.UserID, id)
 	if err != nil {
 		logger.Error("failed to load mcp server", "id", id, "err", err)
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to load MCP server")

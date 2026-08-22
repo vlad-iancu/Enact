@@ -277,5 +277,5 @@ func (c *mcpToolCredentialInjectionCase) TearDown(t *utils.T) {
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
 		t.Env.IdentitiesURL+"/v1/identities?provider="+credProviderName, nil, nil)
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-		t.Env.IdentitiesURL+"/v1/providers/"+credProviderName+"?force=true", nil, nil)
+		t.Env.IdentitiesURL+"/v1/providers/"+credProviderName, nil, nil)
 }

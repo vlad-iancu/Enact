@@ -13,18 +13,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PID_DIR="$ROOT_DIR/dist/run"
 
-SERVICES=(
-  enact-agent-management-api
-  enact-kb-api
-  enact-kb-document-indexer
-  enact-main
-  enact-model-inference
-  enact-model-management
-  enact-tests
-  enact-tool-registry
-  enact-external-identities
-  enact-rbac
-)
+# Derived from the pid files rather than a hardcoded list.
+#
+# A second copy of the service list is a copy that drifts: enact-mcp-servers
+# was added to start-services.sh and not here, so `make stop` quietly left it
+# running and every later `make restart` kept serving a stale binary. Whatever
+# was started is what gets stopped.
+SERVICES=()
+for pidfile in "$PID_DIR"/*.pid; do
+  [ -e "$pidfile" ] || continue
+  SERVICES+=("$(basename "$pidfile" .pid)")
+done
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
@@ -40,10 +39,6 @@ kill_tree() {
 
 for svc in "${SERVICES[@]}"; do
   pidfile="$PID_DIR/$svc.pid"
-  if [ ! -f "$pidfile" ]; then
-    log "$svc: no pidfile (not started by start-services.sh, or already stopped)"
-    continue
-  fi
   pid=$(cat "$pidfile")
   if ! kill -0 "$pid" 2>/dev/null; then
     log "$svc: stale pidfile (PID $pid not running); cleaning up"
@@ -54,3 +49,7 @@ for svc in "${SERVICES[@]}"; do
   kill_tree "$pid"
   rm -f "$pidfile"
 done
+
+if [ ${#SERVICES[@]} -eq 0 ]; then
+  log "no running services (no pid files in $PID_DIR)"
+fi

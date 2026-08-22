@@ -31,6 +31,12 @@ credential is missing, the tool call parks, emits
 `toolCallWaitingAuthorization`, and resumes when a **Redis pub/sub** event
 from the identity service says the user connected it.
 
+> **Amended 2026-08-17 — the waiting is gone.** A missing credential now
+> fails the call immediately; see
+> [Amendment: tool calls no longer wait](#amendment-2026-08-17-tool-calls-no-longer-wait)
+> at the end of this ADR. Everything else here still holds: the caller's
+> credentials, resolved at call time, injected through the proxy envelope.
+
 ## Alternatives Considered
 
 ### Alternative 1: use the agent owner's credentials
@@ -105,3 +111,45 @@ from the identity service says the user connected it.
 - The non-streaming inference path cannot wait (there is no channel to tell
   anyone what to connect), so it returns a tool error naming the provider
   instead of stalling silently.
+
+---
+
+## Amendment (2026-08-17): tool calls no longer wait
+
+The parking mechanism is **removed**. A tool call whose credentials are not
+connected fails at once, emitting `toolCallAuthorizationRequired` with the
+same `missing` payload, followed by the call's ordinary `toolCallResult`
+carrying `is_error: true`. The user connects the account and asks again;
+nothing retries on their behalf.
+
+Removed with it: the in-memory waiters, the recheck and heartbeat tickers,
+`TOOL_AUTH_WAIT_TIMEOUT` / `TOOL_AUTH_RECHECK_INTERVAL` /
+`TOOL_AUTH_HEARTBEAT_INTERVAL`, the whole `internal/identityevents` package,
+its Redis publisher in enact-external-identities and its subscriber in
+enact-model-inference.
+
+**Why.** The original decision optimised the wrong moment. Parking holds a
+model turn, an SSE connection and a Bedrock context open for up to five
+minutes on the chance that somebody completes an OAuth flow in another tab —
+paying a real cost on every refusal to save a retry on the few that get
+connected. The consequences section below already listed most of it: calls
+blocking for minutes, waiters lost on restart, the non-streaming path unable
+to wait at all, so the same missing credential behaved differently depending
+on how you asked.
+
+The event contract was the tell. It needed a status machine
+(`waiting`/`resolved`/`timeout`), a countdown, 30-second heartbeats to keep
+proxies from closing the stream, and a re-announcement whenever a client
+might have connected late — all of it protocol for a state that exists only
+because the call refused to end.
+
+**What replaces it.** `GET /agents/{id}/required-identities` answers the same
+question *before* a conversation starts, which is where the prompt to connect
+an account belongs. The runtime refusal is the backstop, not the workflow.
+
+**Consequence.** A user whose credential is missing loses the turn: the
+assistant reports that the tool could not run, and they ask again after
+connecting. That is one extra round trip, in exchange for an inference
+service that holds nothing open and a platform with no Redis pub/sub
+dependency at all.
+

@@ -19,6 +19,13 @@ BINS := $(addprefix $(DIST_DIR)/,$(CMDS))
 
 GO_FILES := $(shell find . -type f -name '*.go' -not -path './$(DIST_DIR)/*')
 
+# Files embedded with go:embed are inputs to the build as much as source is,
+# but they are not *.go and so are invisible to the rule below. Without this,
+# editing a documentation page rebuilds nothing and the running service keeps
+# serving the previous text — a confusing failure, because the file on disk is
+# plainly correct.
+EMBED_FILES := $(shell find docs/app -type f 2>/dev/null)
+
 INFRA := ./scripts/infrastructure.sh
 START := ./scripts/start-services.sh
 STOP  := ./scripts/stop-services.sh
@@ -43,7 +50,7 @@ $(BUILD_MODE_FILE): FORCE
 
 FORCE:
 
-$(DIST_DIR)/%: $(GO_FILES) go.mod go.sum $(BUILD_MODE_FILE)
+$(DIST_DIR)/%: $(GO_FILES) $(EMBED_FILES) go.mod go.sum $(BUILD_MODE_FILE)
 	@mkdir -p $(DIST_DIR)
 	$(GO) build $(GCFLAGS) -o $@ ./cmd/$*
 

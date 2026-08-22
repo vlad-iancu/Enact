@@ -1,0 +1,25 @@
+# Access control list for enact-workflows.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# Workflow management is a user-facing entry point, reached through enact-main,
+# so its routes admit anonymous (untokened) callers. WHO may do what is decided
+# by this service's own RBAC checks, not here — the S2S layer authenticates
+# services, and a workflow belongs to a person.
+service: enact-workflows
+rules:
+  - route: "POST /v1/workflows"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/workflows"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/workflows/{id}"
+    allow: [anonymous, "*"]
+  - route: "PUT /v1/workflows/{id}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /v1/workflows/{id}"
+    allow: [anonymous, "*"]
+  - route: "POST /v1/workflows/{id}/executions"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/workflows/{id}/executions"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/executions/{id}"
+    allow: [anonymous, "*"]

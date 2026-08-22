@@ -25,6 +25,7 @@ import (
 	"enact/internal/ses"
 	"enact/internal/tools"
 	"enact/internal/users"
+	"enact/internal/workflows"
 )
 
 // minPasswordLen is the minimum accepted password length for local accounts.
@@ -60,13 +61,21 @@ type MainAPI struct {
 	// toolRegistry fronts the MCP tool registry for user-scoped server
 	// management.
 	toolRegistry *tools.Client
+	// docs is the product documentation, loaded once at startup: it is
+	// embedded, so it cannot change while the process runs.
+	docs []docPage
 	// rbac is the authorization service: organizations, roles and the rules
 	// that decide what a session may do.
 	rbac *rbac.Client
 	// identities fronts the external identity service for user-scoped
 	// third-party account management.
 	identities *extidentities.Client
-	logger     *logging.Logger
+	// workflows fronts the workflow service for authoring and manual runs.
+	workflows *workflows.Client
+	// apiKeys memoizes resolved API keys, so programmatic traffic does not
+	// cost one account lookup per request.
+	apiKeys *apiKeyCache
+	logger  *logging.Logger
 }
 
 // isAdmin reports whether the given account email is the administrator.
@@ -88,6 +97,7 @@ func newMainAPI(userRepo *users.Repository, sessions *SessionStore, google *goog
 		cdn:           cdn,
 		cookies:       cookies,
 		frontendURL:   strings.TrimRight(frontendURL, "/"),
+		apiKeys:       newAPIKeyCache(),
 		logger:        logger,
 	}
 }
@@ -188,6 +198,11 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 	// filter). Registered on the auth group only — the other groups are
 	// GET-only pages and the OAuth callback, which state+PKCE protect.
 	auth.Filter(a.csrfOriginFilter)
+	// Resolves a caller when there is one, without demanding it: most of this
+	// group is reachable by anyone, but /auth/me answers for whoever asks —
+	// a session or an API key. Handlers that must have a cookie call
+	// requireSessionOnly and are unaffected.
+	auth.Filter(a.optionalCaller)
 
 	auth.Route(auth.GET("/google").
 		To(a.googleLogin).
@@ -243,6 +258,31 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 		Returns(http.StatusBadRequest, "Invalid image", errorResponse{}).
 		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
 
+	// API keys live on the auth group because they are account credentials,
+	// and — deliberately — behind the session only. See requireSessionOnly.
+	auth.Route(auth.POST("/keys").
+		To(a.createAPIKey).
+		Consumes(restful.MIME_JSON).
+		Reads(createAPIKeyRequest{}).
+		Doc("Create an API key for programmatic access. The key is returned ONCE and cannot be recovered afterwards").
+		Returns(http.StatusCreated, "Created", createAPIKeyResponse{}).
+		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
+	auth.Route(auth.GET("/keys").
+		To(a.listAPIKeys).
+		Doc("List the logged-in user's API keys (prefixes only; the keys themselves are not stored)").
+		Returns(http.StatusOK, "OK", listAPIKeysResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
+	auth.Route(auth.DELETE("/keys/{id}").
+		To(a.deleteAPIKey).
+		Param(auth.PathParameter("id", "API key id, as returned by GET /auth/keys")).
+		Doc("Revoke an API key").
+		Returns(http.StatusNoContent, "Revoked", nil).
+		Returns(http.StatusNotFound, "No such key", errorResponse{}).
+		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
+
 	callback := new(restful.WebService)
 	callback.Path("/google")
 	callback.Route(callback.GET("/oauth/callback").
@@ -268,7 +308,8 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 		a.conversationsWebService(), a.modelsWebService(),
 		a.agentsWebService(), a.kbWebService(), a.inferenceWebService(),
 		a.adminWebService(), a.mcpServersWebService(), a.identitiesWebService(),
-		a.organizationsWebService(),
+		a.organizationsWebService(), a.docsWebService(),
+		a.workflowsWebService(),
 	}
 }
 
@@ -541,14 +582,22 @@ func (a *MainAPI) logout(req *restful.Request, resp *restful.Response) {
 	resp.WriteHeader(http.StatusNoContent)
 }
 
+// me returns the account the caller is acting as — resolved by optionalCaller
+// from either a cookie or an API key.
+//
+// Keys are admitted here, unlike anywhere else under /auth, because this reads
+// identity rather than changing credentials: a key already acts as this user
+// across agents, knowledge bases and inference, so it learns nothing new. What
+// it gains is the obvious way for a program to check that a key is live and
+// find out whose it is.
 func (a *MainAPI) me(req *restful.Request, resp *restful.Response) {
 	logger := requesthelper.Logger(req, a.logger)
-	sess, ok := a.session(req)
-	if !ok {
+	sess := sessionAttr(req)
+	if sess.UserID == "" {
 		requesthelper.WriteError(req, resp, http.StatusUnauthorized, "not logged in")
 		return
 	}
-	logger.Info("session resolved", "user_id", sess.UserID)
+	logger.Info("caller resolved", "user_id", sess.UserID)
 	user, found, err := a.users.GetByEmail(req.Request.Context(), sess.Email)
 	if err != nil || !found {
 		logger.Error("failed to load session user", "user_id", sess.UserID, "found", found, "err", err)

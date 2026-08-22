@@ -29,6 +29,10 @@ type rbacCrossOrgCase struct {
 	agent    utils.AgentDTO
 	kbID     string
 	serverID string
+	// session owns a server registered THROUGH enact-main, so the gateway's
+	// own resolution path is covered and not just the registry's.
+	session       *utils.MainSession
+	gatewayServer string
 	// otherOrg is the organization created for this case; its owner is
 	// crossOrgUser.
 	otherOrg string
@@ -58,6 +62,18 @@ func (c *rbacCrossOrgCase) Setup(t *utils.T) {
 	if st := t.DoJSON("enact-tests", utils.ToolRegistryAudience, http.MethodPost,
 		t.ToolRegistryURL("/v1/servers/create"), strings.NewReader(body), nil); st != http.StatusCreated {
 		t.Fatalf("register server in org A: got HTTP %d, want 201", st)
+	}
+
+	// A second server, registered through the browser surface by a session
+	// user, so the gateway path has something of its own to resolve.
+	c.session = t.NewMainSession()
+	c.session.RegisterOrLogin(t, "E2E Cross Org", mainTestEmail, mainTestPassword)
+	c.gatewayServer = "e2e-cross-org-gateway"
+	c.session.DoJSON(t, http.MethodDelete, "/mcp-servers/"+c.gatewayServer, nil, nil)
+	gateway := fmt.Sprintf(`{"id":%q,"url":%q,"transport_type":"streamable-http","description":"gateway path"}`,
+		c.gatewayServer, t.Env.MCPFixtureURL)
+	if st := c.session.DoJSON(t, http.MethodPost, "/mcp-servers", strings.NewReader(gateway), nil); st != http.StatusCreated {
+		t.Fatalf("register the gateway server: got HTTP %d, want 201", st)
 	}
 
 	c.otherOrg = c.createOrganization(t)
@@ -162,6 +178,62 @@ func (c *rbacCrossOrgCase) Run(t *utils.T) {
 		t.ToolRegistryURL("/v1/servers/create"), strings.NewReader(body), nil); st != http.StatusConflict {
 		t.Errorf("duplicate id within one organization: got HTTP %d, want 409", st)
 	}
+
+	c.gatewayDeleteResolvesWithinTheOrganization(t)
+}
+
+// gatewayDeleteResolvesWithinTheOrganization covers enact-main rather than the
+// registry: the gateway resolves a server by id to check the session owns it,
+// and that lookup must be scoped to the caller's organization.
+//
+// Unscoped it matched every organization holding the same id and returned an
+// arbitrary one, so the ownership check ran against a stranger's record and
+// the owner was told their own server did not exist.
+func (c *rbacCrossOrgCase) gatewayDeleteResolvesWithinTheOrganization(t *utils.T) {
+	// The other organization registers the SAME id, so the gateway now has
+	// two records to choose between.
+	body := fmt.Sprintf(`{"id":%q,"url":%q,"transport_type":"streamable-http","description":"org B copy"}`,
+		c.gatewayServer, t.Env.MCPFixtureURL)
+	if st := t.DoJSONAs(crossOrgUser, "enact-tests", utils.ToolRegistryAudience, http.MethodPost,
+		t.ToolRegistryURL("/v1/servers/create"), strings.NewReader(body), nil); st != http.StatusCreated {
+		t.Fatalf("register the duplicate in the other organization: got HTTP %d, want 201", st)
+	}
+
+	// The owner deletes theirs through enact-main. Ambiguity here reads as
+	// "not found", which is the symptom this guards against.
+	if st := c.session.DoJSON(t, http.MethodDelete, "/mcp-servers/"+c.gatewayServer, nil, nil); st != http.StatusNoContent {
+		t.Errorf("owner deletes their own server through the gateway: got HTTP %d, want 204 — "+
+			"a 404 means the lookup crossed into another organization", st)
+	}
+
+	// Theirs is gone from their listing...
+	var listed struct {
+		Servers []struct {
+			ID string `json:"id"`
+		} `json:"servers"`
+	}
+	if st := c.session.DoJSON(t, http.MethodGet, "/mcp-servers", nil, &listed); st != http.StatusOK {
+		t.Fatalf("list servers after the gateway delete: got HTTP %d, want 200", st)
+	}
+	for _, srv := range listed.Servers {
+		if srv.ID == c.gatewayServer {
+			t.Errorf("the deleted server is still listed")
+		}
+	}
+	// ...and the other organization's copy survived it.
+	var others struct {
+		Servers []struct {
+			ID string `json:"id"`
+		} `json:"servers"`
+	}
+	if st := t.DoJSONAs(crossOrgUser, "enact-tests", utils.ToolRegistryAudience, http.MethodGet,
+		t.ToolRegistryURL("/v1/servers?ids="+c.gatewayServer+"&owner="+crossOrgUser), nil, &others); st != http.StatusOK {
+		t.Fatalf("list the other organization's servers: got HTTP %d, want 200", st)
+	}
+	if len(others.Servers) != 1 {
+		t.Errorf("the other organization has %d copies of %s after the delete, want 1 — "+
+			"a delete must not reach across the boundary", len(others.Servers), c.gatewayServer)
+	}
 }
 
 func (c *rbacCrossOrgCase) TearDown(t *utils.T) {
@@ -171,6 +243,11 @@ func (c *rbacCrossOrgCase) TearDown(t *utils.T) {
 	if c.kbID != "" {
 		t.DoJSON("enact-tests", utils.KBAudience, http.MethodDelete,
 			t.KBURL("/v1/knowledge-bases/"+c.kbID), nil, nil)
+	}
+	if c.session != nil && c.gatewayServer != "" {
+		c.session.DoJSON(t, http.MethodDelete, "/mcp-servers/"+c.gatewayServer, nil, nil)
+		t.DoJSONAs(crossOrgUser, "enact-tests", utils.ToolRegistryAudience, http.MethodDelete,
+			t.ToolRegistryURL("/v1/servers?id="+c.gatewayServer), nil, nil)
 	}
 	if c.serverID != "" {
 		t.DoJSON("enact-tests", utils.ToolRegistryAudience, http.MethodDelete,

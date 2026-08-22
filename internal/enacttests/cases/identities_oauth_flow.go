@@ -97,7 +97,7 @@ func (c *identitiesOAuthFlowCase) Run(t *utils.T) {
 		c.url(t, "/v1/providers/oauth"), strings.NewReader(bare), &bareErr); st != http.StatusBadRequest {
 		t.Errorf("registering an oauth provider with no scopes and no access levels: got HTTP %d, want 400", st)
 		t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-			c.url(t, "/v1/providers/"+oauthProviderName+"-bare?force=true"), nil, nil)
+			c.url(t, "/v1/providers/"+oauthProviderName+"-bare"), nil, nil)
 	} else if !strings.Contains(bareErr.Error, "scopes") {
 		t.Errorf("the refusal %q does not say what is missing", bareErr.Error)
 	}
@@ -109,7 +109,7 @@ func (c *identitiesOAuthFlowCase) Run(t *utils.T) {
 		t.Errorf("registering an oauth provider with access levels but no scopes: got HTTP %d, want 201", st)
 	}
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-		c.url(t, "/v1/providers/"+oauthProviderName+"-levels?force=true"), nil, nil)
+		c.url(t, "/v1/providers/"+oauthProviderName+"-levels"), nil, nil)
 
 	// An undefined level is refused rather than silently ignored.
 	unknown := c.url(t, fmt.Sprintf("/v1/oauth/authorize?provider=%s&access_level=nope", oauthProviderName))
@@ -284,7 +284,7 @@ func (c *identitiesOAuthFlowCase) Run(t *utils.T) {
 		t.Fatalf("retrieve the credential before the forced provider delete: got HTTP %d, want 200", st)
 	}
 	if st := t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-		c.url(t, "/v1/providers/"+oauthProviderName+"?force=true"), nil, nil); st != http.StatusNoContent {
+		c.url(t, "/v1/providers/"+oauthProviderName), nil, nil); st != http.StatusNoContent {
 		t.Fatalf("forced provider delete: got HTTP %d, want 204", st)
 	}
 	if revoked, _ := c.revocation(t, doomed.Credentials); !revoked {
@@ -325,9 +325,9 @@ func (c *identitiesOAuthFlowCase) TearDown(t *utils.T) {
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
 		c.url(t, "/v1/identities?provider="+oauthProviderName), nil, nil)
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-		c.url(t, "/v1/providers/"+oauthProviderName+"?force=true"), nil, nil)
+		c.url(t, "/v1/providers/"+oauthProviderName), nil, nil)
 	for _, suffix := range []string{"-bare", "-levels"} {
 		t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-			c.url(t, "/v1/providers/"+oauthProviderName+suffix+"?force=true"), nil, nil)
+			c.url(t, "/v1/providers/"+oauthProviderName+suffix), nil, nil)
 	}
 }

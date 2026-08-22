@@ -406,6 +406,6 @@ func (c *mainAdminUserManagementCase) TearDown(t *utils.T) {
 	body := fmt.Sprintf(`{"email":%q}`, adminCreatedEmail)
 	c.admin.DoJSON(t, http.MethodPost, "/admin/delete-user", strings.NewReader(body), nil)
 	for _, name := range []string{adminPATProvider, adminPATProvider + "-bad", adminOAuthProvider, adminIdentityProvider} {
-		c.admin.DoJSON(t, http.MethodDelete, "/identities/providers/"+name+"?force=true", nil, nil)
+		c.admin.DoJSON(t, http.MethodDelete, "/identities/providers/"+name, nil, nil)
 	}
 }

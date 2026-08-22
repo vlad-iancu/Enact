@@ -34,7 +34,9 @@ func (a *RegistryAPI) probeTools(ctx context.Context, server tools.Server) ([]mc
 	// Always wrapped: with nothing configured the transport is a
 	// pass-through, so there is one code path rather than two.
 	client := &http.Client{Transport: transport, Timeout: a.probeClient.Timeout}
-	session, err := mcp.Connect(ctx, server.URL, server.TransportType, client)
+	// dialURL, not server.URL: a built-in server is registered under an
+	// alias that resolves to nothing here.
+	session, err := mcp.Connect(ctx, a.dialURL(server.URL), server.TransportType, client)
 	if err != nil {
 		return nil, err
 	}

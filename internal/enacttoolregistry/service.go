@@ -37,7 +37,19 @@ type Config struct {
 	RefreshAt time.Duration `env:"REFRESH_AT, default=5m"`
 	// MCPTimeout bounds one connect+list against an underlying MCP server
 	// (registration health checks and cache refreshes).
-	MCPTimeout time.Duration `env:"MCP_CONNECT_TIMEOUT, default=15s"`
+	//
+	// 15s was too tight to be a health check. Connecting opens the standalone
+	// SSE stream the spec defines, and a real server can sit on it: Atlassian
+	// sends its first byte after 15.2 seconds, so a probe died a fifth of a
+	// second short and blamed whichever message came next. The budget covers
+	// the handshake, not the server's throughput, so it can afford to be
+	// generous — tools.ClientConfig.Timeout must stay above it.
+	MCPTimeout time.Duration `env:"MCP_CONNECT_TIMEOUT, default=45s"`
+	// BuiltInMCPURL is where enact-mcp-servers actually listens. Servers are
+	// registered under the portless alias builtinmcp.AliasHost, and this is
+	// what that alias resolves to when the registry dials — so the address
+	// lives in the deployment rather than in every user's record.
+	BuiltInMCPURL string `env:"MCP_SERVERS_URL, default=http://localhost:8010"`
 }
 
 // Build constructs the registry service and starts the refresh loop.
@@ -73,10 +85,20 @@ func Build(cfg *Config) service.Builder {
 			// Probes talk to third-party MCP servers directly, so this client
 			// carries no S2S signing — only whatever the owner's credential
 			// configuration renders.
-			probeClient: &http.Client{Timeout: cfg.MCPTimeout},
-			logger:      logger,
+			//
+			// No client-level Timeout, for the same reason proxyClient has
+			// none: a server that answers initialize with text/event-stream
+			// makes the SDK open a standalone SSE stream, and http.Client's
+			// Timeout covers a whole request INCLUDING a streaming body. It
+			// killed that stream, the SDK retried it five times, and a probe
+			// that should take a second failed after ninety. probeTools
+			// bounds the operation with a context instead.
+			probeClient:   &http.Client{},
+			builtInMCPURL: cfg.BuiltInMCPURL,
+			logger:        logger,
 		}
 		logger.Info("tool registry initialized",
+			"built_in_mcp_url", cfg.BuiltInMCPURL,
 			"refresh_at", cfg.RefreshAt,
 			"mcp_timeout", cfg.MCPTimeout,
 			"external_identities", cfg.Identities.BaseURL,

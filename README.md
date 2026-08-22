@@ -21,11 +21,15 @@ and Apache Tika. Agents can be grounded in documents two ways, independently:
 | `enact-model-management`        | `GET /v1/models` — friendly model names mapped to Bedrock model ids. |
 | `enact-kb-api`                  | Create/delete knowledge bases; upload **context documents**. Raw file bytes are base64-encoded and pushed onto the Redis queue, **not** processed inline. |
 | `enact-kb-document-indexer`     | Consumes the queue and extracts text via Tika. KB context documents are stored whole; agent RAG documents are chunked + embedded (Bedrock Titan) into the k-NN index. No public API (health probe only). |
-| `enact-agent-management-api`    | CRUD for agents (`model`, `system_prompt`, `knowledge_base_ids`); upload **RAG documents** to an agent (`POST /v1/agents/{id}/rag/documents`). |
-| `enact-model-inference`         | `POST /v1/inference`. Accepts `agent_id`; resolves the agent's model, loads the KB context files whole, retrieves top-k chunks from the agent's RAG collection, and augments the system prompt. Agents with MCP `tools` run a Bedrock tool-use loop (max `MAX_TURNS`, default 10): tool calls execute through the registry's MCP proxy and stream as `toolCall` / `toolCallResult` SSE events. |
+| `enact-agent-management-api`    | CRUD for agents (`model`, `system_prompt`, `knowledge_base_ids`, `tools`, `output_schema`); upload **RAG documents** to an agent (`POST /v1/agents/{id}/rag/documents`). |
+| `enact-model-inference`         | `POST /v1/inference`. Accepts `agent_id`; resolves the agent's model, loads the KB context files whole, retrieves top-k chunks from the agent's RAG collection, and augments the system prompt. Agents with MCP `tools` run a Bedrock tool-use loop (max `MAX_TURNS`, default 10): tool calls execute through the registry's MCP proxy and stream as `toolCall` / `toolCallResult` SSE events. An agent's `output_schema` becomes the Converse `OutputConfig`, constraining the reply to JSON; a `malformed_model_output` stop fails the request rather than returning prose the caller would parse as JSON. |
 | `enact-external-identities`     | Credentials the platform holds on a user's behalf at third parties (Google Workspace, GitHub, JIRA). Registers providers (`POST /v1/providers/oauth` with well-known discovery, `POST /v1/providers/pat`), owns the OAuth consent flow (`/v1/oauth/authorize` + `/v1/oauth/callback`), serves usable credentials to services, and refreshes tokens on a background sweep. Credentials are AES-256-GCM sealed at rest (ADR-0013). |
 | `enact-rbac`                    | Organizations, memberships, roles and the rules they grant. `GET /v1/effective` is the hot path — a user's organization and every rule they hold, which services cache and evaluate locally. Also organization requests and their approval, and `POST /v1/grants`, the ownership bookkeeping every service writes when it creates a resource. |
+| `enact-workflows`               | Workflow authoring and execution intake. A workflow is an ordered list of **agent** steps (an existing agent, prompt templated with Go templates) and **code** steps (JavaScript over the step context). `POST /v1/workflows/{id}/executions` validates `use`, writes an execution record and queues it — it never executes anything itself. |
+| `enact-workflow-runner`         | Consumes queued executions and runs their steps in order **as the triggering user**, updating the record after each. Agent steps call `enact-model-inference`, which re-checks `enact:agent:use:{id}` — so a workflow cannot run an agent its triggerer may not. Code steps run in goja with no host access and a wall-clock interrupt. No public API (health probe only). |
 | `enact-tool-registry`           | MCP servers on the platform: register (`POST /v1/servers/create`, health-checked), partial update, list, and a cached tool catalogue (`GET /v1/servers/tools`, refreshed every `REFRESH_AT`). `/v1/servers/{id}/mcp` and `/{id}/sse` are spec-compliant MCP proxies to the underlying server. |
+
+Programmatic access: `POST /auth/keys` on enact-main issues a per-user API key (`enact_sk_…`, returned once, stored only as a SHA-256). Presented as `Authorization: Bearer` or `X-Enact-Api-Key` (the former is consumed and stripped by the auth filter so the S2S filter, which reads the same header, never sees it), it authenticates the agent, knowledge-base, MCP-server, conversation, model and inference routes as that user — organizations, identities/providers, admin and key management stay session-only, so a key can neither escalate nor mint another.
 
 Every service also exposes `GET /healthz`, a home page at `/`, and Swagger UI
 at `/swagger-ui/` for free (via `internal/service`).
@@ -72,7 +76,7 @@ which is used to create the k-NN index mapping. Change both together.
 ## Storage layout (OpenSearch indices)
 
 * `enact-knowledge-bases` — KB metadata (`id`, `user_id`, `created_at`).
-* `enact-agents` — agent records.
+* `enact-agents` — agent records. `output_schema` is `enabled: false`: it is arbitrary user JSON, so it is kept in `_source` but never mapped.
 * `enact-kb-documents` — extracted full-text context documents of KBs.
 * `enact-agent-rag-chunks` — RAG chunks with `embedding` (`knn_vector`),
   scoped by `agent_id`.
@@ -80,6 +84,11 @@ which is used to create the k-NN index mapping. Change both together.
   `enact-roles` — the authorization model. A membership's document id is the
   user id, so belonging to exactly one organization is structural rather than
   enforced.
+* `enact-workflows` — workflow definitions; `steps` is `enabled: false` (user-authored prompts and JavaScript).
+* `enact-workflow-executions` — one record per run: the trigger input, the step definitions **as they were when it ran**, and each step's input, output and timing. All of it `enabled: false`.
+* `enact-users` — accounts, keyed by normalized email. `api_keys[].key_hash`
+  is an indexed keyword because authentication resolves a user *from* a
+  presented key; the key itself is never stored, only its SHA-256.
 
 Every resource carries `organization_id`, and identity providers and MCP
 servers are additionally **keyed** by it (`<organization>:<name>` and
@@ -387,8 +396,8 @@ behalf, which is a different thing from an organization's shared resources.
 A registered MCP server can declare, per tool, which third-party credentials
 the tool needs and how to present them. At call time the inference service
 resolves the **calling user's** credentials, renders them, and injects them;
-if the user has not connected the account yet the call parks and the UI is
-told (ADR-0014).
+if the user has not connected the account yet the call is refused and the UI
+is told what to connect (ADR-0014).
 
 ```json
 {
@@ -467,23 +476,27 @@ available for Basic auth:
 Registration validates every template by rendering it against sentinel
 credentials, so a configuration that registers is one that will render.
 
-**When a credential is missing**, the stream emits
-`toolCallWaitingAuthorization` with `status` `waiting` → `resolved` |
-`timeout`:
+**When a credential is missing the call fails**, immediately. The stream
+emits `toolCallAuthorizationRequired`, then the call's ordinary
+`toolCallResult` with `is_error: true` — so the model learns it failed and
+can say so, rather than the turn stalling:
 
 ```json
 { "server_id": "github-mcp", "tool": "list_issues", "tool_use_id": "…",
-  "status": "waiting",
   "missing": [{ "provider": "github", "access_level": "read", "reason": "not_connected" }] }
 ```
 
 It carries coordinates, not a URL — the inference service does not know the
 frontend's origin. The UI builds
 `/identities/connect?provider=…&access_level=…` (OAuth) or posts
-`/identities/pat`. The moment the credential lands, the identity
-service publishes on Redis and the parked call resumes (measured at ~20ms);
-`TOOL_AUTH_RECHECK_INTERVAL` is the fallback and `TOOL_AUTH_WAIT_TIMEOUT`
-(default 5m) the ceiling.
+`/identities/pat`, and the user asks again. **Nothing retries on their
+behalf**: a parked call would hold a model turn, an SSE stream and a Bedrock
+context open on the chance somebody finishes an OAuth flow in another tab.
+
+To avoid the failure entirely, ask
+`GET /agents/{id}/required-identities` before starting — it answers the same
+question up front, so the UI can prompt for the account before the user
+sends a message rather than after.
 
 **Tool calls are persisted** on the assistant message of a conversation
 (`tool_calls`: server, tool, `tool_use_id`, the model's arguments, the result

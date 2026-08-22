@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"enact/internal/extidentities"
 	"enact/internal/identity"
@@ -21,16 +20,8 @@ const (
 	// reasonInsufficientAccess: a credential exists but was revoked, or its
 	// grant does not cover the required access level.
 	reasonInsufficientAccess = "insufficient_access"
-	// reasonUnavailable: the identity service could not answer. Waiting
-	// cannot fix this, so the call fails instead of parking.
+	// reasonUnavailable: the identity service could not answer.
 	reasonUnavailable = "unavailable"
-)
-
-// Statuses of the toolCallWaitingAuthorization event.
-const (
-	waitStatusWaiting  = "waiting"
-	waitStatusResolved = "resolved"
-	waitStatusTimeout  = "timeout"
 )
 
 // missingRequirement is one unmet credential.
@@ -40,25 +31,29 @@ type missingRequirement struct {
 	Reason      string `json:"reason"`
 }
 
-// toolCallWaitingAuthorizationEvent announces that a tool call cannot
-// proceed until the user connects an account, and later that it can.
+// toolCallAuthorizationRequiredEvent reports that a tool call could not run
+// because the user has not connected everything it needs. It is TERMINAL:
+// the call has already failed by the time it is emitted, and a
+// toolCallResult marked as an error follows it.
 //
-// It carries COORDINATES, not a URL: this service does not know
-// enact-main's public origin, so the frontend builds
+// It carries COORDINATES, not a URL: this service does not know enact-main's
+// public origin, so the frontend builds
 // /identities/connect?provider=…&access_level=… for OAuth providers, or
 // posts /identities/pat for token ones.
-type toolCallWaitingAuthorizationEvent struct {
-	ServerID    string               `json:"server_id"`
-	Tool        string               `json:"tool"`
-	ToolUseID   string               `json:"tool_use_id"`
-	Status      string               `json:"status"`
-	Missing     []missingRequirement `json:"missing,omitempty"`
-	WaitSeconds int                  `json:"wait_timeout_seconds,omitempty"`
+type toolCallAuthorizationRequiredEvent struct {
+	ServerID  string               `json:"server_id"`
+	Tool      string               `json:"tool"`
+	ToolUseID string               `json:"tool_use_id"`
+	Missing   []missingRequirement `json:"missing,omitempty"`
 }
 
-// toolAuthorizer resolves the CALLING user's credentials for a tool call,
-// renders them into headers and params, and parks the call until they
-// exist.
+// toolAuthorizer resolves the CALLING user's credentials for a tool call and
+// renders them into headers and params.
+//
+// It does NOT wait for missing credentials. A call whose requirements are
+// unmet fails immediately, saying what to connect: parking an inference for
+// minutes holds a model turn, an SSE stream and a Bedrock context open on the
+// chance that somebody completes an OAuth flow in another tab.
 //
 // Deliberately the caller's credentials, not the agent owner's: a tool acts
 // as the person who asked for it. (Knowledge-base loading differs on
@@ -66,10 +61,6 @@ type toolCallWaitingAuthorizationEvent struct {
 // KBs are the agent's configuration, not the caller's data.)
 type toolAuthorizer struct {
 	identities *extidentities.Client
-	waiters    *authWaiters
-	recheck    time.Duration
-	heartbeat  time.Duration
-	waitFor    time.Duration
 	logger     *logging.Logger
 }
 
@@ -77,8 +68,8 @@ type toolAuthorizer struct {
 type resolved struct {
 	Credentials tools.Credentials
 	Missing     []missingRequirement
-	// Fatal is set when waiting cannot help (the identity service is
-	// unreachable, or a requirement is malformed).
+	// Fatal is set when the failure is not the user's to fix (the identity
+	// service is unreachable, or a requirement is malformed).
 	Fatal error
 }
 
@@ -171,93 +162,9 @@ func (z *toolAuthorizer) probeHeaders(ctx context.Context, logger *logging.Logge
 	return headers, nil
 }
 
-// waitForAuthorization parks until every missing credential exists or the
-// deadline passes. It returns the freshly resolved credentials.
-//
-// The wait happens entirely BEFORE the MCP call, so the tool client's
-// CallTimeout never bounds it.
-func (z *toolAuthorizer) waitForAuthorization(ctx context.Context, logger *logging.Logger, server tools.Server, toolName, toolUseID string, first resolved, deadline time.Time, emit func(string, any) error) (resolved, error) {
-	userID := identity.FromContext(ctx)
-
-	keys := make([]string, 0, len(server.Requirements(toolName)))
-	for _, req := range server.Requirements(toolName) {
-		keys = append(keys, waiterKey(userID, req.Provider))
-	}
-	// Register BEFORE re-checking: a credential stored between the check
-	// and the registration would otherwise never wake this call.
-	woken, release := z.waiters.Register(keys)
-	defer release()
-
-	current := first
-	if current = z.resolve(ctx, logger, server, toolName); len(current.Missing) == 0 || current.Fatal != nil {
-		// The credential landed between the turn's announcement and this
-		// wait. The client was told the call was waiting, so it must be told
-		// the wait is over — otherwise the status never leaves "waiting"
-		// until the result arrives.
-		if current.Fatal == nil {
-			_ = emit("toolCallWaitingAuthorization", toolCallWaitingAuthorizationEvent{
-				ServerID: server.ID, Tool: toolName, ToolUseID: toolUseID,
-				Status: waitStatusResolved,
-			})
-		}
-		return current, current.Fatal
-	}
-
-	// No opening announcement here: resolveTurn already emitted one for this
-	// call, with the same missing credentials and the same deadline. A second
-	// identical event a moment later tells the client nothing and reads as a
-	// duplicate. What follows are heartbeats and status changes only.
-	logger.Info("tool call waiting for authorization", "tool", toolName,
-		"missing", len(current.Missing), "deadline", deadline, "pending_waiters", z.waiters.Pending())
-
-	recheck := time.NewTicker(z.recheck)
-	defer recheck.Stop()
-	heartbeat := time.NewTicker(z.heartbeat)
-	defer heartbeat.Stop()
-	timeout := time.NewTimer(time.Until(deadline))
-	defer timeout.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			// The browser hung up; nothing left to wait for.
-			return current, ctx.Err()
-		case <-timeout.C:
-			logger.Warn("tool call authorization timed out", "tool", toolName)
-			_ = emit("toolCallWaitingAuthorization", toolCallWaitingAuthorizationEvent{
-				ServerID: server.ID, Tool: toolName, ToolUseID: toolUseID,
-				Status: waitStatusTimeout, Missing: current.Missing,
-			})
-			return current, nil
-		case <-heartbeat.C:
-			// Re-announce: keeps the SSE connection warm through proxies and
-			// lets a UI that connected late learn what to ask for.
-			_ = emit("toolCallWaitingAuthorization", toolCallWaitingAuthorizationEvent{
-				ServerID: server.ID, Tool: toolName, ToolUseID: toolUseID,
-				Status: waitStatusWaiting, Missing: current.Missing,
-				WaitSeconds: int(time.Until(deadline).Seconds()),
-			})
-		case <-woken:
-			logger.Info("identity event woke a waiting tool call", "tool", toolName)
-		case <-recheck.C:
-		}
-
-		if current = z.resolve(ctx, logger, server, toolName); current.Fatal != nil {
-			return current, current.Fatal
-		}
-		if len(current.Missing) == 0 {
-			logger.Info("tool call authorization satisfied", "tool", toolName)
-			_ = emit("toolCallWaitingAuthorization", toolCallWaitingAuthorizationEvent{
-				ServerID: server.ID, Tool: toolName, ToolUseID: toolUseID,
-				Status: waitStatusResolved,
-			})
-			return current, nil
-		}
-	}
-}
-
 // missingMessage is what the model is told when a tool cannot run for lack
-// of a credential. It names what to connect so the assistant can relay it.
+// of a credential. It names what to connect so the assistant can relay it,
+// and says "then try again" because nothing will retry on the user's behalf.
 func missingMessage(missing []missingRequirement) string {
 	parts := make([]string, 0, len(missing))
 	for _, m := range missing {

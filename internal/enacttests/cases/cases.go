@@ -18,6 +18,7 @@ func All() []utils.Factory {
 		NewRBACCrossOrg,
 		NewAgentNameLifecycle,
 		NewAgentRAGUploadListDelete,
+		NewAgentOutputSchema,
 
 		// Knowledge bases
 		NewKBCreateGetDelete,
@@ -29,6 +30,14 @@ func All() []utils.Factory {
 		// enact-main (UI backend), exercised as a browser: cookie sessions,
 		// no service tokens.
 		NewMainAuthSessionLifecycle,
+		NewMainAPIKeyAccess,
+
+		// Workflows
+		NewWorkflowValidation,
+		NewWorkflowExecution,
+		NewWorkflowFailure,
+		NewWorkflowIsolation,
+		NewWorkflowInheritsAgentPermission,
 		NewMainAgentsCrudProxy,
 		NewMainKBCrudProxy,
 		NewMainConversationsLifecycle,
@@ -47,7 +56,7 @@ func All() []utils.Factory {
 
 		// Per-user credentials injected into MCP tool calls
 		NewMCPToolCredentialInjection,
-		NewMCPToolAuthorizationWait,
+		NewMCPToolAuthorization,
 		NewMCPGatedServer,
 
 		// Model catalogue

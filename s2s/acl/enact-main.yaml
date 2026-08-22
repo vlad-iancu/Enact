@@ -20,6 +20,16 @@ rules:
     allow: [anonymous, "*"]
   - route: "POST /auth/me/avatar"
     allow: [anonymous, "*"]
+  # API key management. Anonymous at this layer like every other auth route —
+  # a cookie session is what actually authorizes these, checked in the
+  # handlers. They are deliberately NOT reachable with an API key: see
+  # requireSessionOnly in internal/enactmain/apikeys.go.
+  - route: "POST /auth/keys"
+    allow: [anonymous, "*"]
+  - route: "GET /auth/keys"
+    allow: [anonymous, "*"]
+  - route: "DELETE /auth/keys/{id}"
+    allow: [anonymous, "*"]
   - route: "GET /auth/verify"
     allow: [anonymous, "*"]
   - route: "POST /auth/resend-verification"
@@ -39,6 +49,8 @@ rules:
     allow: [anonymous, "*"]
   - route: "PUT /conversations/{id}"
     allow: [anonymous, "*"]
+  - route: "DELETE /conversations/{id}"
+    allow: [anonymous, "*"]
   - route: "POST /conversations/{id}/messages"
     allow: [anonymous, "*"]
   - route: "GET /models"
@@ -52,12 +64,6 @@ rules:
     allow: [anonymous, "*"]
   - route: "GET /admin/users"
     allow: [anonymous, "*"]
-  - route: "POST /admin/identity-providers/oauth"
-    allow: [anonymous, "*"]
-  - route: "POST /admin/identity-providers/pat"
-    allow: [anonymous, "*"]
-  - route: "DELETE /admin/identity-providers/{name}"
-    allow: [anonymous, "*"]
   - route: "POST /admin/delete-user"
     allow: [anonymous, "*"]
 
@@ -69,6 +75,8 @@ rules:
     allow: [anonymous, "*"]
   - route: "GET /mcp-servers/tools"
     allow: [anonymous, "*"]
+  - route: "GET /mcp-servers/built-in"
+    allow: [anonymous, "*"]
   - route: "PUT /mcp-servers/{id}"
     allow: [anonymous, "*"]
   - route: "DELETE /mcp-servers/{id}"
@@ -78,6 +86,8 @@ rules:
   # whose credentials are touched, never the request.
   # Organizations and RBAC (browser surface; enact-rbac enforces owner-gating).
   - route: "GET /organizations/me"
+    allow: [anonymous, "*"]
+  - route: "GET /organizations/me/roles"
     allow: [anonymous, "*"]
   - route: "POST /organizations/requests"
     allow: [anonymous, "*"]
@@ -111,6 +121,12 @@ rules:
   - route: "GET /identities"
     allow: [anonymous, "*"]
   - route: "GET /identities/providers"
+    allow: [anonymous, "*"]
+  - route: "POST /identities/providers/oauth"
+    allow: [anonymous, "*"]
+  - route: "POST /identities/providers/pat"
+    allow: [anonymous, "*"]
+  - route: "DELETE /identities/providers/{name}"
     allow: [anonymous, "*"]
   - route: "POST /identities/pat"
     allow: [anonymous, "*"]
@@ -152,4 +168,32 @@ rules:
   - route: "POST /knowledge-bases/{id}/documents"
     allow: [anonymous, "*"]
   - route: "DELETE /knowledge-bases/{id}/documents/{docId}"
+    allow: [anonymous, "*"]
+
+  # Product documentation: public by design — someone deciding whether to
+  # sign up, or stuck at the "you need an organization" step, is exactly who
+  # needs to read it.
+  - route: "GET /docs"
+    allow: [anonymous, "*"]
+  - route: "GET /docs/{slug}"
+    allow: [anonymous, "*"]
+
+  # Workflows: browser-facing, and the one surface built to be driven by a
+  # script — an API key authenticates a manual run. The workflow service
+  # decides who may run what; this layer only admits the caller.
+  - route: "GET /workflows"
+    allow: [anonymous, "*"]
+  - route: "POST /workflows"
+    allow: [anonymous, "*"]
+  - route: "GET /workflows/{id}"
+    allow: [anonymous, "*"]
+  - route: "PUT /workflows/{id}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /workflows/{id}"
+    allow: [anonymous, "*"]
+  - route: "POST /workflows/{id}/executions"
+    allow: [anonymous, "*"]
+  - route: "GET /workflows/{id}/executions"
+    allow: [anonymous, "*"]
+  - route: "GET /workflows/executions/{executionId}"
     allow: [anonymous, "*"]

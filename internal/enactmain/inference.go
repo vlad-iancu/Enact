@@ -32,7 +32,7 @@ func (a *MainAPI) inferenceWebService() *restful.WebService {
 	// go-restful answers 406 to a client that declares it accepts one.
 	ws.Path("/inference").Produces(restful.MIME_JSON, "text/event-stream")
 	ws.Filter(a.csrfOriginFilter)
-	ws.Filter(a.requireSession)
+	ws.Filter(a.requireCaller)
 
 	ws.Route(ws.POST("").
 		To(a.testInference).
@@ -170,16 +170,16 @@ func (a *MainAPI) relayInferenceStream(req *restful.Request, resp *restful.Respo
 			_, err := fmt.Fprintf(resp, "event: error\ndata: %s\n\n", ev.Data)
 			flusher.Flush()
 			return err
-		case "toolCall", "toolCallResult", "toolCallWaitingAuthorization":
+		case "toolCall", "toolCallResult", "toolCallAuthorizationRequired":
 			// Tool-loop progress from the inference service, forwarded
 			// verbatim so the frontend can render live tool activity — and,
-			// for waiting authorizations, prompt the user to connect the
-			// account the tool needs.
+			// when a call is refused for want of a credential, prompt the
+			// user to connect the account it needed.
 			//
 			// The call and its result are also collected, so reopening the
-			// conversation shows what the agent did. Waiting events are not:
-			// they are the state of a call in flight, not part of what
-			// happened. A parse failure only costs the record, never the
+			// conversation shows what the agent did. The authorization event
+			// is not: the refusal already reaches the record as the call's
+			// error result. A parse failure only costs the record, never the
 			// relay — the client still gets the bytes.
 			switch ev.Event {
 			case "toolCall":

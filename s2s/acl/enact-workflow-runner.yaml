@@ -1,0 +1,10 @@
+# Access control list for enact-workflow-runner.
+# The runner consumes queued executions and exposes no business routes, so
+# there is nothing to allow — everything (beyond the unfiltered health/home
+# endpoints) is denied by default.
+#
+# It is a caller, not a callee: it signs requests to enact-model-inference as
+# itself while carrying the triggering user's identity, and that service
+# decides whether that user may run the agent.
+service: enact-workflow-runner
+rules: []

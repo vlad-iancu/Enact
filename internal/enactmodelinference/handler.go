@@ -223,6 +223,11 @@ func (a *InferenceAPI) infer(req *restful.Request, resp *restful.Response) {
 		response.StopReason = out.StopReason
 		response.InputTokens += out.InputTokens
 		response.OutputTokens += out.OutputTokens
+		if msg := malformedOutputError(out.StopReason); msg != "" {
+			logger.Error("model could not satisfy the output schema", "stop_reason", out.StopReason)
+			writeError(req, resp, http.StatusBadGateway, msg)
+			return
+		}
 		if out.StopReason != "tool_use" || len(out.ToolUses) == 0 {
 			response.Content = out.Content
 			break
@@ -359,6 +364,14 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 	bedReq.Model = modelID
 	logger.Info("model resolved", "model_id", modelID)
 
+	// Structured output, if the agent was configured with a schema. Passed
+	// through untouched: the agent API validated its shape, and Bedrock owns
+	// what the keywords mean.
+	bedReq.OutputSchema = agent.OutputSchema
+	if len(agent.OutputSchema) > 0 {
+		logger.Info("structured output configured", "output_schema_bytes", len(agent.OutputSchema))
+	}
+
 	// MCP tools: resolve the agent's server list against the registry's
 	// cache into Bedrock tool specs plus the execution bindings.
 	var bindings map[string]toolBinding
@@ -445,6 +458,21 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 	bedReq.SystemPrompt = strings.Join(blocks, "\n\n")
 	logger.Info("system prompt assembled", "blocks", len(blocks), "total_chars", len(bedReq.SystemPrompt))
 	return bindings, 0, ""
+}
+
+// malformedOutputError returns the message to fail with when a turn ended
+// because the model could not produce output matching the agent's schema, or
+// "" for every other stop reason.
+//
+// This is checked rather than treated as a normal end of turn: the text of
+// such a turn does not satisfy the schema, and a caller that asked for
+// structured output is going to parse it. Silently returning prose where JSON
+// was promised moves the failure into their code.
+func malformedOutputError(stopReason string) string {
+	if stopReason != "malformed_model_output" {
+		return ""
+	}
+	return "the model could not produce output matching the agent's output schema; simplify the schema or try another model"
 }
 
 // lastUserMessage returns the content of the last user-role message, falling
@@ -543,6 +571,11 @@ func (a *InferenceAPI) stream(req *restful.Request, resp *restful.Response, logg
 		result, err := a.client.ConverseStream(ctx, bedReq, send)
 		if err != nil {
 			fail(err)
+			return
+		}
+		if msg := malformedOutputError(result.StopReason); msg != "" {
+			logger.Error("model could not satisfy the output schema", "stop_reason", result.StopReason)
+			fail(errors.New(msg))
 			return
 		}
 		if result.StopReason != "tool_use" || len(result.ToolUses) == 0 {

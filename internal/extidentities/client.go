@@ -322,11 +322,8 @@ func (c *Client) RegisterPATProvider(ctx context.Context, body RegisterPATProvid
 // DeleteProvider removes a provider. Without force the service refuses
 // while stored identities still reference it; with force those identities
 // are deleted along with it. The boolean reports existence.
-func (c *Client) DeleteProvider(ctx context.Context, name string, force bool) (bool, error) {
+func (c *Client) DeleteProvider(ctx context.Context, name string) (bool, error) {
 	endpoint := c.baseURL + "/v1/providers/" + url.PathEscape(name)
-	if force {
-		endpoint += "?force=true"
-	}
 	return c.do(ctx, http.MethodDelete, endpoint, nil, http.StatusNoContent, nil)
 }
 

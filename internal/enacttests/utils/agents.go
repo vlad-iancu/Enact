@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 )
@@ -14,7 +15,10 @@ type AgentDTO struct {
 	Model            string   `json:"model"`
 	SystemPrompt     string   `json:"system_prompt"`
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
-	Error            string   `json:"error"`
+	// OutputSchema is raw so a case can assert on the schema it sent rather
+	// than on whatever a Go round-trip would have made of it.
+	OutputSchema json.RawMessage `json:"output_schema"`
+	Error        string          `json:"error"`
 }
 
 const AgentAudience = "enact-agent-management-api"

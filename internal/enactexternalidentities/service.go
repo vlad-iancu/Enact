@@ -16,7 +16,6 @@ import (
 	restful "github.com/emicklei/go-restful/v3"
 
 	"enact/internal/extidentities"
-	"enact/internal/identityevents"
 	"enact/internal/logging"
 	"enact/internal/opensearch"
 	"enact/internal/rbac"
@@ -33,12 +32,11 @@ import (
 // PUBLIC_BASE_URL to enact-main.
 type Config struct {
 	service.Config
-	OpenSearch     opensearch.Config
-	Identities     extidentities.Config
-	Crypto         extidentities.CryptoConfig
-	IdentityEvents identityevents.Config
-	RBAC           rbac.ClientConfig
-	S2S            s2s.Config
+	OpenSearch opensearch.Config
+	Identities extidentities.Config
+	Crypto     extidentities.CryptoConfig
+	RBAC       rbac.ClientConfig
+	S2S        s2s.Config
 
 	// RefreshAt is how often the sweep runs.
 	RefreshAt time.Duration `env:"IDENTITIES_REFRESH_AT, default=5m"`
@@ -95,13 +93,9 @@ func Build(cfg *Config) service.Builder {
 
 		rbacClient := rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
 		api := &IdentitiesAPI{
-			repo:         repo,
-			flows:        newFlowStore(cfg.FlowTTL),
-			providerHTTP: &http.Client{Transport: requesthelper.NewTransport(nil), Timeout: cfg.ProviderTimeout},
-			// Announces newly stored credentials so a tool call parked on a
-			// missing one resumes. Constructing it opens no connection, so a
-			// Redis outage cannot stop this service from starting.
-			events:        identityevents.NewPublisher(cfg.IdentityEvents),
+			repo:          repo,
+			flows:         newFlowStore(cfg.FlowTTL),
+			providerHTTP:  &http.Client{Transport: requesthelper.NewTransport(nil), Timeout: cfg.ProviderTimeout},
 			enforcer:      rbac.NewEnforcer(rbacClient, cfg.RBAC),
 			rbac:          rbacClient,
 			refreshWindow: refreshWindow,
@@ -117,7 +111,6 @@ func Build(cfg *Config) service.Builder {
 			"provider_timeout", cfg.ProviderTimeout,
 			"flow_ttl", cfg.FlowTTL,
 			"public_url", api.publicURL,
-			"identity_events_channel", api.events.Channel(),
 			"s2s_key_id", cfg.S2S.KeyID,
 		)
 

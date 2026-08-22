@@ -97,6 +97,64 @@ func NewClient(cfg ClientConfig, base http.RoundTripper) *Client {
 	}
 }
 
+// Response is a buffered inference result.
+type Response struct {
+	Content      string `json:"content"`
+	StopReason   string `json:"stop_reason"`
+	InputTokens  int32  `json:"input_tokens"`
+	OutputTokens int32  `json:"output_tokens"`
+	Model        string `json:"model"`
+}
+
+// Invoke runs a NON-streaming inference call and returns the whole reply.
+//
+// For callers with no one to stream to — a workflow step's output is only
+// useful once it is complete, and its consumer is the next step rather than a
+// person watching text appear. Streaming and then reassembling would add a
+// parser between the model and the record for no benefit.
+//
+// No client-level timeout applies (see NewClient); the context governs, which
+// matters because an agent with tools can legitimately take minutes.
+func (c *Client) Invoke(ctx context.Context, req Request) (Response, error) {
+	req.Stream = false
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return Response{}, fmt.Errorf("inference: marshal request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/inference", bytes.NewReader(payload))
+	if err != nil {
+		return Response{}, fmt.Errorf("inference: build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set(identity.Header, identity.FromContext(ctx))
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return Response{}, fmt.Errorf("inference: call: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		var apiErr struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		if apiErr.Error == "" {
+			apiErr.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		// The message is passed through rather than wrapped in a status code,
+		// because it is usually the inference service explaining something the
+		// user can act on — an agent they may not use, or a schema the model
+		// could not satisfy.
+		return Response{}, fmt.Errorf("%s", apiErr.Error)
+	}
+	var out Response
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return Response{}, fmt.Errorf("inference: decode response: %w", err)
+	}
+	return out, nil
+}
+
 // Stream runs a streaming inference call, invoking onEvent for every SSE
 // event as it arrives. The calling user is taken from ctx and forwarded as
 // the platform's stub-auth header. A non-nil error from onEvent aborts the

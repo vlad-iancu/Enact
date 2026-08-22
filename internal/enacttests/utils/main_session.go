@@ -63,6 +63,43 @@ func (s *MainSession) DoJSON(t *T, method, path string, body io.Reader, out any)
 	return resp.StatusCode
 }
 
+// DoAPIKey performs a request against enact-main authenticated by an API key
+// instead of a session — no cookie jar, exactly as an external caller would.
+//
+// extraHeaders exists for one purpose: the impersonation check, which sends a
+// forged X-User-Id alongside a valid key and asserts the response is still
+// scoped to the key's owner.
+func (t *T) DoAPIKey(key, method, path string, body io.Reader, out any, extraHeaders map[string]string) int {
+	req, err := http.NewRequestWithContext(t.Context(), method,
+		strings.TrimRight(t.Env.MainAPIURL, "/")+path, body)
+	if err != nil {
+		t.Fatalf("build request %s %s: %v", method, path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
+	// A bare client: no jar, so nothing can accidentally carry a session and
+	// make a key look like it worked when it did not.
+	resp, err := (&http.Client{Timeout: t.Env.Timeout}).Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			t.Fatalf("%s %s: decode response: %v", method, path, err)
+		}
+	}
+	return resp.StatusCode
+}
+
 // DoMultipart uploads one file (field "file") within the session.
 func (s *MainSession) DoMultipart(t *T, path, filename string, content []byte, out any) int {
 	body, contentType, err := buildMultipart(filename, content)

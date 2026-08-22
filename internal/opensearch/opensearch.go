@@ -301,6 +301,18 @@ func (c *Client) DeleteByQuery(ctx context.Context, index string, body []byte) e
 		Index:   []string{index},
 		Body:    bytes.NewReader(body),
 		Refresh: &refresh,
+		// Without this, a delete-by-query ABORTS the moment any matched
+		// document has been written since the query snapshotted it, and
+		// reports 409 having deleted nothing. That turns an ordinary race —
+		// deleting a workflow while one of its executions is still being
+		// written, or an account while a message is being appended — into a
+		// failed cascade and orphaned records.
+		//
+		// "proceed" deletes everything it can and skips what moved underneath
+		// it. The trade is that a document written at that exact instant
+		// survives; it is orphaned rather than duplicated, and its parent is
+		// gone, so it is unreachable through any listing.
+		Conflicts: "proceed",
 	}
 	res, err := req.Do(ctx, c.api)
 	if err != nil {

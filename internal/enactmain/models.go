@@ -23,7 +23,7 @@ type listModelsResponse struct {
 func (a *MainAPI) modelsWebService() *restful.WebService {
 	ws := new(restful.WebService)
 	ws.Path("/models").Produces(restful.MIME_JSON)
-	ws.Filter(a.requireSession)
+	ws.Filter(a.requireCaller)
 
 	ws.Route(ws.GET("").
 		To(a.listModels).

@@ -7,10 +7,12 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	restful "github.com/emicklei/go-restful/v3"
 
+	"enact/internal/builtinmcp"
 	"enact/internal/extidentities"
 	"enact/internal/identity"
 	"enact/internal/logging"
@@ -36,7 +38,44 @@ type RegistryAPI struct {
 	identities  *extidentities.Client
 	rbac        *rbac.Client
 	enforcer    *rbac.Enforcer
-	logger      *logging.Logger
+	// builtInMCPURL is where enact-mcp-servers listens; see dialURL.
+	builtInMCPURL string
+	logger        *logging.Logger
+}
+
+// dialURL is the address to actually connect to for a server.
+//
+// Built-in servers are registered under a portless internal alias
+// (builtinmcp.AliasHost), which is not a real address anywhere: locally
+// nothing resolves it, and in the cluster DNS resolves the name but not the
+// port. Resolving here rather than at registration keeps the stored record
+// environment-neutral — the same record works in development and in the
+// cluster — and lets a user read back the name they typed.
+//
+// EVERY dial in this package goes through it. Passing server.URL straight to
+// a dialer is the bug this exists to prevent, and there are four call sites
+// that would each have had to remember.
+//
+// Only the alias is touched. Any other host is returned exactly as
+// registered: the registry rewrites nothing it was not told about.
+func (a *RegistryAPI) dialURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(parsed.Hostname(), builtinmcp.AliasHost) {
+		return rawURL
+	}
+	base, err := url.Parse(a.builtInMCPURL)
+	if err != nil || base.Host == "" {
+		// Nothing configured to resolve to. Returning the alias unchanged
+		// makes the failure a connection error naming it, which is clearer
+		// than silently dialling something else.
+		return rawURL
+	}
+	// Host matching ignores any port the caller wrote, so the alias with and
+	// without one behave identically rather than one being a special case.
+	resolved := *parsed
+	resolved.Scheme = base.Scheme
+	resolved.Host = base.Host
+	return resolved.String()
 }
 
 type createServerRequest struct {
@@ -170,6 +209,13 @@ func (a *RegistryAPI) createServer(req *restful.Request, resp *restful.Response)
 	if msg, ok := validateServerFields(body.ID, body.URL, body.TransportType); !ok {
 		logger.Warn("registration rejected", "reason", msg)
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, msg)
+		return
+	}
+	// Catch an unresolvable alias here rather than letting the probe below
+	// fail with a DNS error that reads like the caller's mistake.
+	if msg, ok := a.validateAlias(body.URL); !ok {
+		logger.Error("registration rejected: the built-in alias cannot be resolved", "url", body.URL)
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, msg)
 		return
 	}
 	if err := tools.ValidateToolAuthorization(body.ToolAccessRequirements, body.ToolAuthorizations); err != nil {
@@ -503,6 +549,22 @@ func probeFingerprint(server tools.Server) string {
 		return ""
 	}
 	return string(raw)
+}
+
+// validateAlias reports whether a URL naming the built-in alias can actually
+// be resolved. A registry with no address configured would otherwise accept
+// the registration and fail the probe with "no such host", which points the
+// user at their own input rather than at the deployment.
+func (a *RegistryAPI) validateAlias(rawURL string) (string, bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(parsed.Hostname(), builtinmcp.AliasHost) {
+		return "", true
+	}
+	if a.dialURL(rawURL) == rawURL {
+		return fmt.Sprintf("this platform cannot resolve %q; MCP_SERVERS_URL is not configured on the tool registry",
+			builtinmcp.AliasHost), false
+	}
+	return "", true
 }
 
 // validateServerFields checks the id/url/transport trio shared by create

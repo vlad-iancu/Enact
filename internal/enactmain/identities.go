@@ -98,11 +98,10 @@ func (a *MainAPI) identitiesWebService() *restful.WebService {
 	ws.Route(ws.DELETE("/providers/{name}").
 		To(a.deleteIdentityProvider).
 		Param(ws.PathParameter("name", "provider name")).
-		Param(ws.QueryParameter("force", "also delete every user identity that references it").DataType("boolean")).
-		Doc("Delete one of your organization's identity providers (requires enact:provider:delete); refused while stored identities still reference it unless force=true, which revokes and deletes those users' stored credentials too").
+		Doc("Delete one of your organization's identity providers (requires enact:provider:delete). "+
+			"Every user's stored credential for it is revoked at the provider and deleted with it").
 		Returns(http.StatusNoContent, "Deleted", nil).
 		Returns(http.StatusNotFound, "No such provider", errorResponse{}).
-		Returns(http.StatusConflict, "Identities still reference this provider; pass force=true", errorResponse{}).
 		Returns(http.StatusForbidden, "Not permitted to delete this provider", errorResponse{}).
 		Returns(http.StatusUnauthorized, "No session", errorResponse{}))
 
@@ -382,11 +381,11 @@ func (a *MainAPI) createPATProvider(req *restful.Request, resp *restful.Response
 // apart from disconnectIdentity, which deletes the caller's own credential.
 func (a *MainAPI) deleteIdentityProvider(req *restful.Request, resp *restful.Response) {
 	name := req.PathParameter("name")
-	force := req.QueryParameter("force") == "true"
-	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sessionAttr(req).UserID, "provider", name)
-	logger.Info("delete provider requested", "force", force)
 
-	found, err := a.identities.DeleteProvider(identityCtx(req).Request.Context(), name, force)
+	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sessionAttr(req).UserID, "provider", name)
+	logger.Info("delete provider requested")
+
+	found, err := a.identities.DeleteProvider(identityCtx(req).Request.Context(), name)
 	if err != nil {
 		logger.Warn("provider deletion failed", "err", err)
 		relayIdentitiesErr(req, resp, err, "delete the provider")
@@ -396,7 +395,7 @@ func (a *MainAPI) deleteIdentityProvider(req *restful.Request, resp *restful.Res
 		requesthelper.WriteError(req, resp, http.StatusNotFound, fmt.Sprintf("provider %q not found", name))
 		return
 	}
-	logger.Info("provider deleted", "force", force)
+	logger.Info("provider deleted")
 	resp.WriteHeader(http.StatusNoContent)
 }
 
@@ -439,10 +438,10 @@ type agentRequirementsResponse struct {
 // agentRequiredIdentities answers what the logged-in user must connect
 // before an agent's tools can run.
 //
-// The tool loop resolves exactly this at call time and emits
-// toolCallWaitingAuthorization when something is missing; this endpoint
-// exposes the same answer as a QUERY, so a UI can show "needs GitHub"
-// up front instead of discovering it mid-conversation.
+// The tool loop resolves exactly this at call time and REFUSES the call when
+// something is missing; this endpoint exposes the same answer as a QUERY, so
+// a UI can show "needs GitHub" up front rather than letting the user find out
+// by watching a tool call fail mid-conversation.
 func (a *MainAPI) agentRequiredIdentities(req *restful.Request, resp *restful.Response) {
 	sess := sessionAttr(req)
 	agentID := req.PathParameter("id")

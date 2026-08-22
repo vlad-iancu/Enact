@@ -6,7 +6,12 @@
 .DS_Store
 dist/
 deploy/
+# docs/adr and the rest are host-side, but docs/app is EMBEDDED into
+# enact-main (see docs/embed.go) — excluding it makes the image build fail at
+# the go:embed directive, not at runtime.
 docs/
+!docs/app/
+!docs/embed.go
 mappings/
 s2s/
 scripts/

@@ -52,18 +52,6 @@ var defaultModels = []Model{
 		BedrockModelID: "eu.anthropic.claude-opus-4-6-v1",
 		Description:    "Anthropic Claude Opus 4.6.",
 	},
-	{
-		Name:           "claude-opus-4-7",
-		DisplayName:    "Claude Opus 4.7",
-		BedrockModelID: "eu.anthropic.claude-opus-4-7",
-		Description:    "Anthropic Claude Opus 4.7.",
-	},
-	{
-		Name:           "claude-opus-4-8",
-		DisplayName:    "Claude Opus 4.8",
-		BedrockModelID: "eu.anthropic.claude-opus-4-8",
-		Description:    "Anthropic Claude Opus 4.8.",
-	},
 }
 
 // List returns all available models.

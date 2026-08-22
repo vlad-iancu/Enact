@@ -145,12 +145,6 @@ func (c *identitiesPATLifecycleCase) Run(t *utils.T) {
 		t.Errorf("retrieval with unmet required_access: got HTTP %d, want 409", st)
 	}
 
-	// A provider with identities cannot be deleted by accident.
-	if st := t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-		c.url(t, "/v1/providers/"+patProviderName), nil, nil); st != http.StatusConflict {
-		t.Errorf("deleting a referenced provider: got HTTP %d, want 409", st)
-	}
-
 	// Delete the identity; retrieval then 404s.
 	if st := t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
 		c.url(t, fmt.Sprintf("/v1/identities?provider=%s", patProviderName)), nil, nil); st != http.StatusNoContent {
@@ -161,29 +155,31 @@ func (c *identitiesPATLifecycleCase) Run(t *utils.T) {
 		t.Errorf("retrieval after delete: got HTTP %d, want 404", st)
 	}
 
-	// Forcing the deletion takes the stored credentials with it. Leaving them
-	// behind would keep a secret nobody can ever open again — the provider
-	// record is what knows how to parse the envelope.
+	// Deleting the provider takes the stored credentials with it, with no
+	// flag to ask for it. Leaving them behind would keep a secret nobody can
+	// ever open again — the provider record is what knows how to parse the
+	// envelope — and a grant nobody can revoke, because revocation needs that
+	// same record.
 	if st := t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodPost,
 		c.url(t, "/v1/identities"), strings.NewReader(storeBody), nil); st != http.StatusCreated {
-		t.Fatalf("re-store identity before the forced delete: got HTTP %d, want 201", st)
+		t.Fatalf("re-store identity before the provider delete: got HTTP %d, want 201", st)
 	}
 	if st := t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-		c.url(t, "/v1/providers/"+patProviderName+"?force=true"), nil, nil); st != http.StatusNoContent {
-		t.Fatalf("forced provider delete: got HTTP %d, want 204", st)
+		c.url(t, "/v1/providers/"+patProviderName), nil, nil); st != http.StatusNoContent {
+		t.Fatalf("provider delete with a referencing identity: got HTTP %d, want 204", st)
 	}
-	var afterForce struct {
+	var afterDelete struct {
 		Identities []struct {
 			Provider string `json:"provider"`
 		} `json:"identities"`
 	}
 	if st := t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodGet,
-		c.url(t, "/v1/identities?provider="+patProviderName), nil, &afterForce); st != http.StatusOK {
-		t.Fatalf("listing after the forced delete: got HTTP %d, want 200", st)
+		c.url(t, "/v1/identities?provider="+patProviderName), nil, &afterDelete); st != http.StatusOK {
+		t.Fatalf("listing after the provider delete: got HTTP %d, want 200", st)
 	}
-	if len(afterForce.Identities) != 0 {
-		t.Errorf("%d identities survived the forced provider delete, want 0 — they are unreadable orphans",
-			len(afterForce.Identities))
+	if len(afterDelete.Identities) != 0 {
+		t.Errorf("%d identities survived the provider delete, want 0 — they are unreadable orphans",
+			len(afterDelete.Identities))
 	}
 }
 
@@ -191,7 +187,7 @@ func (c *identitiesPATLifecycleCase) TearDown(t *utils.T) {
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
 		c.url(t, fmt.Sprintf("/v1/identities?provider=%s", patProviderName)), nil, nil)
 	t.DoJSON("enact-main", utils.IdentitiesAudience, http.MethodDelete,
-		c.url(t, "/v1/providers/"+patProviderName+"?force=true"), nil, nil)
+		c.url(t, "/v1/providers/"+patProviderName), nil, nil)
 }
 
 // contains reports whether haystack holds needle.

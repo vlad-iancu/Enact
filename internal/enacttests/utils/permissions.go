@@ -26,6 +26,7 @@ var testRules = []string{
 	"enact:kb:create:*",
 	"enact:mcp-server:create:*",
 	"enact:provider:create:*",
+	"enact:workflow:create:*",
 }
 
 // TestRules exposes the rule set so cases can provision fixture accounts

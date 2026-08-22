@@ -4,7 +4,7 @@
   ],
   "priority": 100,
   "_meta": {
-    "description": "User accounts: display name, email (doc id), password hash for local accounts, Google subject for OAuth accounts."
+    "description": "User accounts: display name, email (doc id), password hash for local accounts, Google subject for OAuth accounts, and hashed API keys for programmatic access."
   },
   "template": {
     "settings": {
@@ -47,6 +47,28 @@
         },
         "verification_expires_at": {
           "type": "date"
+        },
+        "api_keys": {
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "key_hash": {
+              "type": "keyword"
+            },
+            "prefix": {
+              "type": "keyword"
+            },
+            "created_at": {
+              "type": "date"
+            },
+            "last_used_at": {
+              "type": "date"
+            }
+          }
         }
       }
     }

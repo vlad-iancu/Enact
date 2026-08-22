@@ -153,11 +153,10 @@ func (a *IdentitiesAPI) providersWebService() *restful.WebService {
 	ws.Route(ws.DELETE("/{name}").
 		To(a.deleteProvider).
 		Param(ws.PathParameter("name", "provider name")).
-		Param(ws.QueryParameter("force", "also delete every identity that references it").DataType("boolean")).
-		Doc("Delete a provider; refused while identities still reference it unless force=true, which deletes those identities too").
+		Doc("Delete a provider. Every stored identity that references it is revoked at the provider and deleted — "+
+			"a credential whose provider is gone can be neither used nor revoked, so it cannot be left behind").
 		Returns(http.StatusNoContent, "Deleted", nil).
-		Returns(http.StatusNotFound, "No such provider", errorResponse{}).
-		Returns(http.StatusConflict, "Identities still reference this provider", errorResponse{}))
+		Returns(http.StatusNotFound, "No such provider", errorResponse{}))
 
 	return ws
 }
@@ -465,8 +464,7 @@ func (a *IdentitiesAPI) getProvider(req *restful.Request, resp *restful.Response
 func (a *IdentitiesAPI) deleteProvider(req *restful.Request, resp *restful.Response) {
 	logger := requesthelper.Logger(req, a.logger)
 	name := req.PathParameter("name")
-	force := req.QueryParameter("force") == "true"
-	logger.Info("delete provider requested", "name", name, "force", force)
+	logger.Info("delete provider requested", "name", name)
 	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceProvider, rbac.ActionDelete, name); err != nil {
 		logger.Warn("delete provider denied", "err", err)
 		rbac.WriteDenied(req, resp, err, fmt.Sprintf("provider %q not found", name))
@@ -489,8 +487,12 @@ func (a *IdentitiesAPI) deleteProvider(req *restful.Request, resp *restful.Respo
 		requesthelper.WriteError(req, resp, http.StatusNotFound, fmt.Sprintf("provider %q not found", name))
 		return
 	}
-	// Deleting a provider while identities reference it would strand them:
-	// no handler could parse their envelope and the sweep would skip them.
+	// The provider's identities go with it, always. Leaving them would
+	// strand them: no handler could open their envelope and the refresh
+	// sweep would skip them, so they would sit in the index as live grants
+	// on people's third-party accounts that this platform can neither use
+	// nor end. Refusing the delete instead only moved that problem to
+	// whoever had to clean up by hand.
 	count, err := a.repo.CountByProvider(req.Request.Context(), name)
 	if err != nil {
 		logger.Error("failed to count referencing identities", "err", err)
@@ -498,14 +500,9 @@ func (a *IdentitiesAPI) deleteProvider(req *restful.Request, resp *restful.Respo
 		return
 	}
 	logger.Info("provider reference count", "name", name, "identities", count)
-	if count > 0 && !force {
-		requesthelper.WriteError(req, resp, http.StatusConflict,
-			fmt.Sprintf("%d stored identities still reference provider %q; delete them first or pass force=true", count, name))
-		return
-	}
-	// force takes the identities with it. Identities first: if this fails the
-	// provider survives and the call can be retried, whereas the reverse order
-	// leaves credentials nobody can open or refresh.
+	// Identities first: if this fails the provider survives and the call can
+	// be retried, whereas the reverse order leaves credentials nobody can
+	// open or refresh.
 	if count > 0 {
 		// Revoke BEFORE anything is deleted: revocation needs this provider
 		// record — its revocation endpoint and its client secret — so once
@@ -520,10 +517,15 @@ func (a *IdentitiesAPI) deleteProvider(req *restful.Request, resp *restful.Respo
 			return
 		}
 		if len(records) < count {
-			// ListIdentities caps its page; say so rather than let the log
-			// imply everything was revoked.
-			logger.Warn("more identities than one page; the remainder will be deleted without revocation",
+			// ListIdentities caps its page. Deleting the remainder without
+			// revoking would leave live grants behind, which is the one
+			// outcome this path exists to prevent — so stop instead, having
+			// changed nothing, and let the caller retry until it fits.
+			logger.Error("more identities than one page can revoke; refusing to delete the provider",
 				"name", name, "identities", count, "listed", len(records))
+			requesthelper.WriteError(req, resp, http.StatusInternalServerError,
+				fmt.Sprintf("provider %q has %d stored identities, more than can be revoked in one pass; retry", name, count))
+			return
 		}
 		tally := a.revokeAll(req, logger, records)
 		deleted, err := a.repo.DeleteIdentitiesByProvider(req.Request.Context(), name)
@@ -532,7 +534,7 @@ func (a *IdentitiesAPI) deleteProvider(req *restful.Request, resp *restful.Respo
 			requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to delete the provider's stored identities")
 			return
 		}
-		logger.Info("forced provider deletion removed identities", "name", name, "identities", deleted,
+		logger.Info("provider deletion removed identities", "name", name, "identities", deleted,
 			"revoked", tally.Revoked, "revocation_unsupported", tally.Unsupported, "revocation_failed", tally.Failed)
 	}
 	if err := a.repo.DeleteProvider(req.Request.Context(), organizationID, name); err != nil {

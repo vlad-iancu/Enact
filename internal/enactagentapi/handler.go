@@ -29,6 +29,12 @@ const maxUploadBytes = 50 << 20 // 50 MiB
 // fileFormField is the multipart form field carrying the document file.
 const fileFormField = "file"
 
+// maxOutputSchemaBytes caps an agent's output schema. It is stored on the
+// record and sent to Bedrock on every turn of every inference, so an
+// unbounded one is paid for repeatedly. Real schemas are a few hundred bytes;
+// this is far above anything legitimate and well below anything harmful.
+const maxOutputSchemaBytes = 64 << 10 // 64 KiB
+
 // AgentAPI exposes agent CRUD and RAG document upload. It uses the agent
 // repository for the CRUD, the KB service client to validate the knowledge
 // bases an agent references (a live call to enact-kb-api), the RAG repository
@@ -62,6 +68,8 @@ type agentRequest struct {
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
 	// Tools names registered MCP servers whose tools the agent may call.
 	Tools []string `json:"tools"`
+	// OutputSchema is a JSON Schema constraining the assistant's reply.
+	OutputSchema json.RawMessage `json:"output_schema"`
 }
 
 // agentUpdateRequest is the partial-update body: pointer fields distinguish
@@ -74,18 +82,24 @@ type agentUpdateRequest struct {
 	SystemPrompt     *string   `json:"system_prompt"`
 	KnowledgeBaseIDs *[]string `json:"knowledge_base_ids"`
 	Tools            *[]string `json:"tools"`
+	// OutputSchema follows the same rule, with one wrinkle: null means
+	// "unchanged" here as everywhere else, so it cannot also mean "remove".
+	// The empty object {} is the clear — a schema that constrains nothing is
+	// indistinguishable from having none, so the two are one thing.
+	OutputSchema *json.RawMessage `json:"output_schema"`
 }
 
 type agentResponse struct {
-	ID               string    `json:"id"`
-	UserID           string    `json:"user_id"`
-	Name             string    `json:"name"`
-	Model            string    `json:"model"`
-	SystemPrompt     string    `json:"system_prompt"`
-	KnowledgeBaseIDs []string  `json:"knowledge_base_ids"`
-	Tools            []string  `json:"tools"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               string          `json:"id"`
+	UserID           string          `json:"user_id"`
+	Name             string          `json:"name"`
+	Model            string          `json:"model"`
+	SystemPrompt     string          `json:"system_prompt"`
+	KnowledgeBaseIDs []string        `json:"knowledge_base_ids"`
+	Tools            []string        `json:"tools"`
+	OutputSchema     json.RawMessage `json:"output_schema,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
 }
 
 type listAgentsResponse struct {
@@ -169,7 +183,7 @@ func (a *AgentAPI) WebService() *restful.WebService {
 		To(a.update).
 		Param(ws.PathParameter("id", "agent id")).
 		Reads(agentUpdateRequest{}).
-		Doc("Partially update an agent: only provided fields change, absent fields keep their value (clear with \"\" / [])").
+		Doc("Partially update an agent: only provided fields change, absent fields keep their value (clear with \"\" / [], and {} for output_schema)").
 		Returns(http.StatusOK, "OK", agentResponse{}).
 		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
@@ -225,10 +239,64 @@ func (a *AgentAPI) validate(req *restful.Request, logger *logging.Logger, body a
 		logger.Warn("agent validation failed: name is required")
 		return "name is required", false
 	}
+	if msg, ok := validateOutputSchema(logger, body.OutputSchema); !ok {
+		return msg, false
+	}
 	if msg, ok := a.validateKBs(req, logger, body.KnowledgeBaseIDs); !ok {
 		return msg, false
 	}
 	return a.validateTools(req, logger, body.Tools)
+}
+
+// validateOutputSchema checks an agent's structured-output schema.
+//
+// It deliberately checks shape and size only, not JSON Schema semantics.
+// Bedrock is the authority on which keywords it honours and the models
+// disagree with each other about the fringes; re-implementing that judgement
+// here would mean rejecting schemas that work, which is worse than passing
+// through one that does not. What is checked is what we would otherwise only
+// discover mid-inference, far from the person who typed it.
+//
+// The empty object is accepted and normalized away by the caller: it is the
+// documented way to clear the field.
+func validateOutputSchema(logger *logging.Logger, raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", true
+	}
+	if len(raw) > maxOutputSchemaBytes {
+		logger.Warn("agent validation failed: output schema too large", "bytes", len(raw), "limit", maxOutputSchemaBytes)
+		return fmt.Sprintf("output_schema is %d bytes; the limit is %d", len(raw), maxOutputSchemaBytes), false
+	}
+	// The body decoder has already proven this is well-formed JSON, so the
+	// only thing left to establish is that it is an object. A JSON Schema
+	// document always is — including one describing an array, which is
+	// {"type":"array",…} and therefore still an object here.
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		logger.Warn("agent validation failed: output schema is not a json object", "err", err)
+		return "output_schema must be a JSON Schema object, for example {\"type\":\"object\",\"properties\":{…}}", false
+	}
+	return "", true
+}
+
+// isEmptyJSONObject reports whether raw is {} — the sentinel that clears an
+// output schema, since a null would be indistinguishable from an absent field.
+func isEmptyJSONObject(raw json.RawMessage) bool {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return false
+	}
+	return len(doc) == 0
+}
+
+// normalizeOutputSchema maps "no schema" and "the empty schema" onto one
+// representation — absent — so a cleared agent and a never-configured one are
+// the same record, and inference has a single case to check.
+func normalizeOutputSchema(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || isEmptyJSONObject(raw) {
+		return nil
+	}
+	return raw
 }
 
 // validateTools checks that every referenced MCP server is registered,
@@ -285,7 +353,8 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 	if !ok {
 		return
 	}
-	logger.Info("create request decoded", "model", body.Model, "knowledge_base_ids", body.KnowledgeBaseIDs, "system_prompt_chars", len(body.SystemPrompt))
+	logger.Info("create request decoded", "model", body.Model, "knowledge_base_ids", body.KnowledgeBaseIDs,
+		"system_prompt_chars", len(body.SystemPrompt), "output_schema_bytes", len(body.OutputSchema))
 	if msg, valid := a.validate(req, logger, body); !valid {
 		writeError(req, resp, http.StatusBadRequest, msg)
 		return
@@ -305,6 +374,7 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 		SystemPrompt:     body.SystemPrompt,
 		KnowledgeBaseIDs: normalizeIDs(body.KnowledgeBaseIDs),
 		Tools:            normalizeIDs(body.Tools),
+		OutputSchema:     normalizeOutputSchema(body.OutputSchema),
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
@@ -435,6 +505,7 @@ func (a *AgentAPI) update(req *restful.Request, resp *restful.Response) {
 		"model_provided", body.Model != nil,
 		"system_prompt_provided", body.SystemPrompt != nil,
 		"knowledge_base_ids_provided", body.KnowledgeBaseIDs != nil,
+		"output_schema_provided", body.OutputSchema != nil,
 	)
 
 	if body.Name != nil {
@@ -473,7 +544,15 @@ func (a *AgentAPI) update(req *restful.Request, resp *restful.Response) {
 		}
 		existing.Tools = normalizeIDs(*body.Tools)
 	}
-	logger.Info("agent changes applied", "model", existing.Model, "knowledge_base_ids", existing.KnowledgeBaseIDs, "system_prompt_chars", len(existing.SystemPrompt))
+	if body.OutputSchema != nil {
+		if msg, valid := validateOutputSchema(logger, *body.OutputSchema); !valid {
+			writeError(req, resp, http.StatusBadRequest, msg)
+			return
+		}
+		existing.OutputSchema = normalizeOutputSchema(*body.OutputSchema)
+	}
+	logger.Info("agent changes applied", "model", existing.Model, "knowledge_base_ids", existing.KnowledgeBaseIDs,
+		"system_prompt_chars", len(existing.SystemPrompt), "output_schema_bytes", len(existing.OutputSchema))
 	existing.UpdatedAt = time.Now().UTC()
 	if err := a.agents.Update(req.Request.Context(), existing); err != nil {
 		logger.Error("failed to update agent", "err", err)
@@ -715,6 +794,7 @@ func toAgentResponse(a agents.Agent) agentResponse {
 		SystemPrompt:     a.SystemPrompt,
 		KnowledgeBaseIDs: normalizeIDs(a.KnowledgeBaseIDs),
 		Tools:            normalizeIDs(a.Tools),
+		OutputSchema:     a.OutputSchema,
 		CreatedAt:        a.CreatedAt,
 		UpdatedAt:        a.UpdatedAt,
 	}

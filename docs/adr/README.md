@@ -24,3 +24,4 @@ See [template.md](template.md) to add one manually.
 | [0017](0017-owner-scoped-probe-credentials.md) | A gated MCP server is reached with its owner's credentials | accepted | 2026-08-15 |
 | [0018](0018-conversations-record-and-replay-tool-calls.md) | Conversations record tool calls and replay them into the model's context | accepted | 2026-08-15 |
 | [0019](0019-organizations-as-the-isolation-boundary.md) | Organizations are the isolation boundary, and every resource stores which one it is in | accepted | 2026-08-16 |
+| [0020](0020-workflows-run-queued-with-a-copied-definition.md) | Workflows run on a queue, against a copy of their own definition | accepted | 2026-08-21 |

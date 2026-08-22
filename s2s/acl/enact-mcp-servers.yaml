@@ -1,0 +1,17 @@
+# Access control list for enact-mcp-servers.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# The MCP route is DELIBERATELY not listed, and that is not an omission.
+#
+# S2S signs its token into the Authorization header, and on this service that
+# header already carries the CALLER'S third-party credential — the reason the
+# X-Enact-Tool-Auth envelope exists at all, since the tool registry translates
+# it onto the upstream request as real headers. Two credentials cannot share
+# one header.
+#
+# Nothing is lost. The Google token IS the authentication: this service holds
+# no credentials of its own, and can do nothing a caller's own token could not
+# do by calling Google directly. That is the same posture as every third-party
+# MCP server the platform talks to.
+service: enact-mcp-servers
+rules: []

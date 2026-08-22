@@ -1,0 +1,45 @@
+{
+  "index_patterns": [
+    "enact-workflows"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Workflow definitions: an ordered list of agent and code steps. The steps array is user-authored (prompts, JavaScript) and is stored but never indexed."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id": {
+          "type": "keyword"
+        },
+        "user_id": {
+          "type": "keyword"
+        },
+        "organization_id": {
+          "type": "keyword"
+        },
+        "name": {
+          "type": "text"
+        },
+        "description": {
+          "type": "text",
+          "index": false
+        },
+        "steps": {
+          "type": "object",
+          "enabled": false
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "updated_at": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}

@@ -101,10 +101,18 @@ type ConverseRequest struct {
 	Documents    []Document
 	// Tools the model may call; a "tool_use" stop reason then carries the
 	// requested invocations.
-	Tools       []ToolSpec
-	MaxTokens   int32
-	Temperature *float32
-	TopP        *float32
+	Tools []ToolSpec
+	// OutputSchema constrains the assistant's text to JSON matching this JSON
+	// Schema (Bedrock structured output). Empty leaves the reply unconstrained.
+	//
+	// This is orthogonal to Tools and composes with it: on a turn where the
+	// model calls a tool there is no text to constrain, and the schema applies
+	// to the turn that finally answers. A model that cannot satisfy the schema
+	// stops with "malformed_model_output" rather than returning bad JSON.
+	OutputSchema json.RawMessage
+	MaxTokens    int32
+	Temperature  *float32
+	TopP         *float32
 }
 
 // ConverseResponse is the high-level output from Converse.
@@ -132,6 +140,7 @@ type converseParams struct {
 	system          []types.SystemContentBlock
 	inferenceConfig *types.InferenceConfiguration
 	toolConfig      *types.ToolConfiguration
+	outputConfig    *types.OutputConfig
 }
 
 // rawToDocument converts raw JSON into the SDK's document representation
@@ -250,6 +259,20 @@ func buildConverseParams(req *ConverseRequest) converseParams {
 		p.toolConfig = &types.ToolConfiguration{Tools: specs}
 	}
 
+	if len(req.OutputSchema) > 0 {
+		// The schema goes over the wire as a JSON *string*, unlike a tool's
+		// input schema which is a document — so the caller's bytes are passed
+		// through as-is rather than round-tripped through a document.
+		p.outputConfig = &types.OutputConfig{
+			TextFormat: &types.OutputFormat{
+				Type: types.OutputFormatTypeJsonSchema,
+				Structure: &types.OutputFormatStructureMemberJsonSchema{
+					Value: types.JsonSchemaDefinition{Schema: aws.String(string(req.OutputSchema))},
+				},
+			},
+		}
+	}
+
 	cfg := &types.InferenceConfiguration{}
 	hasCfg := false
 	if req.MaxTokens > 0 {
@@ -279,6 +302,7 @@ func (c *Client) Converse(ctx context.Context, req *ConverseRequest) (*ConverseR
 		System:          p.system,
 		InferenceConfig: p.inferenceConfig,
 		ToolConfig:      p.toolConfig,
+		OutputConfig:    p.outputConfig,
 	})
 	if err != nil {
 		return nil, err
@@ -334,6 +358,7 @@ func (c *Client) ConverseStream(ctx context.Context, req *ConverseRequest, onChu
 		System:          p.system,
 		InferenceConfig: p.inferenceConfig,
 		ToolConfig:      p.toolConfig,
+		OutputConfig:    p.outputConfig,
 	})
 	if err != nil {
 		return nil, err

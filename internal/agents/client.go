@@ -93,6 +93,10 @@ type CreateAgentRequest struct {
 	SystemPrompt     string   `json:"system_prompt"`
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
 	Tools            []string `json:"tools,omitempty"`
+	// OutputSchema is a JSON Schema the assistant's reply must match; omit
+	// for prose. Forwarded verbatim — enact-main does not interpret it, the
+	// agent API validates it.
+	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
 }
 
 // do issues one JSON request and decodes the response. It maps 404 to

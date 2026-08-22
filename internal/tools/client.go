@@ -25,7 +25,13 @@ type ClientConfig struct {
 	// Timeout bounds each management call end to end. Tool calls through
 	// the MCP proxy use CallTimeout instead — tools may legitimately be
 	// slow.
-	Timeout time.Duration `env:"TOOL_REGISTRY_API_TIMEOUT, default=10s"`
+	//
+	// It MUST exceed the registry's own MCP_CONNECT_TIMEOUT (45s), because
+	// registering a server makes the registry probe it. At 10s this expired
+	// first, so a slow server produced a generic "failed to register" here
+	// while the registry was still probing — and the real failure, the one
+	// that says what is actually wrong, never reached the caller.
+	Timeout time.Duration `env:"TOOL_REGISTRY_API_TIMEOUT, default=60s"`
 	// CallTimeout bounds one MCP tool invocation through the proxy.
 	CallTimeout time.Duration `env:"TOOL_REGISTRY_CALL_TIMEOUT, default=60s"`
 }
@@ -174,8 +180,12 @@ func (c *Client) List(ctx context.Context, ids []string, owner string) ([]Server
 }
 
 // Get fetches one server by id. The boolean reports existence.
-func (c *Client) Get(ctx context.Context, id string) (Server, bool, error) {
-	servers, err := c.List(ctx, []string{id}, "")
+func (c *Client) Get(ctx context.Context, owner, id string) (Server, bool, error) {
+	// owner is passed through so the registry scopes the listing to that
+	// user's ORGANIZATION. Without it the same id matches in every
+	// organization that registered it — ids are unique per organization, not
+	// platform-wide — and this would return an arbitrary one.
+	servers, err := c.List(ctx, []string{id}, owner)
 	if err != nil {
 		return Server{}, false, err
 	}

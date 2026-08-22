@@ -40,7 +40,7 @@ func (a *MainAPI) kbWebService() *restful.WebService {
 	ws := new(restful.WebService)
 	ws.Path("/knowledge-bases").Produces(restful.MIME_JSON)
 	ws.Filter(a.csrfOriginFilter)
-	ws.Filter(a.requireSession)
+	ws.Filter(a.requireCaller)
 
 	ws.Route(ws.GET("").
 		To(a.listKBs).

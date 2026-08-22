@@ -208,6 +208,28 @@ type Handler func(ctx context.Context, msg DocumentMessage) error
 // pending list: stalled deliveries are claimed and retried, and messages that
 // have exhausted MaxDeliveries are dropped (see Consumer.Dropped).
 func (c *Consumer) Run(ctx context.Context, handler Handler) error {
+	return c.run(ctx, func(ctx context.Context, raw []byte) error {
+		var msg DocumentMessage
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			return errUnprocessable
+		}
+		return handler(ctx, msg)
+	})
+}
+
+// rawHandler processes one message's payload. Returning errUnprocessable
+// acknowledges it without retrying — a payload that cannot be decoded will
+// never decode, and retrying it forever only clogs the pending list.
+type rawHandler func(ctx context.Context, raw []byte) error
+
+// errUnprocessable marks a message that must be dropped rather than retried.
+var errUnprocessable = errors.New("queue: message cannot be decoded")
+
+// run is the consume loop, shared by every message type on every stream. It
+// deals only in raw payloads so that adding a second kind of work — workflow
+// executions alongside document indexing — reuses the reclaim, retry and
+// tracing behaviour instead of reimplementing it.
+func (c *Consumer) run(ctx context.Context, handle rawHandler) error {
 	if err := c.EnsureGroup(ctx); err != nil {
 		return err
 	}
@@ -219,7 +241,7 @@ func (c *Consumer) Run(ctx context.Context, handler Handler) error {
 		if now := time.Now(); now.After(nextReclaim) {
 			// Best-effort: a failed sweep is retried next tick, and hard
 			// connectivity problems surface through XReadGroup below.
-			c.reclaimPending(ctx, handler)
+			c.reclaimPending(ctx, handle)
 			nextReclaim = now.Add(c.reclaimInterval)
 		}
 		streams, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
@@ -237,7 +259,7 @@ func (c *Consumer) Run(ctx context.Context, handler Handler) error {
 		}
 		for _, st := range streams {
 			for _, m := range st.Messages {
-				c.dispatch(ctx, m, handler)
+				c.dispatch(ctx, m, handle)
 			}
 		}
 	}
@@ -249,7 +271,7 @@ func (c *Consumer) Run(ctx context.Context, handler Handler) error {
 // message whose processing can never succeed does not loop forever. Failed
 // retries reset a message's idle time, so it naturally waits another
 // ReclaimMinIdle before the next attempt.
-func (c *Consumer) reclaimPending(ctx context.Context, handler Handler) {
+func (c *Consumer) reclaimPending(ctx context.Context, handle rawHandler) {
 	pending, err := c.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 		Stream: c.stream,
 		Group:  c.group,
@@ -281,34 +303,40 @@ func (c *Consumer) reclaimPending(ctx context.Context, handler Handler) {
 			continue
 		}
 		for _, m := range claimed {
-			c.dispatch(ctx, m, handler)
+			c.dispatch(ctx, m, handle)
 		}
 	}
 }
 
-func (c *Consumer) dispatch(ctx context.Context, m redis.XMessage, handler Handler) {
+func (c *Consumer) dispatch(ctx context.Context, m redis.XMessage, handle rawHandler) {
 	raw, ok := m.Values["data"].(string)
 	if !ok {
 		// Unparseable payload: ack to avoid an infinite redelivery loop.
 		_ = c.rdb.XAck(ctx, c.stream, c.group, m.ID).Err()
 		return
 	}
-	var msg DocumentMessage
-	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
-		_ = c.rdb.XAck(ctx, c.stream, c.group, m.ID).Err()
-		return
-	}
-
 	// Continue the producer's trace: extract the context stamped into the
 	// message and process under a consumer span, so the handler's spans and
-	// log records correlate with the upload request that queued the work.
-	msgCtx := otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(msg.Trace))
+	// log records correlate with the request that queued the work. Only the
+	// trace envelope is decoded here — the rest of the payload belongs to
+	// whichever handler understands this stream.
+	var envelope struct {
+		Trace map[string]string `json:"trace,omitempty"`
+	}
+	_ = json.Unmarshal([]byte(raw), &envelope)
+
+	msgCtx := otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(envelope.Trace))
 	msgCtx, span := otel.Tracer(scopeName).Start(msgCtx, "consume "+c.stream,
 		trace.WithSpanKind(trace.SpanKindConsumer),
 	)
 	defer span.End()
 
-	if err := handler(msgCtx, msg); err != nil {
+	if err := handle(msgCtx, []byte(raw)); err != nil {
+		if errors.Is(err, errUnprocessable) {
+			// Undecodable: ack to avoid an infinite redelivery loop.
+			_ = c.rdb.XAck(ctx, c.stream, c.group, m.ID).Err()
+			return
+		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		// Leave the message pending for retry; do not ack.

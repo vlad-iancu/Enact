@@ -9,14 +9,12 @@ package enactmodelinference
 
 import (
 	"context"
-	"time"
 
 	restful "github.com/emicklei/go-restful/v3"
 
 	"enact/internal/agents"
 	"enact/internal/bedrock"
 	"enact/internal/extidentities"
-	"enact/internal/identityevents"
 	"enact/internal/kb"
 	"enact/internal/logging"
 	"enact/internal/opensearch"
@@ -44,21 +42,10 @@ type Config struct {
 	ToolRegistry   tools.ClientConfig
 	Identities     extidentities.ClientConfig
 	RBAC           rbac.ClientConfig
-	IdentityEvents identityevents.Config
 	S2S            s2s.Config
 	EmbeddingModel string `env:"BEDROCK_EMBEDDING_MODEL, default=amazon.titan-embed-text-v2:0"`
 	// MaxTurns caps the tool-execution rounds of one inference request.
 	MaxTurns int `env:"MAX_TURNS, default=10"`
-
-	// ToolAuthWaitTimeout bounds how long ONE turn may sit waiting for the
-	// user to connect the accounts its tools need.
-	ToolAuthWaitTimeout time.Duration `env:"TOOL_AUTH_WAIT_TIMEOUT, default=5m"`
-	// ToolAuthRecheckInterval is the safety net behind the pub/sub wake-up:
-	// a dropped notification costs one interval, not the whole wait.
-	ToolAuthRecheckInterval time.Duration `env:"TOOL_AUTH_RECHECK_INTERVAL, default=5s"`
-	// ToolAuthHeartbeatInterval re-announces a pending authorization, so the
-	// SSE connection stays warm and a late UI still learns what to ask for.
-	ToolAuthHeartbeatInterval time.Duration `env:"TOOL_AUTH_HEARTBEAT_INTERVAL, default=30s"`
 }
 
 // Build returns a service.Builder that constructs the inference web service
@@ -93,23 +80,13 @@ func Build(cfg *Config) service.Builder {
 		kbClient := kb.NewClient(cfg.KBAPI, s2sRuntime.Transport(nil, "enact-kb-api"))
 		toolsClient := tools.NewClient(cfg.ToolRegistry, s2sRuntime.Transport(nil, "enact-tool-registry"))
 		identitiesClient := extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities"))
-		waiters := newAuthWaiters()
-		toolAuth := &toolAuthorizer{
-			identities: identitiesClient,
-			waiters:    waiters,
-			recheck:    cfg.ToolAuthRecheckInterval,
-			heartbeat:  cfg.ToolAuthHeartbeatInterval,
-			waitFor:    cfg.ToolAuthWaitTimeout,
-			logger:     logger,
-		}
+		toolAuth := &toolAuthorizer{identities: identitiesClient, logger: logger}
 		logger.Info("inference api initialized",
 			"embedding_model", cfg.EmbeddingModel,
 			"agent_api", cfg.AgentAPI.BaseURL,
 			"kb_api", cfg.KBAPI.BaseURL,
 			"tool_registry", cfg.ToolRegistry.BaseURL,
 			"external_identities", cfg.Identities.BaseURL,
-			"tool_auth_wait_timeout", cfg.ToolAuthWaitTimeout,
-			"tool_auth_recheck", cfg.ToolAuthRecheckInterval,
 			"max_turns", cfg.MaxTurns,
 			"s2s_key_id", cfg.S2S.KeyID,
 		)
@@ -117,21 +94,6 @@ func Build(cfg *Config) service.Builder {
 		api := newInferenceAPI(client, agentClient, rags, kbClient, toolsClient, toolAuth,
 			rbac.NewEnforcer(rbacClient, cfg.RBAC), cfg.EmbeddingModel, cfg.MaxTurns, logger)
 
-		// Credentials landing in the identity service wake tool calls parked
-		// on them. A subscription failure must not stop this service: the
-		// waiters also re-check on a timer.
-		subscriber := identityevents.NewSubscriber(cfg.IdentityEvents)
-		go func() {
-			logger.Info("identity event subscriber started", "channel", subscriber.Channel())
-			err := subscriber.Run(ctx, func(_ context.Context, ev identityevents.Event) {
-				woken := waiters.Notify(waiterKey(ev.UserID, ev.Provider))
-				logger.Info("identity event received", "type", ev.Type, "user_id", ev.UserID,
-					"provider", ev.Provider, "woken", woken)
-			}, func(err error) {
-				logger.Warn("identity event subscription failed; retrying", "err", err)
-			})
-			logger.Info("identity event subscriber stopped", "err", err)
-		}()
 		ws := api.WebService()
 		if s2sRuntime.Enabled() {
 			ws.Filter(s2sRuntime.Filter)

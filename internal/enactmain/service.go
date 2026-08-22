@@ -30,6 +30,7 @@ import (
 	"enact/internal/ses"
 	"enact/internal/tools"
 	"enact/internal/users"
+	"enact/internal/workflows"
 )
 
 // Config wires the runtime, OpenSearch (user records), S2S, and the Google
@@ -47,6 +48,7 @@ type Config struct {
 	ToolRegistry  tools.ClientConfig
 	RBAC          rbac.ClientConfig
 	Identities    extidentities.ClientConfig
+	Workflows     workflows.ClientConfig
 	S2S           s2s.Config
 	Storage       s3.Config
 	CDN           cloudfront.Config
@@ -179,11 +181,28 @@ func Build(cfg *Config) service.Builder {
 		api.verificationTTL = cfg.VerificationTTL
 		api.publicBaseURL = strings.TrimRight(cfg.PublicBaseURL, "/")
 		api.adminEmail = users.NormalizeEmail(cfg.AdminEmail)
+		// Loaded before anything is served: a page missing its title heading
+		// is a mistake in content that ships with the binary, so it should
+		// stop the service here rather than quietly vanish from navigation.
+		pages, err := loadDocs()
+		if err != nil {
+			logger.Error("failed to load the documentation", "err", err)
+			return nil, err
+		}
+		api.docs = pages
+		logger.Info("documentation loaded", "pages", len(pages))
 		api.toolRegistry = tools.NewClient(cfg.ToolRegistry, s2sRuntime.Transport(nil, "enact-tool-registry"))
 		api.rbac = rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
 		api.identities = extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities"))
+		api.workflows = workflows.NewClient(cfg.Workflows, s2sRuntime.Transport(nil, "enact-workflows"))
 		services := api.WebServices()
 		if s2sRuntime.Enabled() {
+			// Appended LAST, and that matters: go-restful runs a WebService's
+			// filters in registration order, so requireCaller (attached inside
+			// WebServices) runs first and takes an API key out of the
+			// Authorization header before the S2S filter reads it. Register
+			// this earlier and every API key becomes "invalid service token" —
+			// see TestConsumeAPIKeyClearsAuthorization.
 			for _, ws := range services {
 				ws.Filter(s2sRuntime.Filter)
 			}

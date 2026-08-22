@@ -38,6 +38,9 @@ SERVICES=(
   enact-tool-registry
   enact-external-identities
   enact-rbac
+  enact-mcp-servers
+  enact-workflows
+  enact-workflow-runner
 )
 
 # Delve listen ports per service, index-aligned with SERVICES.
@@ -52,6 +55,9 @@ DEBUG_PORTS=(
   40008
   40009
   40010
+  40011
+  40012
+  40013
 )
 
 # assemble_private_keys emits a YAML document with every service's private

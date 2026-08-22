@@ -33,6 +33,9 @@ var services = []string{
 	"enact-tool-registry",
 	"enact-external-identities",
 	"enact-rbac",
+	"enact-mcp-servers",
+	"enact-workflows",
+	"enact-workflow-runner",
 }
 
 func main() {

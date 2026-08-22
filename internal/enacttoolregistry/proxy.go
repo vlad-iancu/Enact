@@ -31,7 +31,7 @@ func (a *RegistryAPI) proxyMCP(req *restful.Request, resp *restful.Response) {
 	if !ok {
 		return
 	}
-	a.forward(req, resp, server, server.URL, false)
+	a.forward(req, resp, server, a.dialURL(server.URL), false)
 }
 
 // proxySSE forwards the legacy SSE transport. The GET event stream carries
@@ -43,7 +43,7 @@ func (a *RegistryAPI) proxySSE(req *restful.Request, resp *restful.Response) {
 	if !ok {
 		return
 	}
-	a.forward(req, resp, server, server.URL, true)
+	a.forward(req, resp, server, a.dialURL(server.URL), true)
 }
 
 // proxySubpath forwards transport session paths (e.g. the message endpoint
@@ -54,7 +54,7 @@ func (a *RegistryAPI) proxySubpath(req *restful.Request, resp *restful.Response)
 	if !ok {
 		return
 	}
-	base, err := url.Parse(server.URL)
+	base, err := url.Parse(a.dialURL(server.URL))
 	if err != nil {
 		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "invalid stored server url")
 		return
@@ -186,7 +186,9 @@ func (a *RegistryAPI) relaySSE(w http.ResponseWriter, flusher http.Flusher, upst
 // /v1/servers/{id}/<path>?<query>, which proxySubpath forwards back to the
 // server's origin.
 func (a *RegistryAPI) rewriteEndpointURL(server tools.Server, raw string) (string, error) {
-	base, err := url.Parse(server.URL)
+	// Only the path of the result is used, but resolving keeps the rule
+	// "server.URL is never handed to a URL that will be dialled" intact.
+	base, err := url.Parse(a.dialURL(server.URL))
 	if err != nil {
 		return "", err
 	}

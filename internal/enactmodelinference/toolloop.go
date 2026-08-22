@@ -7,7 +7,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"enact/internal/bedrock"
 	"enact/internal/logging"
@@ -141,7 +140,7 @@ func (a *InferenceAPI) executeToolUses(ctx context.Context, logger *logging.Logg
 	// The announcement comes FIRST so a client can read the stream in
 	// arrival order. Per tool_use_id the sequence is always
 	//
-	//	toolCall → [toolCallWaitingAuthorization …] → toolCallResult
+	//	toolCall → [toolCallAuthorizationRequired] → toolCallResult
 	//
 	// Announcing after resolution would put a "waiting" before the "call"
 	// it refers to, and a UI rendering toolCall as "running" would show a
@@ -154,12 +153,7 @@ func (a *InferenceAPI) executeToolUses(ctx context.Context, logger *logging.Logg
 	if err := announceToolCalls(turn, bindings, uses, emit); err != nil {
 		return bedrock.Message{}, nil, err
 	}
-	// One deadline for the whole turn: N tools must not multiply how long a
-	// single request can hang. Computed BEFORE the announcements so each one
-	// states the time actually left, not the nominal window — for the second
-	// tool of a turn those differ.
-	turnDeadline := time.Now().Add(a.toolAuth.waitFor)
-	pending := a.resolveTurn(ctx, logger, bindings, uses, turnDeadline, emit)
+	pending := a.resolveTurn(ctx, logger, bindings, uses, emit)
 
 	for _, use := range uses {
 		binding, known := bindings[use.Name]
@@ -182,11 +176,6 @@ func (a *InferenceAPI) executeToolUses(ctx context.Context, logger *logging.Logg
 			var callOpts tools.CallOptions
 
 			if state, credentialed := pending[use.ID]; credentialed {
-				var err error
-				state, err = a.settleAuthorization(ctx, logger, binding, use, state, turnDeadline, emit)
-				if err != nil {
-					return bedrock.Message{}, nil, err
-				}
 				switch {
 				case state.Fatal != nil:
 					content = fmt.Sprintf("tool authorization failed: %v", state.Fatal)
@@ -194,7 +183,7 @@ func (a *InferenceAPI) executeToolUses(ctx context.Context, logger *logging.Logg
 				case len(state.Missing) > 0:
 					content = missingMessage(state.Missing)
 					isError = true
-					logger.Warn("tool call skipped: authorization not completed",
+					logger.Warn("tool call refused: credentials not connected",
 						"server_id", serverID, "tool", toolName, "missing", len(state.Missing))
 				default:
 					auth, _ := binding.Server.Authorization(binding.ToolName)
@@ -331,9 +320,12 @@ func announceToolCalls(turn int, bindings map[string]toolBinding, uses []bedrock
 }
 
 // resolveTurn resolves credentials for every tool in the turn that declares
-// requirements, and announces the ones that cannot proceed yet. Tools
-// without requirements never reach the identity service at all.
-func (a *InferenceAPI) resolveTurn(ctx context.Context, logger *logging.Logger, bindings map[string]toolBinding, uses []bedrock.ToolUse, deadline time.Time, emit func(event string, payload any) error) map[string]resolved {
+// requirements, and announces the ones that cannot run. Tools without
+// requirements never reach the identity service at all.
+//
+// A call whose credentials are missing FAILS — it is not parked. The event
+// tells the UI exactly what to connect so the user can act and ask again.
+func (a *InferenceAPI) resolveTurn(ctx context.Context, logger *logging.Logger, bindings map[string]toolBinding, uses []bedrock.ToolUse, emit func(event string, payload any) error) map[string]resolved {
 	pending := map[string]resolved{}
 	for _, use := range uses {
 		binding, known := bindings[use.Name]
@@ -342,43 +334,19 @@ func (a *InferenceAPI) resolveTurn(ctx context.Context, logger *logging.Logger, 
 		}
 		state := a.toolAuth.resolve(ctx, logger, binding.Server, binding.ToolName)
 		pending[use.ID] = state
-		// Announce every unmet call before executing any of them, so the UI
-		// can render all the "connect" prompts at once. This is the ONLY
-		// opening announcement a waiting call gets — the wait loop adds
-		// heartbeats, not a second identical event.
+		// Announce every unmet call before executing any of them, so a turn
+		// needing two accounts renders both "connect" prompts at once rather
+		// than one per attempt.
 		if emit != nil && state.Fatal == nil && len(state.Missing) > 0 {
-			_ = emit("toolCallWaitingAuthorization", toolCallWaitingAuthorizationEvent{
-				ServerID:    binding.Server.ID,
-				Tool:        binding.ToolName,
-				ToolUseID:   use.ID,
-				Status:      waitStatusWaiting,
-				Missing:     state.Missing,
-				WaitSeconds: int(time.Until(deadline).Seconds()),
+			_ = emit("toolCallAuthorizationRequired", toolCallAuthorizationRequiredEvent{
+				ServerID:  binding.Server.ID,
+				Tool:      binding.ToolName,
+				ToolUseID: use.ID,
+				Missing:   state.Missing,
 			})
 		}
 	}
 	return pending
-}
-
-// settleAuthorization waits for a call's missing credentials when there is
-// a stream to tell the user through. Without one (the non-streaming path)
-// it returns immediately: a silent multi-minute stall with no way to say
-// what is missing is worse than an honest error.
-func (a *InferenceAPI) settleAuthorization(ctx context.Context, logger *logging.Logger, binding toolBinding, use bedrock.ToolUse, state resolved, deadline time.Time, emit func(event string, payload any) error) (resolved, error) {
-	if state.Fatal != nil || len(state.Missing) == 0 {
-		return state, nil
-	}
-	if emit == nil {
-		logger.Warn("authorization required but the response is not streaming; not waiting",
-			"server_id", binding.Server.ID, "tool", binding.ToolName, "missing", len(state.Missing))
-		return state, nil
-	}
-	settled, err := a.toolAuth.waitForAuthorization(ctx, logger, binding.Server, binding.ToolName, use.ID, state, deadline, emit)
-	if err != nil {
-		// A write failure or a cancelled request ends the whole stream.
-		return settled, err
-	}
-	return settled, nil
 }
 
 // expandToolHistory rewrites the conversation the model is given so that a

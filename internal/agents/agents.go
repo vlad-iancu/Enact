@@ -37,9 +37,18 @@ type Agent struct {
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
 	// Tools names the MCP servers (by registry id) whose tools this agent
 	// may call during inference.
-	Tools     []string  `json:"tools"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Tools []string `json:"tools"`
+	// OutputSchema constrains the assistant's own reply to JSON matching this
+	// JSON Schema, via Bedrock's structured output. Absent — the default —
+	// means ordinary prose.
+	//
+	// Stored as raw JSON and passed to Bedrock verbatim: it is the caller's
+	// schema, and reserializing it through a Go type would silently drop the
+	// keywords we do not model. The agent API checks it is a JSON object and
+	// bounds its size; what the keywords mean is Bedrock's business.
+	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
 }
 
 // Repository persists agent records in OpenSearch.

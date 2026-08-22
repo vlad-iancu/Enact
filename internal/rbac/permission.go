@@ -28,8 +28,12 @@ const (
 
 // Resource types. A permission's second segment.
 const (
-	ResourceKB           = "kb"
-	ResourceAgent        = "agent"
+	ResourceKB    = "kb"
+	ResourceAgent = "agent"
+	// ResourceWorkflow is a workflow definition. "use" means execute it —
+	// distinct from "view", because being able to read a chain of agent steps
+	// is not the same as being able to spend model calls running it.
+	ResourceWorkflow     = "workflow"
 	ResourceMCPServer    = "mcp-server"
 	ResourceProvider     = "provider"
 	ResourceIdentity     = "identity"
