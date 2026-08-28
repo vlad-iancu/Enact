@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 
 	"enact/internal/agents"
+	"enact/internal/extidentities"
+	"enact/internal/files"
 	"enact/internal/identity"
 	"enact/internal/logging"
 	"enact/internal/queue"
@@ -31,26 +33,50 @@ type WorkflowAPI struct {
 	// agents validates that a step's agent exists and is visible to the
 	// caller, asking the service that owns that domain rather than reading its
 	// storage.
-	agents   *agents.Client
-	producer *queue.Producer
-	rbac     *rbac.Client
-	enforcer *rbac.Enforcer
-	logger   *logging.Logger
+	agents *agents.Client
+	// identities validates the providers a step draws credentials from, asking
+	// the service that owns that domain.
+	identities *extidentities.Client
+	producer   *queue.Producer
+	rbac       *rbac.Client
+	enforcer   *rbac.Enforcer
+	// files holds what a workflow's runs produced. This service never reads
+	// them — the runner writes and enact-main serves — but it owns deleting a
+	// workflow, and a delete that left its files behind would leak storage
+	// nothing can reach.
+	files  files.Store
+	logger *logging.Logger
 }
 
 func newWorkflowAPI(repo *workflows.Repository, executions *workflows.ExecutionRepository,
-	agentClient *agents.Client, producer *queue.Producer,
-	rbacClient *rbac.Client, enforcer *rbac.Enforcer, logger *logging.Logger) *WorkflowAPI {
+	agentClient *agents.Client, identitiesClient *extidentities.Client, producer *queue.Producer,
+	rbacClient *rbac.Client, enforcer *rbac.Enforcer, fileStore files.Store,
+	logger *logging.Logger) *WorkflowAPI {
 	return &WorkflowAPI{
-		repo: repo, executions: executions, agents: agentClient, producer: producer,
-		rbac: rbacClient, enforcer: enforcer, logger: logger,
+		repo: repo, executions: executions, agents: agentClient, identities: identitiesClient, producer: producer,
+		rbac: rbacClient, enforcer: enforcer, files: fileStore, logger: logger,
 	}
 }
 
 type saveRequest struct {
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
+	Name string `json:"name"`
+	// Description is a pointer so an update can tell "not mentioned" from
+	// "set to nothing". As a plain string the two are the same value, which
+	// made a description impossible to remove: every empty one read as
+	// "leave it alone", so the old text stayed and the caller was told the
+	// save succeeded.
+	Description *string          `json:"description"`
+	InputSchema json.RawMessage  `json:"input_schema"`
 	Steps       []workflows.Step `json:"steps"`
+}
+
+// description reads the field for a create, where absent and empty mean the
+// same thing.
+func (r saveRequest) description() string {
+	if r.Description == nil {
+		return ""
+	}
+	return strings.TrimSpace(*r.Description)
 }
 
 type triggerRequest struct {
@@ -117,6 +143,13 @@ func (a *WorkflowAPI) WebService() *restful.WebService {
 		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
+	ws.Route(ws.GET("/workflows/{id}/shapes").
+		To(a.shapes).
+		Param(ws.PathParameter("id", "workflow id")).
+		Doc("Resolved input and output shapes per step: an agent step's from its agent, a code step's from its own declaration, plus the context schema each step receives (for editor completion on ctx)").
+		Returns(http.StatusOK, "OK", workflows.Shapes{}).
+		Returns(http.StatusNotFound, "Not found", errorResponse{}))
+
 	ws.Route(ws.GET("/workflows/{id}/executions").
 		To(a.listExecutions).
 		Param(ws.PathParameter("id", "workflow id")).
@@ -156,9 +189,37 @@ func (a *WorkflowAPI) validate(req *restful.Request, logger *logging.Logger, bod
 	if strings.TrimSpace(body.Name) == "" {
 		return "name is required", false
 	}
+	// Compiled here because it is enforced on every trigger: a schema that
+	// cannot compile would refuse every run.
+	if _, err := workflows.CompileSchema(body.InputSchema); err != nil {
+		logger.Warn("workflow input schema rejected", "err", err)
+		return fmt.Sprintf("invalid input_schema: %s", err), false
+	}
 	if msg, ok := workflows.ValidateSteps(body.Steps); !ok {
 		logger.Warn("workflow validation failed", "reason", msg)
 		return msg, false
+	}
+	// A provider that does not exist is a step that can only ever fail, and
+	// the failure would land mid-run — so it is refused here, where the author
+	// can still fix it. Whether the RUNNING user has connected an account at
+	// that provider is deliberately not checked: that is per-person and
+	// per-run, and a workflow is authored once for everybody.
+	if providers := workflows.Providers(body.Steps); len(providers) > 0 {
+		known, err := a.identities.Providers(req.Request.Context())
+		if err != nil {
+			logger.Error("failed to validate providers", "err", err)
+			return "failed to validate the providers this workflow references", false
+		}
+		names := make(map[string]bool, len(known))
+		for _, p := range known {
+			names[p.Name] = true
+		}
+		for _, provider := range providers {
+			if !names[provider] {
+				logger.Warn("workflow references a missing provider", "provider", provider)
+				return fmt.Sprintf("provider %q not found; connect it under Accounts first", provider), false
+			}
+		}
 	}
 	for _, agentID := range workflows.AgentIDs(body.Steps) {
 		_, found, err := a.agents.Get(req.Request.Context(), agentID)
@@ -202,7 +263,8 @@ func (a *WorkflowAPI) create(req *restful.Request, resp *restful.Response) {
 		UserID:         userID,
 		OrganizationID: organizationID,
 		Name:           strings.TrimSpace(body.Name),
-		Description:    body.Description,
+		Description:    body.description(),
+		InputSchema:    body.InputSchema,
 		Steps:          withStepIDs(body.Steps),
 		CreatedAt:      now,
 		UpdatedAt:      now,
@@ -317,7 +379,11 @@ func (a *WorkflowAPI) update(req *restful.Request, resp *restful.Response) {
 	// update of position 3 in a list the client last saw differently would
 	// silently rewire the wrong step.
 	if body.Steps != nil {
-		if msg, valid := a.validate(req, logger, saveRequest{Name: firstNonEmpty(body.Name, existing.Name), Steps: body.Steps}); !valid {
+		if msg, valid := a.validate(req, logger, saveRequest{
+			Name:        firstNonEmpty(body.Name, existing.Name),
+			InputSchema: firstNonEmptyRaw(body.InputSchema, existing.InputSchema),
+			Steps:       body.Steps,
+		}); !valid {
 			writeError(req, resp, http.StatusBadRequest, msg)
 			return
 		}
@@ -326,8 +392,20 @@ func (a *WorkflowAPI) update(req *restful.Request, resp *restful.Response) {
 	if name := strings.TrimSpace(body.Name); name != "" {
 		existing.Name = name
 	}
-	if body.Description != "" {
-		existing.Description = body.Description
+	// Provided at all means provided: an empty one clears the description
+	// rather than being ignored.
+	if body.Description != nil {
+		existing.Description = body.description()
+	}
+	if body.InputSchema != nil {
+		// {} clears it, as with an agent's output_schema: null is
+		// indistinguishable from an absent field, and a schema constraining
+		// nothing is indistinguishable from having none.
+		if isEmptyJSONObject(body.InputSchema) {
+			existing.InputSchema = nil
+		} else {
+			existing.InputSchema = body.InputSchema
+		}
 	}
 	existing.UpdatedAt = time.Now().UTC()
 	if err := a.repo.Update(req.Request.Context(), existing); err != nil {
@@ -359,6 +437,19 @@ func (a *WorkflowAPI) delete(req *restful.Request, resp *restful.Response) {
 		writeError(req, resp, http.StatusInternalServerError, "failed to delete the workflow's executions")
 		return
 	}
+	// The files of every run, and anything a run chose to keep. Logged rather
+	// than surfaced: the workflow record is already gone, so a retry stops at
+	// the permission check above and never reaches this line — a 500 here
+	// would report a failure the caller cannot act on. What is left behind is
+	// unreachable, since the only references to it lived in the executions
+	// just deleted, so this is wasted disk for an operator to notice rather
+	// than data anyone can still read.
+	if a.files != nil {
+		if err := a.files.DeleteWorkflow(req.Request.Context(), workflow.ID); err != nil {
+			logger.Error("failed to delete the workflow's files; they are now unreachable and must be swept",
+				"err", err, "workflow_id", workflow.ID)
+		}
+	}
 	logger.Info("workflow deleted")
 	resp.WriteHeader(http.StatusNoContent)
 }
@@ -386,6 +477,13 @@ func (a *WorkflowAPI) trigger(req *restful.Request, resp *restful.Response) {
 	if len(body.Input) > maxInputBytes {
 		writeError(req, resp, http.StatusBadRequest,
 			fmt.Sprintf("input is %d bytes; the limit is %d", len(body.Input), maxInputBytes))
+		return
+	}
+	// Checked before anything is queued, so a malformed payload is refused
+	// here rather than failing three steps and several model calls later.
+	if err := workflows.ValidateAgainst(workflow.InputSchema, body.Input); err != nil {
+		logger.Warn("trigger input does not match the workflow's input schema", "err", err)
+		writeError(req, resp, http.StatusBadRequest, fmt.Sprintf("input does not match this workflow's input schema: %s", err))
 		return
 	}
 
@@ -426,6 +524,47 @@ func (a *WorkflowAPI) trigger(req *restful.Request, resp *restful.Response) {
 	}
 	logger.Info("workflow execution queued", "execution_id", execution.ID, "steps", len(execution.Steps))
 	requesthelper.WriteJSON(req, resp, http.StatusAccepted, execution)
+}
+
+// shapes resolves what every step produces and receives.
+//
+// The agents are fetched here rather than in the domain package so the
+// resolution rules stay a pure function; and they are fetched AS THE CALLER,
+// so a workflow referencing an agent this user cannot see resolves to prose
+// rather than leaking that agent's schema.
+func (a *WorkflowAPI) shapes(req *restful.Request, resp *restful.Response) {
+	logger := requesthelper.Logger(req, a.logger).WithFields("workflow_id", req.PathParameter("id"))
+	logger.Info("workflow shapes requested")
+	workflow, ok := a.load(req, resp, logger, rbac.ActionView)
+	if !ok {
+		return
+	}
+
+	// One call per DISTINCT agent, not per step: a workflow that uses the
+	// same agent three times should cost one lookup.
+	agentSchemas := map[string]json.RawMessage{}
+	for _, agentID := range workflows.AgentIDs(workflow.Steps) {
+		agent, found, err := a.agents.Get(req.Request.Context(), agentID)
+		if err != nil {
+			// A shapes response is an editor aid, not the workflow itself. An
+			// agent that cannot be read degrades that one step to prose rather
+			// than failing the whole response.
+			logger.Warn("could not resolve an agent's output schema", "agent_id", agentID, "err", err)
+			continue
+		}
+		if found && len(agent.OutputSchema) > 0 {
+			agentSchemas[agentID] = agent.OutputSchema
+		}
+	}
+
+	resolved, err := workflows.ResolveShapes(workflow, agentSchemas)
+	if err != nil {
+		logger.Error("failed to resolve shapes", "err", err)
+		writeError(req, resp, http.StatusInternalServerError, "failed to resolve the workflow's shapes")
+		return
+	}
+	logger.Info("workflow shapes resolved", "steps", len(resolved.Steps), "agents_resolved", len(agentSchemas))
+	requesthelper.WriteJSON(req, resp, http.StatusOK, resolved)
 }
 
 func (a *WorkflowAPI) listExecutions(req *restful.Request, resp *restful.Response) {
@@ -490,6 +629,25 @@ func withStepIDs(steps []workflows.Step) []workflows.Step {
 		out = append(out, step)
 	}
 	return out
+}
+
+// isEmptyJSONObject reports whether raw is {} — the sentinel that clears a
+// schema on a partial update.
+func isEmptyJSONObject(raw json.RawMessage) bool {
+	var doc map[string]json.RawMessage
+	return json.Unmarshal(raw, &doc) == nil && len(doc) == 0
+}
+
+// firstNonEmptyRaw picks the incoming schema when one was supplied, else the
+// stored one — so validating an update does not reject a workflow because the
+// request omitted a schema it already has.
+func firstNonEmptyRaw(values ...json.RawMessage) json.RawMessage {
+	for _, v := range values {
+		if len(v) > 0 && !isEmptyJSONObject(v) {
+			return v
+		}
+	}
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {

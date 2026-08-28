@@ -3,6 +3,8 @@ package workflows
 import (
 	"fmt"
 	"regexp"
+
+	"enact/internal/inference"
 )
 
 // MaxSteps bounds a workflow's length.
@@ -66,6 +68,26 @@ func ValidateSteps(steps []Step) (string, bool) {
 			if err := ParsePrompt(step.Name, step.Prompt); err != nil {
 				return err.Error(), false
 			}
+			// An agent step's output shape comes from the agent, so declaring
+			// one here would create a second copy of the same contract — and
+			// the two would drift the first time somebody edited the agent.
+			if len(step.OutputSchema) > 0 {
+				return fmt.Sprintf(
+					"%s (%s) declares an output_schema, but an agent step takes its output shape from the agent itself; set the schema on agent %q instead",
+					position, step.Name, step.AgentID), false
+			}
+			// More attachments than the model will accept is a workflow that
+			// cannot run, so it is refused at save time rather than several
+			// minutes into a run.
+			if len(step.Attach) > inference.MaxContextFiles {
+				return fmt.Sprintf("%s (%s) attaches %d files; a step may attach at most %d",
+					position, step.Name, len(step.Attach), inference.MaxContextFiles), false
+			}
+			for _, path := range step.Attach {
+				if msg, ok := ValidateAttachPath(path); !ok {
+					return fmt.Sprintf("%s (%s): %s", position, step.Name, msg), false
+				}
+			}
 		case StepTypeCode:
 			if step.Code == "" {
 				return fmt.Sprintf("%s (%s) is a code step but has no code", position, step.Name), false
@@ -77,9 +99,31 @@ func ValidateSteps(steps []Step) (string, bool) {
 			if step.AgentID != "" || step.Prompt != "" {
 				return fmt.Sprintf("%s (%s) is a code step but also names an agent or a prompt", position, step.Name), false
 			}
+			// Attachments go to a model. A code step has none, and cannot
+			// read a file's bytes in any case: goja has no I/O.
+			if len(step.Attach) > 0 {
+				return fmt.Sprintf("%s (%s) is a code step but attaches files; only an agent step sends files to a model",
+					position, step.Name), false
+			}
+			// Parsed, not run: a syntax error is caught here rather than
+			// mid-execution, the same way a broken prompt template is.
+			if err := ParseCode(step.Name, step.Code); err != nil {
+				return err.Error(), false
+			}
+			// Compiled at save time, because it is enforced at run time: a
+			// schema that cannot compile would fail every execution.
+			if _, err := CompileSchema(step.OutputSchema); err != nil {
+				return fmt.Sprintf("%s (%s) has an invalid output_schema: %s", position, step.Name, err), false
+			}
 		default:
-			return fmt.Sprintf("%s (%s) has type %q; expected %q or %q",
-				position, step.Name, step.Type, StepTypeAgent, StepTypeCode), false
+			if IsGoogleStep(step.Type) {
+				if msg, ok := validateGoogleStep(position, step); !ok {
+					return msg, false
+				}
+				break
+			}
+			return fmt.Sprintf("%s (%s) has type %q; expected %q, %q, or one of %s",
+				position, step.Name, step.Type, StepTypeAgent, StepTypeCode, GoogleStepTypes()), false
 		}
 	}
 	return "", true
@@ -96,6 +140,22 @@ func AgentIDs(steps []Step) []string {
 		}
 		seen[step.AgentID] = true
 		out = append(out, step.AgentID)
+	}
+	return out
+}
+
+// Providers returns the distinct providers a workflow's steps draw
+// credentials from, for the caller that validates them against the identities
+// service.
+func Providers(steps []Step) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(steps))
+	for _, step := range steps {
+		if step.Provider == "" || seen[step.Provider] {
+			continue
+		}
+		seen[step.Provider] = true
+		out = append(out, step.Provider)
 	}
 	return out
 }

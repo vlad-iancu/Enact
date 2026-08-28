@@ -31,6 +31,24 @@ const (
 // contract — one input, one return — visible in the code itself.
 const entrypoint = "run"
 
+// ParseCode checks that a code step is syntactically valid JavaScript,
+// without running any of it.
+//
+// goja.Compile parses and compiles; it never executes, so this is safe to do
+// on the API host at save time — which is the point. Without it, a stray
+// bracket saves cleanly and only fails when the run reaches that step, minutes
+// and several model calls later. It also means an editor's red squiggle and
+// what the backend accepts are the same judgement.
+//
+// The message keeps goja's line and column, so a client can place a marker
+// rather than just showing a sentence.
+func ParseCode(name, source string) error {
+	if _, err := goja.Compile(name, source, true); err != nil {
+		return fmt.Errorf("step %q has invalid JavaScript: %w", name, err)
+	}
+	return nil
+}
+
 // RunCode evaluates a code step against the step context and returns its
 // output as JSON.
 //
@@ -85,7 +103,10 @@ func RunCode(source string, ctx Context, timeout time.Duration) (json.RawMessage
 		return nil, codeError("run", err)
 	}
 
-	exported := value.Export()
+	exported, err := settle(value.Export())
+	if err != nil {
+		return nil, err
+	}
 	// undefined exports as nil, which marshals to null — a step that returns
 	// nothing produces null rather than failing. Later steps then see null,
 	// which is honest.
@@ -97,6 +118,36 @@ func RunCode(source string, ctx Context, timeout time.Duration) (json.RawMessage
 		return nil, fmt.Errorf("returned %d bytes; the limit is %d", len(out), MaxCodeOutputBytes)
 	}
 	return out, nil
+}
+
+// settle unwraps a Promise returned by run into the value it carries.
+//
+// Marking a function `async` is a reflex for anyone who writes JavaScript, and
+// without this it silently destroys the result: an async function returns a
+// Promise, which marshals to {} — the step "succeeds", stores an empty object,
+// and the next step is handed nothing with no indication anything went wrong.
+//
+// A promise that is already settled is honoured, so the common accidental case
+// (an async function that awaits nothing) simply works. One that is still
+// pending never can be: goja has no event loop — no timers, no I/O — so
+// nothing exists to settle it later, and saying so is far more useful than
+// returning an empty object or hanging until the interrupt.
+func settle(exported any) (any, error) {
+	promise, ok := exported.(*goja.Promise)
+	if !ok {
+		return exported, nil
+	}
+	switch promise.State() {
+	case goja.PromiseStateFulfilled:
+		return promise.Result().Export(), nil
+	case goja.PromiseStateRejected:
+		// The same outcome as throwing, because that is what it is.
+		return nil, fmt.Errorf("run: %v", promise.Result())
+	default:
+		return nil, fmt.Errorf(
+			"run returned a pending Promise, which can never settle here: a code step has no event loop, " +
+				"so there are no timers and no I/O to await. Return the value directly instead of awaiting it")
+	}
 }
 
 // codeError unwraps goja's error types into something a workflow author can

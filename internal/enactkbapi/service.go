@@ -53,6 +53,11 @@ func Build(cfg *Config) service.Builder {
 			return nil, err
 		}
 		documents := kb.NewDocumentRepository(osClient, cfg.KB)
+		chunks := kb.NewChunkRepository(osClient, cfg.KB)
+		if err := chunks.EnsureIndex(ctx); err != nil {
+			logger.Error("failed to verify the knowledge-base chunk index", "err", err)
+			return nil, err
+		}
 		if err := documents.EnsureIndex(ctx); err != nil {
 			logger.Error("failed to verify kb documents index", "err", err)
 			return nil, err
@@ -68,7 +73,7 @@ func Build(cfg *Config) service.Builder {
 		// signed service caller, not only through enact-main.
 		rbacClient := rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
 		enforcer := rbac.NewEnforcer(rbacClient, cfg.RBAC)
-		ws := newKBAPI(kbs, documents, producer, rbacClient, enforcer, logger).WebService()
+		ws := newKBAPI(kbs, documents, chunks, producer, rbacClient, enforcer, logger).WebService()
 		if s2sRuntime.Enabled() {
 			ws.Filter(s2sRuntime.Filter)
 		}

@@ -44,7 +44,9 @@ func NewClient(cfg ClientConfig, base http.RoundTripper) *Client {
 type SaveRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
-	Steps       []Step `json:"steps"`
+	// InputSchema declares the trigger payload; enforced when a run starts.
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	Steps       []Step          `json:"steps"`
 }
 
 // TriggerRequest starts an execution. Input is the trigger payload, reachable
@@ -167,6 +169,14 @@ func (c *Client) ListExecutions(ctx context.Context, workflowID string, limit in
 	}
 	found, err := c.do(ctx, http.MethodGet, endpoint, nil, http.StatusOK, &out)
 	return out.Executions, found, err
+}
+
+// GetShapes returns the workflow's resolved per-step shapes.
+func (c *Client) GetShapes(ctx context.Context, workflowID string) (Shapes, bool, error) {
+	var out Shapes
+	found, err := c.do(ctx, http.MethodGet,
+		c.baseURL+"/v1/workflows/"+url.PathEscape(workflowID)+"/shapes", nil, http.StatusOK, &out)
+	return out, found, err
 }
 
 func (c *Client) GetExecution(ctx context.Context, id string) (Execution, bool, error) {

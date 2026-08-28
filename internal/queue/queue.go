@@ -62,24 +62,30 @@ const (
 	// indexer extracts its text and stores it whole; agents referencing the
 	// KB load it into the model context at inference time.
 	DocumentTypeKBContext DocumentType = "kb_context"
-	// DocumentTypeAgentRAG is a document uploaded to an agent's RAG
-	// configuration. The indexer extracts, chunks, and embeds it into the
-	// agent's vector collection for retrieval at inference time.
-	DocumentTypeAgentRAG DocumentType = "agent_rag"
+	// DocumentTypeKBRetrieval is a document uploaded to a RETRIEVAL knowledge
+	// base. The indexer extracts, chunks and embeds it, and an agent attached
+	// to that KB gets the relevant passages at inference time.
+	//
+	// The value is unchanged from when these collections belonged to an agent,
+	// so a message already on the stream when this shipped still dispatches.
+	DocumentTypeKBRetrieval DocumentType = "agent_rag"
 
 	// DocumentTypeKBContextDelete asks the indexer to remove one context
 	// document from its knowledge base. Content is empty on these messages;
 	// KBID and DocumentID identify the target.
 	DocumentTypeKBContextDelete DocumentType = "kb_context_delete"
-	// DocumentTypeAgentRAGDelete asks the indexer to remove one document's
-	// chunks from an agent's RAG collection. Content is empty; AgentID and
+	// DocumentTypeKBRetrievalDelete asks the indexer to remove one document's
+	// chunks from a retrieval knowledge base. Content is empty; KBID and
 	// DocumentID identify the target.
-	DocumentTypeAgentRAGDelete DocumentType = "agent_rag_delete"
+	DocumentTypeKBRetrievalDelete DocumentType = "agent_rag_delete"
 )
 
 // DocumentMessage is the payload pushed onto the queue for each uploaded
-// document awaiting indexing. KBID is set for kb_context documents, AgentID
-// for agent_rag documents.
+// document awaiting indexing.
+//
+// KBID identifies the target for BOTH kinds now that retrieval collections
+// belong to knowledge bases rather than to agents. AgentID remains only so a
+// message queued before that change still carries what it carried.
 //
 // Content carries the document's raw bytes base64-encoded (StdEncoding). The
 // bytes are encoded because a message travels as JSON, which requires valid
@@ -87,13 +93,25 @@ const (
 // indexer base64-decodes Content and hands the bytes to Tika for text
 // extraction.
 type DocumentMessage struct {
-	Type       DocumentType `json:"type"`
-	UserID     string       `json:"user_id"`
-	KBID       string       `json:"kb_id,omitempty"`
-	AgentID    string       `json:"agent_id,omitempty"`
-	DocumentID string       `json:"document_id"`
-	Filename   string       `json:"filename,omitempty"`
-	Content    string       `json:"content"`
+	Type   DocumentType `json:"type"`
+	UserID string       `json:"user_id"`
+	KBID   string       `json:"kb_id,omitempty"`
+	// AgentID is legacy: retrieval documents used to be addressed by agent.
+	AgentID    string `json:"agent_id,omitempty"`
+	DocumentID string `json:"document_id"`
+	Filename   string `json:"filename,omitempty"`
+	Content    string `json:"content"`
+	// ChunkSize and ChunkOverlap carry the knowledge base's chunking to the
+	// indexer, in runes, so a document is split the way its KB was created to
+	// split it. Zero means the indexer applies its own configured default —
+	// the case for context documents (nothing to chunk) and for retrieval
+	// knowledge bases that predate this field.
+	//
+	// Copied onto the message rather than looked up by the indexer: the
+	// message is what gets retried, and re-reading the KB later could apply a
+	// different setting to a redelivery than to the first attempt.
+	ChunkSize    int `json:"chunk_size,omitempty"`
+	ChunkOverlap int `json:"chunk_overlap,omitempty"`
 
 	// Trace carries the W3C trace context (traceparent/tracestate/baggage)
 	// of the request that published the message, so the consumer's async

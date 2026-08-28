@@ -29,9 +29,23 @@ type listKBsResponse struct {
 	KnowledgeBases []kbListItem `json:"knowledge_bases"`
 }
 
-// createKBRequest names the knowledge base being created.
+// createKBRequest names the knowledge base being created and says what kind
+// it is; an absent kind means "context", the behaviour every knowledge base
+// had before kinds existed.
 type createKBRequest struct {
 	Name string `json:"name"`
+	Kind string `json:"kind"`
+	// ChunkSize and ChunkOverlap tune a retrieval KB's document splitting, in
+	// runes, and can only be set here — creation. Absent takes the platform
+	// default; the KB service validates and refuses them on a context KB.
+	ChunkSize    *int `json:"chunk_size,omitempty"`
+	ChunkOverlap *int `json:"chunk_overlap,omitempty"`
+}
+
+// queuedDeletionResponse acknowledges an asynchronous document deletion.
+type queuedDeletionResponse struct {
+	DocumentID string `json:"document_id"`
+	Status     string `json:"status"`
 }
 
 // kbWebService returns the session-guarded knowledge-base routes: the UI's
@@ -134,9 +148,15 @@ func (a *MainAPI) createKB(req *restful.Request, resp *restful.Response) {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v", err))
 		return
 	}
-	logger.Info("create request decoded", "name", body.Name)
+	logger.Info("create request decoded", "name", body.Name, "kind", body.Kind,
+		"chunk_size", body.ChunkSize, "chunk_overlap", body.ChunkOverlap)
 
-	record, err := a.kb.Create(req.Request.Context(), body.Name)
+	record, err := a.kb.Create(req.Request.Context(), kb.CreateRequest{
+		Name:         body.Name,
+		Kind:         body.Kind,
+		ChunkSize:    body.ChunkSize,
+		ChunkOverlap: body.ChunkOverlap,
+	})
 	if err != nil {
 		logger.Warn("knowledge base creation failed", "err", err)
 		relayAgentErr(req, resp, err, "create knowledge base")

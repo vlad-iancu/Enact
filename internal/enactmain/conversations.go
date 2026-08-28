@@ -39,10 +39,17 @@ type updateConversationRequest struct {
 // selects what answers it — chosen per message, because conversations are
 // deliberately not bound to either.
 type addMessageRequest struct {
-	Content       string `json:"content"`
-	AgentID       string `json:"agent_id,omitempty"`
-	Model         string `json:"model,omitempty"`
-	RetrievalTopK *int   `json:"retrieval_top_k,omitempty"`
+	Content string `json:"content"`
+	AgentID string `json:"agent_id,omitempty"`
+	Model   string `json:"model,omitempty"`
+	// Temperature and TopP tune this turn's sampling, and like the agent
+	// choice they are per message rather than per conversation: a thread can
+	// ask for something creative and then something exact. Nothing about them
+	// is persisted on the message — replaying the conversation later replays
+	// the text, not the settings that produced it.
+	Temperature   *float32 `json:"temperature,omitempty"`
+	TopP          *float32 `json:"top_p,omitempty"`
+	RetrievalTopK *int     `json:"retrieval_top_k,omitempty"`
 	// ContextFiles are forwarded to the inference service, which passes
 	// them to the model natively (Bedrock DocumentBlocks) for THIS turn.
 	// Only their filenames are persisted on the message.
@@ -339,7 +346,9 @@ func (a *MainAPI) addMessage(req *restful.Request, resp *restful.Response) {
 	for _, f := range body.ContextFiles {
 		attachmentNames = append(attachmentNames, f.Filename)
 	}
-	logger.Info("message decoded", "content_chars", len(body.Content), "agent_id", body.AgentID, "model", body.Model, "retrieval_top_k", body.RetrievalTopK, "attachments", attachmentNames)
+	logger.Info("message decoded", "content_chars", len(body.Content), "agent_id", body.AgentID, "model", body.Model,
+		"retrieval_top_k", body.RetrievalTopK, "temperature", body.Temperature, "top_p", body.TopP,
+		"attachments", attachmentNames)
 
 	if strings.TrimSpace(body.Content) == "" {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, "content must not be empty")
@@ -388,6 +397,8 @@ func (a *MainAPI) addMessage(req *restful.Request, resp *restful.Response) {
 	infReq := inference.Request{
 		AgentID:       body.AgentID,
 		Model:         body.Model,
+		Temperature:   body.Temperature,
+		TopP:          body.TopP,
 		RetrievalTopK: body.RetrievalTopK,
 		// Files attach to the last user message downstream — the one just
 		// appended. Only this turn carries them; history replays never do.

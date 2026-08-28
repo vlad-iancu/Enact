@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"enact/internal/identity"
@@ -57,12 +58,56 @@ type ContextFile struct {
 	Content  string `json:"content"`
 }
 
+// What the inference API accepts as context files, which is what the Converse
+// API accepts: a handful of documents, each a few megabytes, in the formats
+// Bedrock can read.
+//
+// enact-model-inference enforces these; they are stated here so a caller can
+// refuse a file before base64-encoding megabytes of it into a request that
+// would come back a 400. If the service's limits move, these move with them.
+const (
+	MaxContextFiles     = 5
+	MaxContextFileBytes = 4_500_000
+)
+
+// contextFileExtensions are the filename extensions the inference API maps
+// onto a Converse document format. The format is derived from the NAME, so a
+// file whose name lacks a usable extension cannot be attached however well
+// formed its bytes are.
+var contextFileExtensions = map[string]bool{
+	".pdf": true, ".csv": true, ".doc": true, ".docx": true,
+	".xls": true, ".xlsx": true, ".html": true, ".htm": true,
+	".txt": true, ".md": true,
+}
+
+// SupportsContextFile reports whether filename names a document the inference
+// API can attach.
+func SupportsContextFile(filename string) bool {
+	return contextFileExtensions[strings.ToLower(filepath.Ext(filename))]
+}
+
+// ContextFileFormats lists the accepted extensions, for an error message that
+// tells the author what would have worked.
+func ContextFileFormats() string {
+	return "pdf, csv, doc, docx, xls, xlsx, html, htm, txt, md"
+}
+
 // Request mirrors the inference API's request body. Exactly one of AgentID
 // or Model must be set (the callee validates).
 type Request struct {
-	AgentID       string        `json:"agent_id,omitempty"`
-	Model         string        `json:"model,omitempty"`
-	Messages      []Message     `json:"messages"`
+	AgentID  string    `json:"agent_id,omitempty"`
+	Model    string    `json:"model,omitempty"`
+	Messages []Message `json:"messages"`
+	// Temperature and TopP are the model's sampling parameters, both 0–1 and
+	// both pointers so "unset" reaches the model as genuinely unset — sending
+	// a zero would mean fully deterministic, which is a choice, not a default.
+	// They apply to agent invocations too: naming an agent fixes its model,
+	// prompt and output schema, not how its replies are sampled.
+	Temperature *float32 `json:"temperature,omitempty"`
+	TopP        *float32 `json:"top_p,omitempty"`
+	// RetrievalTopK is not a sampling parameter — it is how many passages the
+	// agent's retrieval knowledge base contributes. Only meaningful with
+	// AgentID.
 	RetrievalTopK *int          `json:"retrieval_top_k,omitempty"`
 	ContextFiles  []ContextFile `json:"context_files,omitempty"`
 	Stream        bool          `json:"stream,omitempty"`

@@ -260,6 +260,11 @@ func (c *workflowValidationCase) Run(t *utils.T) {
 		{"missing agent", `{"name":"x","steps":[
 			{"name":"a","type":"agent","agent_id":"00000000-0000-0000-0000-000000000000","prompt":"hi"}]}`, "not found"},
 		{"no name", `{"name":"","steps":[{"name":"a","type":"code","code":"function run(i){return 1;}"}]}`, "name is required"},
+		// Syntax is checked when the workflow is SAVED, so a stray bracket
+		// fails here rather than mid-run, and an editor's squiggle and the
+		// backend agree about what is acceptable.
+		{"invalid javascript", `{"name":"x","steps":[
+			{"name":"a","type":"code","code":"function run(ctx) { return {"}]}`, "invalid javascript"},
 	}
 	for _, tc := range cases {
 		var out workflowDTO

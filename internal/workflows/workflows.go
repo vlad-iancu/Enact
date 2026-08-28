@@ -32,6 +32,8 @@ const (
 	// glue between agents: reshaping, filtering and arithmetic, which a model
 	// should not be asked to do reliably.
 	StepTypeCode = "code"
+	// The Google step types live in google.go, which owns everything about
+	// them: their operations, export formats and output shapes.
 )
 
 // Execution and step statuses.
@@ -61,9 +63,72 @@ type Step struct {
 	// the definition, the rendering is part of the record.
 	Prompt string `json:"prompt,omitempty"`
 
+	// Attach names the files an AGENT step sends to the model alongside its
+	// prompt, as paths into the step context — "previous.document",
+	// "steps.export.files.0".
+	//
+	// Declared rather than inferred. A file reaching a step is not the same
+	// as a file that step should pay to have read: a document carried through
+	// five steps to reach the sixth would otherwise be attached, tokenised
+	// and charged at every one of them. Naming the attachment says where it
+	// is meant to be read.
+	//
+	// The prompt is still free to talk ABOUT the file — {{ .Previous.document.name }}
+	// renders its name — but a template can only ever produce text. The bytes
+	// travel beside the prompt, not inside it.
+	Attach []string `json:"attach,omitempty"`
+
 	// Code is a code step's JavaScript body. It receives the step context and
 	// returns a JSON-serialisable value.
 	Code string `json:"code,omitempty"`
+	// OutputSchema declares what a CODE step returns, and is enforced — a
+	// return value that does not match fails the step.
+	//
+	// Only code steps carry one. An agent step's output shape is the agent's
+	// own output_schema, read from the agent record rather than repeated
+	// here: two copies of the same contract are two copies that disagree, and
+	// the agent is where it belongs. A code step has no such source, so it
+	// declares its own.
+	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
+
+	// Provider names the identity provider a GOOGLE DOCS step draws its
+	// credential from — the same provider name a user connects their account
+	// under, and the same one an MCP server's tool_access_requirements name.
+	//
+	// A name rather than a stored token, resolved at the moment the step runs.
+	// The workflow therefore holds no credential of its own: it says which
+	// account to act through, and whose account that is depends entirely on
+	// who triggered the run. Two people running the same workflow reach their
+	// own Drive, and someone who has never connected the provider gets a step
+	// that fails saying so.
+	Provider string `json:"provider,omitempty"`
+	// Operation selects what a Google Docs step does: "export" or "create".
+	Operation string `json:"operation,omitempty"`
+
+	// DocumentID is the document an export reads. A Go template, so the id can
+	// come from the trigger input or an earlier step.
+	DocumentID string `json:"document_id,omitempty"`
+	// Format is the export format — see DocsExportFormats. Defaults to pdf.
+	Format string `json:"format,omitempty"`
+
+	// Title and Body are a created file's name and contents, both templated:
+	// the point of creating one is to write something an earlier step
+	// produced. A presentation has no body — see the validation.
+	Title string `json:"title,omitempty"`
+	Body  string `json:"body,omitempty"`
+
+	// Rows are the cells a SPREADSHEET step writes, as a template rendering to
+	// a JSON array of arrays: [["a",1],["b",2]].
+	//
+	// A template producing JSON rather than a typed field, because the rows
+	// almost always come from an earlier step — {{ .Steps.summarise.rows }} —
+	// and anything typed here would mean the author hand-copying values a step
+	// already produced.
+	Rows string `json:"rows,omitempty"`
+	// Range is the A1 range an append targets, such as "Sheet1!A:C". Empty
+	// appends after the last row of the first sheet, which is what "log this"
+	// usually means.
+	Range string `json:"range,omitempty"`
 }
 
 // Workflow is an ordered list of steps.
@@ -76,11 +141,20 @@ type Workflow struct {
 	// another's data.
 	OrganizationID string `json:"organization_id"`
 
-	Name        string    `json:"name"`
-	Description string    `json:"description,omitempty"`
-	Steps       []Step    `json:"steps"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// InputSchema declares the trigger payload, and is enforced when a run is
+	// started: a payload that does not match is refused there rather than
+	// failing somewhere in the middle of the run.
+	//
+	// It belongs to the WORKFLOW rather than to its first step because every
+	// step can reach it — {{ .Input }} and ctx.input are the same value
+	// throughout — so it is a property of the run, not of one position in it.
+	// It is also what lets an editor offer completions on ctx.input.
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	Steps       []Step          `json:"steps"`
+	CreatedAt   time.Time       `json:"created_at"`
+	UpdatedAt   time.Time       `json:"updated_at"`
 }
 
 // StepRun is what happened when one step ran.
@@ -102,9 +176,33 @@ type StepRun struct {
 	// template lives on the workflow and may since have been edited, so
 	// without this a past execution cannot be explained.
 	Prompt string `json:"prompt,omitempty"`
+	// Attachments are the files sent with that prompt. Recorded for the same
+	// reason as Prompt: the model's answer was formed from the text AND the
+	// documents beside it, so a record holding only the text describes an
+	// input the model never had.
+	Attachments []StepAttachment `json:"attachments,omitempty"`
 
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
+}
+
+// StepAttachment is one file an agent step sent to the model.
+//
+// It records where the file was found as well as what it was: "the model was
+// given q3.pdf" explains the answer, and "it came from previous.document"
+// explains the workflow. Both are needed to read a run that went wrong,
+// because either one alone leaves the other a guess.
+type StepAttachment struct {
+	// Path is the attach path that located the file, as the author wrote it.
+	Path string `json:"path"`
+	// Ref is the file's storage reference. It outlives the step, so a run can
+	// be re-read against the bytes it actually used — for as long as the file
+	// itself is kept.
+	Ref string `json:"ref"`
+	// Name is what the file was called, which is also what its type was read
+	// from: the model's document format comes from this extension.
+	Name string `json:"name,omitempty"`
+	Size int64  `json:"size,omitempty"`
 }
 
 // Execution is one run of a workflow.

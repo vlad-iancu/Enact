@@ -17,8 +17,8 @@ func All() []utils.Factory {
 		NewAgentDeleteIsolation,
 		NewRBACCrossOrg,
 		NewAgentNameLifecycle,
-		NewAgentRAGUploadListDelete,
 		NewAgentOutputSchema,
+		NewAgentRejectsMismatchedKBKind,
 
 		// Knowledge bases
 		NewKBCreateGetDelete,
@@ -26,6 +26,8 @@ func All() []utils.Factory {
 		NewKBDeleteIsolation,
 		NewKBNameLifecycle,
 		NewKBDocumentDeleteAsync,
+		NewKBRetrievalUploadListDelete,
+		NewKBChunkingParameters,
 
 		// enact-main (UI backend), exercised as a browser: cookie sessions,
 		// no service tokens.
@@ -38,6 +40,8 @@ func All() []utils.Factory {
 		NewWorkflowFailure,
 		NewWorkflowIsolation,
 		NewWorkflowInheritsAgentPermission,
+		NewWorkflowSchemas,
+		NewWorkflowGoogleDocs,
 		NewMainAgentsCrudProxy,
 		NewMainKBCrudProxy,
 		NewMainConversationsLifecycle,
@@ -66,6 +70,7 @@ func All() []utils.Factory {
 		NewInferenceRejectsUnknownModel,
 		NewInferenceRequiresMessages,
 		NewInferenceRejectsBadTopK,
+		NewInferenceSamplingParameters,
 		NewInferenceContextFilesValidation,
 	}
 }

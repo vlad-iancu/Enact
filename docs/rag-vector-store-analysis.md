@@ -4,8 +4,9 @@
 
 ## What we do today
 
-The chunk store (`internal/kb/chunk.go`, mapping in `mappings/enact-kb-chunks.json`) uses
-OpenSearch's built-in vector engine:
+The chunk store (`internal/kb/chunks.go`, mapping in
+`mappings/enact-agent-rag-chunks.json`) uses OpenSearch's built-in vector
+engine:
 
 | Aspect | Our choice |
 |---|---|
@@ -13,8 +14,14 @@ OpenSearch's built-in vector engine:
 | Algorithm | HNSW (approximate nearest neighbour) |
 | Engine | **Lucene** |
 | Similarity | cosine |
-| Filtering | term filters on `user_id` + `kb_id` inside the k-NN query |
+| Filtering | a term filter on `kb_id` inside the k-NN query |
 | Scale posture | 1 shard, 0 replicas, top-k=5 |
+
+The filter used to include `user_id` as well. It was dropped when retrieval
+collections became knowledge bases (ADR-0021): a knowledge base is shared
+through RBAC rules, so filtering by the reader's own id would have hidden a
+colleague's documents in a knowledge base they had been given. Authorization
+belongs on the knowledge base; this index just holds its bytes.
 
 The same cluster stores KB and agent metadata, so vectors ride on infrastructure we
 already operate.

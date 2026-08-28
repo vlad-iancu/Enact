@@ -157,8 +157,16 @@ register_templates() {
 # field to an existing mapping is an idempotent, always-allowed operation.
 update_live_mappings() {
   put_live_mapping enact-agent-rag-chunks '{"properties":{"filename":{"type":"keyword"}}}'
+  # Chunks belong to a knowledge base now, not to an agent.
+  put_live_mapping enact-agent-rag-chunks '{"properties":{"kb_id":{"type":"keyword"}}}'
+  put_live_mapping enact-knowledge-bases '{"properties":{"kind":{"type":"keyword"}}}'
+  # A retrieval KB records the chunking it was created with, so moving the
+  # platform default never re-chunks an existing knowledge base's next upload.
+  put_live_mapping enact-knowledge-bases '{"properties":{"chunk_size":{"type":"integer"},"chunk_overlap":{"type":"integer"}}}'
   put_live_mapping enact-knowledge-bases '{"properties":{"name":{"type":"text"},"updated_at":{"type":"date"},"organization_id":{"type":"keyword"}}}'
   put_live_mapping enact-agents '{"properties":{"name":{"type":"text"},"tools":{"type":"keyword"},"organization_id":{"type":"keyword"}}}'
+  # The one retrieval knowledge base an agent draws passages from.
+  put_live_mapping enact-agents '{"properties":{"rag_knowledge_base_id":{"type":"keyword"}}}'
   put_live_mapping enact-conversations '{"properties":{"messages":{"properties":{"attachments":{"type":"keyword"},"tool_calls":{"type":"object","enabled":false}}}}}'
   put_live_mapping enact-tool-servers '{"properties":{"tool_access_requirements":{"type":"object","enabled":false},"tool_authorizations":{"type":"object","enabled":false},"organization_id":{"type":"keyword"}}}'
   put_live_mapping enact-conversations '{"properties":{"organization_id":{"type":"keyword"}}}'
@@ -173,6 +181,9 @@ update_live_mappings() {
   # API keys are matched by hash on every authenticated request, so key_hash
   # must be an indexed keyword — this is the one field here that is queried
   # rather than merely stored.
+  # A workflow's input schema is arbitrary user JSON, like the step
+  # definitions beside it: stored, never indexed.
+  put_live_mapping enact-workflows '{"properties":{"input_schema":{"type":"object","enabled":false}}}'
   put_live_mapping enact-users '{"properties":{"api_keys":{"properties":{"id":{"type":"keyword"},"name":{"type":"keyword"},"key_hash":{"type":"keyword"},"prefix":{"type":"keyword"},"created_at":{"type":"date"},"last_used_at":{"type":"date"}}}}}'
 }
 

@@ -4,7 +4,7 @@
   ],
   "priority": 100,
   "_meta": {
-    "description": "Knowledge-base metadata records: id, owner, friendly name."
+    "description": "Knowledge-base metadata records: id, owner, friendly name, and kind (context: documents stored whole; rag: documents chunked and embedded)."
   },
   "template": {
     "settings": {
@@ -27,6 +27,15 @@
         },
         "name": {
           "type": "text"
+        },
+        "kind": {
+          "type": "keyword"
+        },
+        "chunk_size": {
+          "type": "integer"
+        },
+        "chunk_overlap": {
+          "type": "integer"
         },
         "updated_at": {
           "type": "date"

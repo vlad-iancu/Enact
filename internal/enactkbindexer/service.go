@@ -68,9 +68,11 @@ func Build(cfg *Config) service.Builder {
 			logger.Error("failed to verify kb documents index", "err", err)
 			return nil, err
 		}
-		rags := agents.NewRAGRepository(osClient, cfg.Agents)
-		if err := rags.EnsureIndex(ctx); err != nil {
-			logger.Error("failed to verify agent rag chunk index", "err", err)
+		// Chunks belong to knowledge bases now, so the repository comes from
+		// the kb domain and is scoped by kb id.
+		chunks := kb.NewChunkRepository(osClient, cfg.KB)
+		if err := chunks.EnsureIndex(ctx); err != nil {
+			logger.Error("failed to verify the knowledge-base chunk index", "err", err)
 			return nil, err
 		}
 
@@ -80,7 +82,7 @@ func Build(cfg *Config) service.Builder {
 		}
 		w := &worker{
 			documents:    documents,
-			rags:         rags,
+			chunks:       chunks,
 			extractor:    tika.NewClient(cfg.Tika),
 			embedder:     embedder,
 			embedModel:   cfg.EmbeddingModel,

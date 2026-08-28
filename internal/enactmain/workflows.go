@@ -2,12 +2,17 @@ package enactmain
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	restful "github.com/emicklei/go-restful/v3"
 
+	"enact/internal/files"
 	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/workflows"
@@ -87,12 +92,29 @@ func (a *MainAPI) workflowsWebService() *restful.WebService {
 		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
+	ws.Route(ws.GET("/{id}/shapes").
+		To(a.getWorkflowShapes).
+		Param(ws.PathParameter("id", "workflow id")).
+		Doc("Resolved input and output shapes per step, for editor completion on the code step's ctx parameter").
+		Returns(http.StatusOK, "OK", workflows.Shapes{}).
+		Returns(http.StatusNotFound, "Not found", errorResponse{}))
+
 	ws.Route(ws.GET("/{id}/executions").
 		To(a.listWorkflowExecutions).
 		Param(ws.PathParameter("id", "workflow id")).
 		Param(ws.QueryParameter("limit", "how many to return (default 50, max 200)").DataType("integer")).
 		Doc("List a workflow's executions, newest first").
 		Returns(http.StatusOK, "OK", listWorkflowExecutionsResponse{}).
+		Returns(http.StatusNotFound, "Not found", errorResponse{}))
+
+	ws.Route(ws.GET("/{id}/files").
+		To(a.downloadWorkflowFile).
+		Produces("*/*").
+		Param(ws.PathParameter("id", "workflow id")).
+		Param(ws.QueryParameter("ref", "the file's storage reference, as it appears on a step's output or attachment record")).
+		Doc("Download a file a workflow step produced").
+		Returns(http.StatusOK, "The file", nil).
+		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
 	ws.Route(ws.GET("/executions/{executionId}").
@@ -260,6 +282,26 @@ func (a *MainAPI) triggerWorkflow(req *restful.Request, resp *restful.Response) 
 	requesthelper.WriteJSON(req, resp, http.StatusAccepted, execution)
 }
 
+func (a *MainAPI) getWorkflowShapes(req *restful.Request, resp *restful.Response) {
+	sess := sessionAttr(req)
+	id := req.PathParameter("id")
+	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID, "workflow_id", id)
+	logger.Info("workflow shapes requested")
+
+	shapes, found, err := a.workflows.GetShapes(req.Request.Context(), id)
+	if err != nil {
+		logger.Error("failed to resolve shapes", "err", err)
+		relayAgentErr(req, resp, err, "resolve workflow shapes")
+		return
+	}
+	if !found {
+		requesthelper.WriteError(req, resp, http.StatusNotFound, "workflow not found")
+		return
+	}
+	logger.Info("workflow shapes resolved", "steps", len(shapes.Steps))
+	requesthelper.WriteJSON(req, resp, http.StatusOK, shapes)
+}
+
 func (a *MainAPI) listWorkflowExecutions(req *restful.Request, resp *restful.Response) {
 	sess := sessionAttr(req)
 	id := req.PathParameter("id")
@@ -300,4 +342,124 @@ func (a *MainAPI) getWorkflowExecution(req *restful.Request, resp *restful.Respo
 	}
 	logger.Info("execution fetched", "status", execution.Status, "runs", len(execution.Runs))
 	requesthelper.WriteJSON(req, resp, http.StatusOK, execution)
+}
+
+// downloadWorkflowFile streams a file a step produced.
+//
+// The reference names bytes but carries no authority of its own, so it is
+// never what grants access. It is parsed back into the location it encodes,
+// that location is required to be the workflow in the path, and the workflow
+// is then fetched as the caller — which is what applies the same permission
+// check as reading the workflow itself. A reference to another organization's
+// file parses perfectly well and gets nowhere.
+func (a *MainAPI) downloadWorkflowFile(req *restful.Request, resp *restful.Response) {
+	sess := sessionAttr(req)
+	id := req.PathParameter("id")
+	ref := req.QueryParameter("ref")
+	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID, "workflow_id", id)
+
+	if ref == "" {
+		requesthelper.WriteError(req, resp, http.StatusBadRequest, "a file reference is required")
+		return
+	}
+	_, location, err := files.ParseRef(ref)
+	if err != nil {
+		logger.Warn("malformed file reference", "err", err)
+		requesthelper.WriteError(req, resp, http.StatusBadRequest, "malformed file reference")
+		return
+	}
+	// Not a 403: confirming that the file exists somewhere else is itself
+	// something the caller has not earned.
+	if location.WorkflowID != id {
+		logger.Warn("file reference belongs to another workflow", "ref_workflow_id", location.WorkflowID)
+		requesthelper.WriteError(req, resp, http.StatusNotFound, "file not found")
+		return
+	}
+
+	// The authorization: whoever may read the workflow may read what its runs
+	// produced, which is the same boundary its executions already use.
+	if _, found, err := a.workflows.Get(req.Request.Context(), id); err != nil {
+		logger.Error("failed to resolve the workflow for a file download", "err", err)
+		relayAgentErr(req, resp, err, "download workflow file")
+		return
+	} else if !found {
+		requesthelper.WriteError(req, resp, http.StatusNotFound, "workflow not found")
+		return
+	}
+
+	if a.files == nil {
+		logger.Error("no file store is configured")
+		requesthelper.WriteError(req, resp, http.StatusServiceUnavailable, "file storage is not configured")
+		return
+	}
+	meta, err := a.files.Stat(req.Request.Context(), ref)
+	if err != nil {
+		if errors.Is(err, files.ErrNotFound) {
+			requesthelper.WriteError(req, resp, http.StatusNotFound, "file not found")
+			return
+		}
+		logger.Error("failed to read file metadata", "err", err)
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to read the file")
+		return
+	}
+	reader, err := a.files.Open(req.Request.Context(), ref)
+	if err != nil {
+		if errors.Is(err, files.ErrNotFound) {
+			requesthelper.WriteError(req, resp, http.StatusNotFound, "file not found")
+			return
+		}
+		logger.Error("failed to open the file", "err", err)
+		requesthelper.WriteError(req, resp, http.StatusInternalServerError, "failed to read the file")
+		return
+	}
+	defer func() { _ = reader.Close() }()
+
+	contentType := meta.MimeType
+	if contentType == "" {
+		contentType = files.DefaultMimeType
+	}
+	resp.Header().Set("Content-Type", contentType)
+	resp.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
+	// Always an attachment, and never sniffed. These bytes came from outside
+	// the platform: served inline, a file the store happily accepted as
+	// text/html would run as a page on this origin.
+	resp.Header().Set("Content-Disposition", contentDisposition(meta.Name))
+	resp.Header().Set("X-Content-Type-Options", "nosniff")
+	resp.WriteHeader(http.StatusOK)
+
+	written, err := io.Copy(resp, reader)
+	if err != nil {
+		// The status and headers are already sent, so there is no error to
+		// return to the client — only something to record.
+		logger.Warn("failed while streaming a workflow file", "err", err, "written", written)
+		return
+	}
+	logger.Info("workflow file downloaded", "bytes", written, "mime_type", contentType)
+}
+
+// contentDisposition builds the header offering a filename.
+//
+// A stored name is whatever a third-party API called the document, so it is
+// never interpolated raw: a quote or a newline in it would end the header and
+// begin whatever the name's author wanted. The quoted form is reduced to
+// characters that cannot do that, and the RFC 5987 form carries the real name
+// for clients that understand it.
+func contentDisposition(name string) string {
+	if name == "" {
+		return "attachment"
+	}
+	var safe strings.Builder
+	for _, r := range name {
+		switch {
+		case r < 0x20, r == 0x7f, r == '"', r == '\\':
+			safe.WriteRune('_')
+		case r > 0x7e:
+			// Non-ASCII cannot go in the quoted form; the filename* below
+			// carries it faithfully.
+			safe.WriteRune('_')
+		default:
+			safe.WriteRune(r)
+		}
+	}
+	return fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", safe.String(), url.PathEscape(name))
 }

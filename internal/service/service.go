@@ -232,7 +232,21 @@ func RunWithConfig(ctx context.Context, cfg Config, build Builder) error {
 	container.Filter(identity.Filter)
 	container.Add(healthWebService())
 	container.Add(homeWebService(cfg.Name))
+	// Checked before adding, because go-restful's Container.Add responds to a
+	// duplicate root path by calling os.Exit(1) — not returning an error, not
+	// panicking. A service whose WebService has no Path defaults to "/", which
+	// collides with the home page above and kills the process at startup with
+	// nothing in the log but go-restful's own one-line warning. Catching it
+	// here turns that into an error the binary can actually report.
+	roots := map[string]bool{"/": true, healthPath: true}
 	for _, ws := range services {
+		root := ws.RootPath()
+		if roots[root] {
+			return fmt.Errorf(
+				"service: two WebServices share the root path %q; give each one a distinct ws.Path(...) "+
+					"(a WebService with no Path defaults to \"/\", which collides with the home page)", root)
+		}
+		roots[root] = true
 		container.Add(ws)
 	}
 	// Swagger introspects the container's already-registered WebServices, so

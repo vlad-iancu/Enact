@@ -15,6 +15,39 @@ const (
 	DefaultOverlap   = 150
 )
 
+// Bounds on caller-chosen chunking, in runes.
+//
+// MinChunkSize exists because a chunk shorter than this carries too little
+// surrounding context to mean anything on its own — retrieval returns a
+// fragment the model cannot place. MaxChunkSize sits well under Titan v2's
+// 8192-token input limit (a rune is at most a token, usually less), so a
+// legal chunk can never be one the embedder refuses.
+const (
+	MinChunkSize = 100
+	MaxChunkSize = 8000
+)
+
+// ValidateChunking reports whether a caller's chunk size and overlap are
+// usable, returning a message naming the problem.
+//
+// Overlap must be strictly less than size: at overlap == size the window
+// never advances, which would be an infinite loop rather than a bad result.
+// Chunk() defends itself against that by substituting a default, but silently
+// changing what someone asked for is the wrong answer at an API boundary —
+// here it is refused so they find out.
+func ValidateChunking(size, overlap int) error {
+	if size < MinChunkSize || size > MaxChunkSize {
+		return fmt.Errorf("chunk_size must be between %d and %d", MinChunkSize, MaxChunkSize)
+	}
+	if overlap < 0 {
+		return fmt.Errorf("chunk_overlap must not be negative")
+	}
+	if overlap >= size {
+		return fmt.Errorf("chunk_overlap (%d) must be less than chunk_size (%d)", overlap, size)
+	}
+	return nil
+}
+
 // Chunk splits text into overlapping windows of up to size runes, advancing
 // by (size - overlap) each step. It first normalises whitespace. Empty or
 // whitespace-only input yields no chunks.

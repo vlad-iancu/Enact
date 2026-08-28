@@ -19,6 +19,8 @@ rules:
     allow: [anonymous, "*"]
   - route: "POST /v1/workflows/{id}/executions"
     allow: [anonymous, "*"]
+  - route: "GET /v1/workflows/{id}/shapes"
+    allow: [anonymous, "*"]
   - route: "GET /v1/workflows/{id}/executions"
     allow: [anonymous, "*"]
   - route: "GET /v1/executions/{id}"

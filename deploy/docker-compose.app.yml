@@ -180,16 +180,30 @@ services:
       TOOL_REGISTRY_API_URL: http://enact-tool-registry:8007
       EXTERNAL_IDENTITIES_API_URL: http://enact-external-identities:8008
       WORKFLOW_API_URL: http://enact-workflows:8011
+      # Sessions in Redis: a deploy restarts every container, and without
+      # this that would sign out every user each time.
+      SESSION_REDIS_ADDR: redis:6379
+      SESSION_REDIS_DB: "1"
+      # The same volume the runner writes to, at the same path: a reference
+      # recorded by a run is resolved here when someone downloads the file.
+      WORKFLOW_FILES_ROOT: /var/lib/enact/workflow-files
       S2S_KEY_ID: enact-main
       S2S_JWKS_FILE: /s2s/jwks.yaml
       S2S_ACL_FILE: /s2s/acl/enact-main.yaml
       S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-main.key
+    # Listed in full because an explicit volumes key REPLACES the anchor's
+    # mounts rather than adding to them.
+    volumes:
+      - ./s2s:/s2s:ro
+      - workflow-files:/var/lib/enact/workflow-files
 
   enact-agent-management-api:
     <<: *common
     image: ${ENACT_REGISTRY:?set ENACT_REGISTRY in deploy/.env}/enact-agent-management-api:${ENACT_TAG:-latest}
     depends_on:
       opensearch:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       <<: *infra-env
@@ -387,10 +401,21 @@ services:
       REDIS_GROUP: workflow-runners
       AGENT_API_URL: http://enact-agent-management-api:8001
       RBAC_API_URL: http://enact-rbac:8009
+      # Providers a step draws credentials from are validated here when a
+      # workflow is saved.
+      EXTERNAL_IDENTITIES_API_URL: http://enact-external-identities:8008
+      # Deleting a workflow deletes its files. This service never reads
+      # them, but it owns the cascade, so it needs the same volume.
+      WORKFLOW_FILES_ROOT: /var/lib/enact/workflow-files
       S2S_KEY_ID: enact-workflows
       S2S_JWKS_FILE: /s2s/jwks.yaml
       S2S_ACL_FILE: /s2s/acl/enact-workflows.yaml
       S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-workflows.key
+    # Listed in full because an explicit volumes key REPLACES the anchor's
+    # mounts rather than adding to them.
+    volumes:
+      - ./s2s:/s2s:ro
+      - workflow-files:/var/lib/enact/workflow-files
 
   enact-workflow-runner:
     <<: *common
@@ -411,15 +436,35 @@ services:
       # but healthy run is executed twice.
       REDIS_RECLAIM_MIN_IDLE: 15m
       INFERENCE_API_URL: http://enact-model-inference:8004
+      # A provider-backed step fetches the triggering user's credential from
+      # here at the moment it runs; nothing is stored on the workflow.
+      EXTERNAL_IDENTITIES_API_URL: http://enact-external-identities:8008
       WORKFLOW_CODE_TIMEOUT: 5s
       WORKFLOW_STEP_TIMEOUT: 10m
+      # Where a step's files are written. A named volume rather than the
+      # container's own layer: a retained file outlives the run that made it,
+      # so it must outlive the container too.
+      #
+      # Anything that SERVES these files must mount the same volume at the
+      # same path — today only the runner reads them, and it reads them within
+      # the run that wrote them. Once enact-main can download a file by
+      # reference it needs this mount as well, and once the runner is scaled
+      # past one host a shared local directory stops being possible at all.
+      WORKFLOW_FILES_ROOT: /var/lib/enact/workflow-files
       S2S_KEY_ID: enact-workflow-runner
       S2S_JWKS_FILE: /s2s/jwks.yaml
       S2S_ACL_FILE: /s2s/acl/enact-workflow-runner.yaml
       S2S_PRIVATE_KEY_FILE: /s2s/keys/enact-workflow-runner.key
+    # Listed in full because an explicit volumes key REPLACES the anchor's
+    # mounts rather than adding to them, and dropping the s2s keys would leave
+    # the runner unable to authenticate to anything.
+    volumes:
+      - ./s2s:/s2s:ro
+      - workflow-files:/var/lib/enact/workflow-files
 
 volumes:
   opensearch-data:
   redis-data:
+  workflow-files:
   caddy-data:
   caddy-config:

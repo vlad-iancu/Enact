@@ -10,13 +10,19 @@ import (
 // requests are signed as enact-tests.
 
 type KBDTO struct {
-	ID        string `json:"id"`
-	UserID    string `json:"user_id"`
-	Name      string `json:"name"`
-	Error     string `json:"error"`
-	Documents []struct {
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+	Name   string `json:"name"`
+	Kind   string `json:"kind"`
+	// ChunkSize and ChunkOverlap are present only on retrieval knowledge
+	// bases; a context one reports neither.
+	ChunkSize    int    `json:"chunk_size"`
+	ChunkOverlap int    `json:"chunk_overlap"`
+	Error        string `json:"error"`
+	Documents    []struct {
 		DocumentID string `json:"document_id"`
 		Filename   string `json:"filename"`
+		Chunks     int    `json:"chunks"`
 	} `json:"documents"`
 }
 
@@ -24,17 +30,27 @@ const KBAudience = "enact-kb-api"
 
 func (t *T) KBURL(path string) string { return t.Env.KBAPIURL + path }
 
-// CreateKB creates a throwaway knowledge base; pair every call with a
+// CreateKB creates a throwaway context knowledge base; pair every call with a
 // DeleteKB in the case's TearDown.
-func (t *T) CreateKB() KBDTO {
+func (t *T) CreateKB() KBDTO { return t.CreateKBOfKind("context") }
+
+// CreateKBOfKind creates a throwaway knowledge base of the given kind
+// ("context" or "rag"); pair every call with a DeleteKB in TearDown.
+func (t *T) CreateKBOfKind(kind string) KBDTO {
 	var out KBDTO
+	// The name is the same for both kinds: cases assert on it, and it names
+	// the fixture, not its storage strategy.
+	body := `{"name":"integration test kb","kind":"` + kind + `"}`
 	status := t.DoJSON("enact-tests", KBAudience, http.MethodPost, t.KBURL("/v1/knowledge-bases"),
-		strings.NewReader(`{"name":"integration test kb"}`), &out)
+		strings.NewReader(body), &out)
 	if status != http.StatusCreated {
-		t.Fatalf("create kb: got HTTP %d (%s), want 201", status, out.Error)
+		t.Fatalf("create %s kb: got HTTP %d (%s), want 201", kind, status, out.Error)
 	}
 	if out.ID == "" {
-		t.Fatalf("create kb: response has no id")
+		t.Fatalf("create %s kb: response has no id", kind)
+	}
+	if out.Kind != kind {
+		t.Fatalf("create %s kb: response reports kind %q", kind, out.Kind)
 	}
 	return out
 }

@@ -110,10 +110,24 @@ func (c *Client) List(ctx context.Context) ([]KnowledgeBase, error) {
 	return body.KnowledgeBases, nil
 }
 
-// Create creates a knowledge base with the given friendly name for the
-// calling user; validation failures surface as *requesthelper.BadRequestError.
-func (c *Client) Create(ctx context.Context, name string) (KnowledgeBase, error) {
-	payload, err := json.Marshal(map[string]string{"name": name})
+// CreateRequest is what creating a knowledge base takes. Chunking is a
+// struct field rather than another positional argument because it is
+// optional, retrieval-only, and easy to transpose with its neighbour.
+type CreateRequest struct {
+	Name string `json:"name"`
+	// Kind is empty to accept the KB service's default (context).
+	Kind string `json:"kind"`
+	// ChunkSize and ChunkOverlap are nil to accept the platform defaults.
+	// Only valid for a retrieval knowledge base; the KB service refuses them
+	// on a context one rather than ignoring them.
+	ChunkSize    *int `json:"chunk_size,omitempty"`
+	ChunkOverlap *int `json:"chunk_overlap,omitempty"`
+}
+
+// Create creates a knowledge base for the calling user. Validation failures
+// surface as *requesthelper.BadRequestError.
+func (c *Client) Create(ctx context.Context, body CreateRequest) (KnowledgeBase, error) {
+	payload, err := json.Marshal(body)
 	if err != nil {
 		return KnowledgeBase{}, fmt.Errorf("kb: marshal create request: %w", err)
 	}

@@ -52,6 +52,14 @@ run in goja with no host access and a wall-clock interrupt.
   script — covers the risk that matters, and the CPU risk is answered by
   running it in the worker rather than the API.
 
+### An output schema declared on every step, agent steps included
+- **Pros**: uniform; the workflow alone describes every shape.
+- **Cons**: an agent already carries an `output_schema` that Bedrock enforces,
+  so a second copy on the step is a second copy to keep in agreement — and it
+  would silently stop matching the first time somebody edited the agent.
+- **Why not**: agent steps derive their shape from the agent; only code steps,
+  which have no such source, declare their own.
+
 ### Passing only the previous step's output to each step
 - **Pros**: simplest possible mental model.
 - **Cons**: any value needed later must be threaded through every intervening
@@ -69,6 +77,10 @@ run in goja with no host access and a wall-clock interrupt.
   user may not use. A workflow therefore cannot launder a permission.
 - Editing a workflow never rewrites the history of a run that already
   happened.
+- A workflow's `input_schema` is enforced at the trigger, so a malformed
+  payload costs nothing; a code step's `output_schema` is enforced after it
+  runs, so a declared shape stays true. Both are what let an editor offer
+  completions on `ctx`.
 - An agent with an `output_schema` composes: its reply is stored as JSON, so
   the next step addresses fields instead of parsing prose.
 
@@ -82,6 +94,11 @@ run in goja with no host access and a wall-clock interrupt.
 - **Cost is bounded only by the step cap.** Steps × tool-loop turns can be a
   hundred model calls, and nothing meters an execution's spend. `MaxSteps`
   exists; a token budget does not.
+- **goja implements the language, not a host environment.** Neither browser
+  nor Node APIs exist, which is the sandbox — but `Promise` does exist while an
+  event loop does not, so an `async run` used to return a promise that
+  marshalled to `{}` and silently discarded the step's result. A settled
+  promise is now unwrapped and a pending one is a clear failure.
 - **goja is a language sandbox, not a process one.** A script reaches nothing,
   but it consumes a core until the interrupt fires. Mitigated by running in
   the worker, not the API.

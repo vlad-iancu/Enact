@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
+	"enact/internal/extidentities"
+	"enact/internal/files"
 	"enact/internal/identity"
 	"enact/internal/inference"
 	"enact/internal/logging"
@@ -17,6 +20,18 @@ import (
 type Runner struct {
 	executions *workflows.ExecutionRepository
 	inference  *inference.Client
+	// files holds the bytes an agent step attaches to its prompt, and the bytes
+	// a Google Docs export produces. Nil when no store is configured, which
+	// makes such a step fail with that as its reason rather than with a nil
+	// dereference.
+	files files.Store
+	// identities resolves the credential a provider-backed step acts with, for
+	// the user who triggered the run.
+	identities *extidentities.Client
+	// google calls Google's REST APIs. Its own client rather than the default:
+	// an export is a large streamed body, and a timeout that covered it would
+	// sever big documents partway through.
+	google *http.Client
 	// codeTimeout bounds one code step's wall clock.
 	codeTimeout time.Duration
 	// stepTimeout bounds one agent step. An agent with tools can legitimately
@@ -27,10 +42,17 @@ type Runner struct {
 }
 
 func newRunner(executions *workflows.ExecutionRepository, inferenceClient *inference.Client,
+	fileStore files.Store, identitiesClient *extidentities.Client, googleClient *http.Client,
 	codeTimeout, stepTimeout time.Duration, logger *logging.Logger) *Runner {
+	if googleClient == nil {
+		googleClient = &http.Client{}
+	}
 	return &Runner{
 		executions:  executions,
 		inference:   inferenceClient,
+		files:       fileStore,
+		identities:  identitiesClient,
+		google:      googleClient,
 		codeTimeout: codeTimeout,
 		stepTimeout: stepTimeout,
 		logger:      logger,
@@ -162,9 +184,22 @@ func (r *Runner) runStep(ctx context.Context, logger *logging.Logger, step workf
 
 		callCtx, cancel := context.WithTimeout(ctx, r.stepTimeout)
 		defer cancel()
+
+		// Resolved before the call rather than alongside it: an attachment
+		// that cannot be read is an authoring mistake, and paying for a model
+		// call to discover it helps nobody.
+		attachments, err := r.attachmentsFor(callCtx, step, stepCtx)
+		if err != nil {
+			return fail(err)
+		}
+		// Recorded before the call, so a step that fails mid-inference still
+		// shows what the model was given.
+		run.Attachments = recorded(attachments)
+
 		resp, err := r.inference.Invoke(callCtx, inference.Request{
-			AgentID:  step.AgentID,
-			Messages: []inference.Message{{Role: "user", Content: prompt}},
+			AgentID:      step.AgentID,
+			Messages:     []inference.Message{{Role: "user", Content: prompt}},
+			ContextFiles: sent(attachments),
 		})
 		if err != nil {
 			if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
@@ -176,7 +211,7 @@ func (r *Runner) runStep(ctx context.Context, logger *logging.Logger, step workf
 		// output_schema composes with the steps after it.
 		run.Output = workflows.EncodeOutput(resp.Content)
 		logger.Info("agent step completed", "step", step.Name, "agent_id", step.AgentID,
-			"prompt_chars", len(prompt), "output_bytes", len(run.Output),
+			"prompt_chars", len(prompt), "attachments", len(attachments), "output_bytes", len(run.Output),
 			"input_tokens", resp.InputTokens, "output_tokens", resp.OutputTokens)
 
 	case workflows.StepTypeCode:
@@ -184,11 +219,33 @@ func (r *Runner) runStep(ctx context.Context, logger *logging.Logger, step workf
 		if err != nil {
 			return fail(err)
 		}
+		// A declared output schema is enforced, not merely advertised. An
+		// unenforced schema drifts from what the code actually returns, and
+		// then misleads every later step — and every editor completing
+		// against it.
+		if err := workflows.ValidateAgainst(step.OutputSchema, output); err != nil {
+			return fail(fmt.Errorf("returned a value that does not match this step's output_schema: %w", err))
+		}
 		run.Output = output
-		logger.Info("code step completed", "step", step.Name, "output_bytes", len(output))
+		logger.Info("code step completed", "step", step.Name, "output_bytes", len(output),
+			"schema_enforced", len(step.OutputSchema) > 0)
 
 	default:
-		return fail(fmt.Errorf("unknown step type %q", step.Type))
+		if !workflows.IsGoogleStep(step.Type) {
+			return fail(fmt.Errorf("unknown step type %q", step.Type))
+		}
+		callCtx, cancel := context.WithTimeout(ctx, r.stepTimeout)
+		defer cancel()
+		output, err := r.runGoogleStep(callCtx, logger, step, stepCtx, execution)
+		if err != nil {
+			if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+				return fail(fmt.Errorf("google did not answer within %s", r.stepTimeout))
+			}
+			return fail(err)
+		}
+		run.Output = output
+		logger.Info("google step completed", "step", step.Name, "type", step.Type,
+			"operation", step.Operation, "provider", step.Provider)
 	}
 
 	run.Status = workflows.StatusSucceeded

@@ -53,12 +53,18 @@ var documentFormats = map[string]string{
 //
 //   - Context files: every document of every knowledge base the agent
 //     references is loaded whole into the prompt.
-//   - RAG: the agent's own RAG collection (uploaded separately) is searched
-//     by embedding the query, and the top-k chunks are added.
+//   - RAG: the retrieval knowledge base the agent points at is searched by
+//     embedding the query, and the top-k chunks are added.
 type InferenceAPI struct {
-	client     *bedrock.Client
-	agents     *agents.Client
-	rags       *agents.RAGRepository
+	client *bedrock.Client
+	agents *agents.Client
+	// chunks reads the retrieval knowledge base's embedded passages directly
+	// from OpenSearch rather than through the KB service: a k-NN search on
+	// every turn of every inference is the one place where the extra hop
+	// would be paid for repeatedly, and authorization has already happened
+	// (the caller was cleared to use the agent, and the agent's KB reference
+	// was validated against the KB service when it was saved).
+	chunks     *kb.ChunkRepository
 	kb         *kb.Client
 	tools      *tools.Client
 	embedModel string
@@ -72,14 +78,14 @@ type InferenceAPI struct {
 	logger   *logging.Logger
 }
 
-func newInferenceAPI(client *bedrock.Client, agentClient *agents.Client, rags *agents.RAGRepository, kbClient *kb.Client, toolsClient *tools.Client, toolAuth *toolAuthorizer, enforcer *rbac.Enforcer, embedModel string, maxTurns int, logger *logging.Logger) *InferenceAPI {
+func newInferenceAPI(client *bedrock.Client, agentClient *agents.Client, chunks *kb.ChunkRepository, kbClient *kb.Client, toolsClient *tools.Client, toolAuth *toolAuthorizer, enforcer *rbac.Enforcer, embedModel string, maxTurns int, logger *logging.Logger) *InferenceAPI {
 	if maxTurns <= 0 {
 		maxTurns = 10
 	}
 	return &InferenceAPI{
 		client:     client,
 		agents:     agentClient,
-		rags:       rags,
+		chunks:     chunks,
 		kb:         kbClient,
 		tools:      toolsClient,
 		toolAuth:   toolAuth,
@@ -126,6 +132,10 @@ func (a *InferenceAPI) infer(req *restful.Request, resp *restful.Response) {
 	if body.RetrievalTopK != nil && (*body.RetrievalTopK < 1 || *body.RetrievalTopK > maxRetrievalTopK) {
 		logger.Warn("inference request has invalid retrieval_top_k", "retrieval_top_k", *body.RetrievalTopK)
 		writeError(req, resp, http.StatusBadRequest, fmt.Sprintf("retrieval_top_k must be between 1 and %d", maxRetrievalTopK))
+		return
+	}
+	if msg, ok := validateSampling(logger, body); !ok {
+		writeError(req, resp, http.StatusBadRequest, msg)
 		return
 	}
 	documents, docErr := convertContextFiles(body)
@@ -417,15 +427,19 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 		}
 	}
 
-	// RAG: retrieve from the agent's own collection using the query embedding.
-	// The (cheap) emptiness check runs first so agents without RAG documents
-	// never pay for a query embedding.
-	hasRAG, err := a.rags.HasChunks(ctx, agent.UserID, agent.ID)
-	if err != nil {
-		logger.Error("failed to check rag collection", "err", err)
-		return nil, http.StatusBadGateway, "failed to check RAG collection"
+	// RAG: retrieve from the knowledge base the agent points at, using the
+	// query embedding. The (cheap) emptiness check runs first so an agent
+	// whose knowledge base is still indexing never pays for a query embedding.
+	hasRAG := false
+	if agent.RAGKnowledgeBaseID != "" {
+		var err error
+		hasRAG, err = a.chunks.HasChunks(ctx, agent.RAGKnowledgeBaseID)
+		if err != nil {
+			logger.Error("failed to check retrieval knowledge base", "rag_kb_id", agent.RAGKnowledgeBaseID, "err", err)
+			return nil, http.StatusBadGateway, "failed to check the retrieval knowledge base"
+		}
+		logger.Info("retrieval knowledge base checked", "rag_kb_id", agent.RAGKnowledgeBaseID, "has_chunks", hasRAG)
 	}
-	logger.Info("rag collection checked", "has_chunks", hasRAG)
 	if query := lastUserMessage(body.Messages); hasRAG && query != "" {
 		topK := defaultRetrievalTopK
 		if body.RetrievalTopK != nil {
@@ -437,12 +451,12 @@ func (a *InferenceAPI) applyAgent(req *restful.Request, logger *logging.Logger, 
 			return nil, http.StatusBadGateway, "failed to embed query for retrieval"
 		}
 		logger.Info("query embedded", "dimensions", len(vector))
-		retrieved, err := a.rags.Search(ctx, agent.UserID, agent.ID, vector, topK)
+		retrieved, err := a.chunks.Search(ctx, agent.RAGKnowledgeBaseID, vector, topK)
 		if err != nil {
-			logger.Error("failed to retrieve rag context", "err", err)
+			logger.Error("failed to retrieve rag context", "rag_kb_id", agent.RAGKnowledgeBaseID, "err", err)
 			return nil, http.StatusBadGateway, "failed to retrieve RAG context"
 		}
-		logger.Info("rag context retrieved", "chunks", len(retrieved), "top_k", topK)
+		logger.Info("rag context retrieved", "rag_kb_id", agent.RAGKnowledgeBaseID, "chunks", len(retrieved), "top_k", topK)
 		texts := make([]string, len(retrieved))
 		for i, c := range retrieved {
 			texts[i] = c.Text
@@ -600,6 +614,43 @@ func (a *InferenceAPI) stream(req *restful.Request, resp *restful.Response, logg
 	// with tool turns in play only the handler knows when it is over.
 	_ = send(bedrock.StreamChunk{Done: true})
 	logger.Info("streaming inference completed")
+}
+
+// validateSampling bounds temperature and top_p before the request reaches
+// Bedrock.
+//
+// Both are probabilities-ish quantities the Anthropic models accept in 0–1,
+// and both are otherwise passed through untouched — so without this check an
+// out-of-range value comes back as a Bedrock ValidationException, which the
+// caller sees as a 502 carrying an AWS trace id and no mention of the field
+// they got wrong. Rejecting here costs one comparison and names the field.
+//
+// Deliberately NOT clamped: silently changing 1.5 to 1.0 would answer a
+// question the caller did not ask, and they would never learn their client
+// was sending nonsense.
+//
+// The two are also mutually exclusive. Every model in the registry is an
+// Anthropic one, and they refuse a request that sets both — "`temperature`
+// and `top_p` cannot both be specified for this model". That is a rule about
+// the model rather than about enact, but it fails identically every time, so
+// it is caught here for the same reason as the ranges. It matches Anthropic's
+// own guidance: the two are different ways to do one thing, and turning both
+// makes neither predictable.
+func validateSampling(logger *logging.Logger, body InferenceRequest) (string, bool) {
+	if t := body.Temperature; t != nil && (*t < 0 || *t > 1) {
+		logger.Warn("inference request has invalid temperature", "temperature", *t)
+		return "temperature must be between 0 and 1", false
+	}
+	if p := body.TopP; p != nil && (*p < 0 || *p > 1) {
+		logger.Warn("inference request has invalid top_p", "top_p", *p)
+		return "top_p must be between 0 and 1", false
+	}
+	if body.Temperature != nil && body.TopP != nil {
+		logger.Warn("inference request sets both temperature and top_p",
+			"temperature", *body.Temperature, "top_p", *body.TopP)
+		return "set temperature or top_p, not both: the models reject a request carrying both", false
+	}
+	return "", true
 }
 
 func toBedrockRequest(body *InferenceRequest) *bedrock.ConverseRequest {

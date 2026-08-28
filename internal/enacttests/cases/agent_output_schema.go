@@ -22,7 +22,9 @@ func NewAgentOutputSchema() utils.TestCase { return &agentOutputSchemaCase{} }
 
 func (c *agentOutputSchemaCase) Name() string { return "TestAgentManagement_OutputSchema" }
 
-const createdSchema = `{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}`
+// Bedrock requires every object node to set additionalProperties:false, so a
+// fixture without it is not a schema any agent could run with.
+const createdSchema = `{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`
 
 func (c *agentOutputSchemaCase) Setup(t *utils.T) {
 	c.agent = t.CreateAgent(`{"name":"integration test agent","model":"claude-sonnet-4-6",` +
@@ -42,7 +44,7 @@ func (c *agentOutputSchemaCase) Run(t *utils.T) {
 	}
 
 	// Replaced when provided.
-	const replacement = `{"type":"object","properties":{"score":{"type":"number"}}}`
+	const replacement = `{"type":"object","properties":{"score":{"type":"number"}},"additionalProperties":false}`
 	replaced := c.put(t, "replace output_schema", `{"output_schema":`+replacement+`}`, http.StatusOK)
 	if !sameJSON(replaced.OutputSchema, replacement) {
 		t.Errorf("replace output_schema: schema = %s, want %s", replaced.OutputSchema, replacement)
@@ -53,6 +55,23 @@ func (c *agentOutputSchemaCase) Run(t *utils.T) {
 	rejected := c.put(t, "non-object output_schema", `{"output_schema":["not","a","schema"]}`, http.StatusBadRequest)
 	if !strings.Contains(rejected.Error, "output_schema") {
 		t.Errorf("non-object output_schema: error %q does not name the field", rejected.Error)
+	}
+
+	// An object without additionalProperties:false is refused HERE. Bedrock
+	// rejects it too, but only once a generation is under way — which reaches
+	// whoever is talking to the agent, quoting a field name they have never
+	// heard of.
+	missing := c.put(t, "object without additionalProperties",
+		`{"output_schema":{"type":"object","properties":{"a":{"type":"string"}}}}`, http.StatusBadRequest)
+	if !strings.Contains(missing.Error, "additionalProperties") {
+		t.Errorf("missing additionalProperties: error %q does not name the rule", missing.Error)
+	}
+	// Nested objects are covered too, and the message locates the one at fault.
+	nested := c.put(t, "nested object without additionalProperties",
+		`{"output_schema":{"type":"object","additionalProperties":false,"properties":{
+			"outer":{"type":"object","properties":{"b":{"type":"string"}}}}}}`, http.StatusBadRequest)
+	if !strings.Contains(nested.Error, "outer") {
+		t.Errorf("nested violation: error %q does not locate the offending object", nested.Error)
 	}
 
 	// {} clears it. A null would be indistinguishable from an absent field,

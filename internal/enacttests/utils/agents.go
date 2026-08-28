@@ -15,6 +15,9 @@ type AgentDTO struct {
 	Model            string   `json:"model"`
 	SystemPrompt     string   `json:"system_prompt"`
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+	// RAGKnowledgeBaseID is the single retrieval knowledge base the agent
+	// searches, or empty.
+	RAGKnowledgeBaseID string `json:"rag_knowledge_base_id"`
 	// OutputSchema is raw so a case can assert on the schema it sent rather
 	// than on whatever a Go round-trip would have made of it.
 	OutputSchema json.RawMessage `json:"output_schema"`

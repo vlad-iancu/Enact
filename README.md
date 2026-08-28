@@ -1,14 +1,18 @@
 # enact — minimal agent platform
 
 A small agent platform built on Amazon Bedrock, OpenSearch, Redis Streams,
-and Apache Tika. Agents can be grounded in documents two ways, independently:
+and Apache Tika. Agents are grounded in *knowledge bases*, of which there are
+two kinds:
 
-* **Context files** — documents uploaded to a *knowledge base*. Agents that
-  reference the KB load every document's full text into the model context at
-  inference time.
-* **RAG** — every agent has exactly one RAG configuration of its own.
-  Documents uploaded to it are chunked and embedded; the most relevant chunks
-  are retrieved (k-NN) per query at inference time.
+* **Context** (`"kind": "context"`) — documents are stored whole. An agent
+  referencing the KB loads every document's full text into the model context
+  at inference time. An agent may reference any number of them.
+* **Retrieval** (`"kind": "rag"`) — documents are chunked and embedded, and
+  the most relevant chunks are retrieved (k-NN) per query. An agent may attach
+  **exactly one**, through `rag_knowledge_base_id`.
+
+Both are ordinary knowledge bases: created, shared and permissioned the same
+way (`enact:kb:…`), and independent of the agents that use them.
 
 > Authentication/authorization is intentionally **not** implemented. Any
 > request may impersonate any user via the `X-User-Id` header (defaults to
@@ -19,13 +23,13 @@ and Apache Tika. Agents can be grounded in documents two ways, independently:
 | Binary (`cmd/…`)                | Purpose |
 |---------------------------------|---------|
 | `enact-model-management`        | `GET /v1/models` — friendly model names mapped to Bedrock model ids. |
-| `enact-kb-api`                  | Create/delete knowledge bases; upload **context documents**. Raw file bytes are base64-encoded and pushed onto the Redis queue, **not** processed inline. |
-| `enact-kb-document-indexer`     | Consumes the queue and extracts text via Tika. KB context documents are stored whole; agent RAG documents are chunked + embedded (Bedrock Titan) into the k-NN index. No public API (health probe only). |
-| `enact-agent-management-api`    | CRUD for agents (`model`, `system_prompt`, `knowledge_base_ids`, `tools`, `output_schema`); upload **RAG documents** to an agent (`POST /v1/agents/{id}/rag/documents`). |
-| `enact-model-inference`         | `POST /v1/inference`. Accepts `agent_id`; resolves the agent's model, loads the KB context files whole, retrieves top-k chunks from the agent's RAG collection, and augments the system prompt. Agents with MCP `tools` run a Bedrock tool-use loop (max `MAX_TURNS`, default 10): tool calls execute through the registry's MCP proxy and stream as `toolCall` / `toolCallResult` SSE events. An agent's `output_schema` becomes the Converse `OutputConfig`, constraining the reply to JSON; a `malformed_model_output` stop fails the request rather than returning prose the caller would parse as JSON. |
+| `enact-kb-api`                  | Create/delete knowledge bases of either kind; upload **documents** (`POST /v1/knowledge-bases/{id}/documents`) — the KB's kind decides whether they are stored whole or chunked and embedded. Raw file bytes are base64-encoded and pushed onto the Redis queue, **not** processed inline. |
+| `enact-kb-document-indexer`     | Consumes the queue and extracts text via Tika. A context KB's documents are stored whole; a retrieval KB's are chunked + embedded (Bedrock Titan) into the k-NN index. No public API (health probe only). |
+| `enact-agent-management-api`    | CRUD for agents (`model`, `system_prompt`, `knowledge_base_ids`, `rag_knowledge_base_id`, `tools`, `output_schema`). Documents live in the KB service; this validates that a referenced KB exists and, for `rag_knowledge_base_id`, that it is of kind `rag`. |
+| `enact-model-inference`         | `POST /v1/inference`. Accepts `agent_id`; resolves the agent's model, loads the context KBs' files whole, retrieves top-k chunks from its retrieval KB, and augments the system prompt. Agents with MCP `tools` run a Bedrock tool-use loop (max `MAX_TURNS`, default 10): tool calls execute through the registry's MCP proxy and stream as `toolCall` / `toolCallResult` SSE events. An agent's `output_schema` becomes the Converse `OutputConfig`, constraining the reply to JSON; a `malformed_model_output` stop fails the request rather than returning prose the caller would parse as JSON. |
 | `enact-external-identities`     | Credentials the platform holds on a user's behalf at third parties (Google Workspace, GitHub, JIRA). Registers providers (`POST /v1/providers/oauth` with well-known discovery, `POST /v1/providers/pat`), owns the OAuth consent flow (`/v1/oauth/authorize` + `/v1/oauth/callback`), serves usable credentials to services, and refreshes tokens on a background sweep. Credentials are AES-256-GCM sealed at rest (ADR-0013). |
 | `enact-rbac`                    | Organizations, memberships, roles and the rules they grant. `GET /v1/effective` is the hot path — a user's organization and every rule they hold, which services cache and evaluate locally. Also organization requests and their approval, and `POST /v1/grants`, the ownership bookkeeping every service writes when it creates a resource. |
-| `enact-workflows`               | Workflow authoring and execution intake. A workflow is an ordered list of **agent** steps (an existing agent, prompt templated with Go templates) and **code** steps (JavaScript over the step context). `POST /v1/workflows/{id}/executions` validates `use`, writes an execution record and queues it — it never executes anything itself. |
+| `enact-workflows`               | Workflow authoring and execution intake. A workflow-level `input_schema` is enforced at the trigger; a code step's `output_schema` is enforced by the runner (agent steps take their shape from the agent's own `output_schema`). `GET /v1/workflows/{id}/shapes` resolves both, plus the per-step context schema an editor completes `ctx` against. A workflow is an ordered list of **agent** steps (an existing agent, prompt templated with Go templates), **code** steps (JavaScript over the step context) and **google-docs** / **google-sheets** / **google-slides** steps (export to a file, create, and — for Sheets — append rows), the last three of which name an identity **provider** and act as the triggering user. `POST /v1/workflows/{id}/executions` validates `use`, writes an execution record and queues it — it never executes anything itself. |
 | `enact-workflow-runner`         | Consumes queued executions and runs their steps in order **as the triggering user**, updating the record after each. Agent steps call `enact-model-inference`, which re-checks `enact:agent:use:{id}` — so a workflow cannot run an agent its triggerer may not. Code steps run in goja with no host access and a wall-clock interrupt. No public API (health probe only). |
 | `enact-tool-registry`           | MCP servers on the platform: register (`POST /v1/servers/create`, health-checked), partial update, list, and a cached tool catalogue (`GET /v1/servers/tools`, refreshed every `REFRESH_AT`). `/v1/servers/{id}/mcp` and `/{id}/sse` are spec-compliant MCP proxies to the underlying server. |
 
@@ -37,49 +41,68 @@ at `/swagger-ui/` for free (via `internal/service`).
 ## Architecture
 
 ```
-          upload context doc                 enqueue (base64 bytes, typed)
+          upload document (either kind)      enqueue (base64 bytes, typed)
   client ───────────────────▶ enact-kb-api ────────────▶ Redis Stream
-          upload RAG doc                                      │ consume
-  client ──────────────▶ enact-agent-mgmt-api ──────────▶─────┤
-                                   │                          ▼
-                                   │ agent CRUD        enact-kb-document-indexer ──▶ Tika
-                                   ▼                     │        (extract text) ◀───┘
-                              OpenSearch ◀───────────────┤
-                              (metadata,     kb_context: │ document stored whole
-                               documents,    agent_rag:  │ chunks+vectors (Bedrock embed)
+                                   │                          │ consume
+          agent CRUD               │ KB CRUD                  ▼
+  client ──▶ enact-agent-mgmt-api ─┤            enact-kb-document-indexer ──▶ Tika
+                                   │              │        (extract text) ◀───┘
+                              OpenSearch ◀────────┤
+                              (metadata,  context: │ document stored whole
+                               documents,   rag:   │ chunks+vectors (Bedrock embed)
                                kNN vectors)
                                    ▲
                                    │ load context files + retrieve (kNN)
-  client ──▶ enact-model-inference ┘  (loads KB docs whole, embeds query,
-              (POST /v1/inference,     searches agent RAG collection,
-               agent_id)               augments prompt, Converse → Bedrock)
+  client ──▶ enact-model-inference ┘  (loads context KB docs whole, embeds
+              (POST /v1/inference,      query, searches the agent's retrieval
+               agent_id)                KB, augments prompt, Converse → Bedrock)
 ```
 
 ### Grounding design
 
-Two independent grounding mechanisms per agent:
+Two independent grounding mechanisms per agent, both backed by knowledge
+bases:
 
 * **Context files** (`knowledge_base_ids`): every document of every referenced
-  KB is loaded whole into the system prompt. Best for small, always-relevant
-  material; no retrieval step, no embeddings.
-* **RAG** (one collection per agent, uploaded via
-  `POST /v1/agents/{id}/rag/documents`): documents are chunked (overlapping
-  character windows, `internal/rag`) and embedded with Amazon Bedrock **Titan
-  Text Embeddings v2** (`amazon.titan-embed-text-v2:0`, 1024-dim by default)
-  into OpenSearch `knn_vector` fields (HNSW, cosine), filtered by `agent_id`
-  (and `user_id`). At inference the query is embedded and the top-k chunks are
-  added to the prompt.
+  context KB is loaded whole into the system prompt. Best for small,
+  always-relevant material; no retrieval step, no embeddings.
+* **Retrieval** (`rag_knowledge_base_id`, exactly one): documents are chunked
+  (overlapping character windows, `internal/rag`) and embedded with Amazon
+  Bedrock **Titan Text Embeddings v2** (`amazon.titan-embed-text-v2:0`,
+  1024-dim by default) into OpenSearch `knn_vector` fields (HNSW, cosine),
+  filtered by `kb_id`. At inference the query is embedded and the top-k chunks
+  are added to the prompt.
+
+A retrieval knowledge base's `chunk_size` and `chunk_overlap` (in runes) are
+set **at creation and never after** — `POST /v1/knowledge-bases` takes them,
+`PUT` refuses them. Chunking happens at upload time, so a value changed
+mid-life would apply only to later documents and leave one KB holding two
+incompatible chunkings with nothing recording which is which. Size must be
+100–8000 and overlap strictly less than size. Omitted, they are **recorded**
+as the platform defaults (1000/150) rather than left blank, so moving
+`RAG_CHUNK_SIZE` later cannot silently re-chunk what somebody uploads to an
+existing knowledge base tomorrow. They are rejected outright on a context KB,
+which stores documents whole. The embedding model stays global — a KB on a
+different-dimension model would need its own index.
+
+One retrieval KB, not many, is deliberate: k-NN ranks passages by distance
+*within* one collection, so searching several and merging their scores
+compares numbers that were never comparable — in practice one corpus quietly
+crowds out another. Combine sources by putting them in the same knowledge
+base, where they are embedded the same way. Context KBs have no such limit
+because nothing is ranked.
 
 The embedding model's output dimension **must** match `BEDROCK_EMBEDDING_DIM`,
 which is used to create the k-NN index mapping. Change both together.
 
 ## Storage layout (OpenSearch indices)
 
-* `enact-knowledge-bases` — KB metadata (`id`, `user_id`, `created_at`).
+* `enact-knowledge-bases` — KB metadata (`id`, `user_id`, `kind`, `created_at`).
 * `enact-agents` — agent records. `output_schema` is `enabled: false`: it is arbitrary user JSON, so it is kept in `_source` but never mapped.
-* `enact-kb-documents` — extracted full-text context documents of KBs.
-* `enact-agent-rag-chunks` — RAG chunks with `embedding` (`knn_vector`),
-  scoped by `agent_id`.
+* `enact-kb-documents` — extracted full-text documents of context KBs.
+* `enact-agent-rag-chunks` — retrieval chunks with `embedding` (`knn_vector`),
+  scoped by `kb_id`. The index name predates knowledge-base kinds and is kept
+  so existing deployments' data stays where it is.
 * `enact-organizations`, `enact-organization-requests`, `enact-memberships`,
   `enact-roles` — the authorization model. A membership's document id is the
   user id, so belonging to exactly one organization is structural rather than
@@ -603,8 +626,9 @@ than assumed.
 # 1. See available models
 curl -s localhost:8081/v1/models
 
-# 2. Create a knowledge base
-KB=$(curl -s -X POST localhost:8082/v1/knowledge-bases | jq -r .id)
+# 2. Create a context knowledge base ("kind" defaults to "context")
+KB=$(curl -s -X POST localhost:8082/v1/knowledge-bases \
+  -H 'Content-Type: application/json' -d '{"name":"notes"}' | jq -r .id)
 
 # 3. Upload a context document to the KB (multipart file; processed async).
 #    The raw bytes are base64-encoded onto the queue and Tika extracts the
@@ -614,18 +638,23 @@ echo "Enact is a minimal agent platform. It uses OpenSearch for vector storage."
 curl -s -X POST localhost:8082/v1/knowledge-bases/$KB/documents \
   -F 'file=@notes.txt'
 
-# 4. Create an agent that uses that KB as context
-AGENT=$(curl -s -X POST localhost:8084/v1/agents \
+# 4. (Optional) Create a RETRIEVAL knowledge base and upload to it. Its
+#    documents are chunked + embedded async and retrieved per query.
+#    chunk_size/chunk_overlap are optional and creation-only (defaults 1000/150).
+RAGKB=$(curl -s -X POST localhost:8082/v1/knowledge-bases \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"claude-3-5-sonnet\",\"system_prompt\":\"You are a helpful assistant.\",\"knowledge_base_ids\":[\"$KB\"]}" \
-  | jq -r .id)
-
-# 5. (Optional) Upload a document to the agent's RAG configuration; it is
-#    chunked + embedded async and retrieved per query at inference time.
-curl -s -X POST localhost:8084/v1/agents/$AGENT/rag/documents \
+  -d '{"name":"handbook","kind":"rag","chunk_size":800,"chunk_overlap":100}' | jq -r .id)
+curl -s -X POST localhost:8082/v1/knowledge-bases/$RAGKB/documents \
   -F 'file=@handbook.pdf'
 
-# 6. Invoke the agent (context loading + RAG happen server-side)
+# 5. Create an agent: the context KB is loaded whole, the retrieval KB is
+#    searched per query. An agent may attach exactly one of the latter.
+AGENT=$(curl -s -X POST localhost:8084/v1/agents \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"system_prompt\":\"You are a helpful assistant.\",\"knowledge_base_ids\":[\"$KB\"],\"rag_knowledge_base_id\":\"$RAGKB\"}" \
+  | jq -r .id)
+
+# 6. Invoke the agent (context loading + retrieval happen server-side)
 curl -s -X POST localhost:8080/v1/inference \
   -H 'Content-Type: application/json' \
   -d "{\"agent_id\":\"$AGENT\",\"messages\":[{\"role\":\"user\",\"content\":\"What does enact use for vector storage?\"}]}"
@@ -633,16 +662,32 @@ curl -s -X POST localhost:8080/v1/inference \
 
 `POST /v1/inference` still works without an agent — supply `model` and
 `messages` directly (set `"stream": true` for SSE streaming). Agent requests
-may set `"retrieval_top_k"` (1–50) to control how many RAG chunks are
-retrieved per query (default 5).
+may set `"retrieval_top_k"` (1–50) to control how many chunks are retrieved
+from the agent's retrieval knowledge base per query (default 5).
+
+Sampling is tunable per request with `"temperature"` and `"top_p"`, both
+0–1 and both rejected as a 400 outside it. **Set one or the other, not
+both** — the Anthropic models refuse a request carrying both, so enact
+rejects it up front rather than letting it come back as a Bedrock
+`ValidationException`. They apply to agent invocations
+too: naming an agent fixes its model, prompt and output schema, not how its
+replies are sampled. Omit them and the model's own defaults apply — enact
+sends nothing it was not given, so there is no platform default to inherit.
+All three travel through enact-main as well, on `POST /inference` and on
+`POST /conversations/{id}/messages`; nothing about them is persisted, so
+they are set per call. `max_tokens` is accepted by the inference service
+directly but is not forwarded by enact-main.
 
 ## Notes & limitations
 
 * No auth: ownership is by `X-User-Id` header only.
-* Knowledge bases support create/delete only (no update), per spec.
+* A knowledge base's `kind`, `chunk_size` and `chunk_overlap` are fixed at
+  creation. Changing the kind would leave existing documents stored in a form
+  nothing reads; changing the chunking would split later documents differently
+  from earlier ones within the same KB.
 * Context files are loaded **whole** into the prompt — every document of every
-  KB the agent references. Large KBs can exceed the model's context window;
-  use the agent's RAG configuration for large corpora.
+  context KB the agent references. Large KBs can exceed the model's context
+  window; use a retrieval knowledge base for large corpora.
 * The indexer ack's a message only after all chunks index successfully;
   failures leave it pending in the Redis consumer group. The consumer sweeps
   the pending list every `REDIS_RECLAIM_INTERVAL` (30s), reclaiming deliveries

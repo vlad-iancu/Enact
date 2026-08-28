@@ -13,11 +13,5 @@ rules:
     allow: [anonymous, "*"]
   - route: "DELETE /v1/agents/{id}"
     allow: [anonymous, "*"]
-  - route: "POST /v1/agents/{id}/rag/documents"
-    allow: [anonymous, "*"]
-  - route: "GET /v1/agents/{id}/rag/documents"
-    allow: [anonymous, "*"]
-  - route: "DELETE /v1/agents/{id}/rag/documents/{docId}"
-    allow: [anonymous, "*"]
   - route: "GET /v1/agents/{id}"
     allow: [anonymous, "*"]

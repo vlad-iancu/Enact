@@ -255,3 +255,128 @@ func TestAgentIDsAreDistinct(t *testing.T) {
 		t.Errorf("AgentIDs = %v, want [a1 a2]", got)
 	}
 }
+
+// Marking a function async is a reflex for anyone who writes JavaScript.
+// Without handling, it silently destroys the result: an async function
+// returns a Promise, which marshals to {} — the step "succeeds" and the next
+// one is handed nothing.
+func TestRunCodeResolvesAnAsyncEntrypoint(t *testing.T) {
+	out, err := RunCode(`async function run(ctx) { return { ok: true, n: 7 }; }`, Context{}, time.Second)
+	if err != nil {
+		t.Fatalf("async run: %v", err)
+	}
+	var decoded struct {
+		OK bool `json:"ok"`
+		N  int  `json:"n"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v (%s)", err, out)
+	}
+	if !decoded.OK || decoded.N != 7 {
+		t.Errorf("async run produced %s, want the returned object", out)
+	}
+}
+
+func TestRunCodeResolvesAReturnedPromise(t *testing.T) {
+	out, err := RunCode(`function run(ctx) { return Promise.resolve({ v: 1 }); }`, Context{}, time.Second)
+	if err != nil {
+		t.Fatalf("promise run: %v", err)
+	}
+	if string(out) != `{"v":1}` {
+		t.Errorf("out = %s, want {\"v\":1}", out)
+	}
+}
+
+// A rejected promise is a failure, exactly as throwing is.
+func TestRunCodeFailsOnARejectedPromise(t *testing.T) {
+	_, err := RunCode(`async function run(ctx) { throw new Error("nope"); }`, Context{}, time.Second)
+	if err == nil {
+		t.Fatalf("a rejected promise was treated as success")
+	}
+	if !strings.Contains(err.Error(), "nope") {
+		t.Errorf("error %q loses the rejection reason", err)
+	}
+}
+
+// Nothing can settle a pending promise here — there is no event loop — so
+// saying so beats returning an empty object or hanging until the interrupt.
+func TestRunCodeExplainsAPendingPromise(t *testing.T) {
+	_, err := RunCode(`function run(ctx) { return new Promise(function () {}); }`, Context{}, time.Second)
+	if err == nil {
+		t.Fatalf("a pending promise was accepted")
+	}
+	if !strings.Contains(err.Error(), "event loop") {
+		t.Errorf("error %q does not explain why it can never settle", err)
+	}
+}
+
+func TestParseCodeRejectsSyntaxErrors(t *testing.T) {
+	err := ParseCode("broken", "function run(ctx) { return {")
+	if err == nil {
+		t.Fatalf("unbalanced braces parsed cleanly")
+	}
+	// The position is what lets an editor place a marker rather than just
+	// showing a sentence.
+	if !strings.Contains(err.Error(), "broken") {
+		t.Errorf("error %q does not name the step", err)
+	}
+	if !strings.Contains(err.Error(), "1:") && !strings.Contains(err.Error(), "line") {
+		t.Errorf("error %q carries no position: %s", err, err.Error())
+	}
+	if err := ParseCode("fine", "function run(ctx) { return ctx.input; }"); err != nil {
+		t.Errorf("valid code was rejected: %v", err)
+	}
+	// Valid syntax that will fail at run time is NOT a parse error: this
+	// checks the code parses, not that it behaves.
+	if err := ParseCode("later", "function notRun(ctx) { return 1; }"); err != nil {
+		t.Errorf("a missing entrypoint should not be a syntax error: %v", err)
+	}
+}
+
+// The template package's own message for this is "can't evaluate field doc_id
+// in type interface {}", which names neither the value nor the mistake. The
+// cause is almost always one JSON encoding too many in the caller.
+func TestRenderPromptExplainsADoubleEncodedInput(t *testing.T) {
+	ctx, err := NewContext(json.RawMessage(`"{\"doc_id\":\"1MLC\"}"`), nil)
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	_, err = RenderPrompt("step_docs", `{{ .Input.doc_id }}`, ctx)
+	if err == nil {
+		t.Fatalf("addressing a field on a string rendered without error")
+	}
+	for _, want := range []string{"JSON string containing JSON", `{"input": {…}}`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// A step whose OUTPUT was double-encoded is the same mistake one hop later.
+func TestRenderPromptExplainsADoubleEncodedStepOutput(t *testing.T) {
+	ctx, err := NewContext(nil, runs([2]string{"classify", `"{\"label\":\"billing\"}"`}))
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	if _, err = RenderPrompt("reply", `{{ .Steps.classify.label }}`, ctx); err == nil {
+		t.Fatalf("addressing a field on a string rendered without error")
+	} else if !strings.Contains(err.Error(), "output of step classify") {
+		t.Errorf("error %q does not name the step whose output is a string", err)
+	}
+}
+
+// A workflow whose input is legitimately a string keeps working; the hint only
+// ever annotates a failure that already happened.
+func TestRenderPromptLeavesLegitimateStringsAlone(t *testing.T) {
+	ctx, err := NewContext(json.RawMessage(`"{\"a\":1}"`), nil)
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	got, err := RenderPrompt("s", `the payload was {{ .Input }}`, ctx)
+	if err != nil {
+		t.Fatalf("rendering a string input failed: %v", err)
+	}
+	if !strings.Contains(got, `{"a":1}`) {
+		t.Errorf("rendered %q, want the string itself", got)
+	}
+}

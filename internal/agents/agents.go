@@ -13,11 +13,10 @@ import (
 	"enact/internal/opensearch"
 )
 
-// Config holds the OpenSearch index names for the agent domain: the agent
-// records themselves and the RAG chunk collections uploaded to agents.
+// Config holds the OpenSearch index name for the agent domain. Retrieval
+// chunks are the knowledge-base domain's (see kb.Config.ChunksIndex).
 type Config struct {
-	Index          string `env:"OPENSEARCH_INDEX_AGENTS, default=enact-agents"`
-	RAGChunksIndex string `env:"OPENSEARCH_INDEX_AGENT_RAG_CHUNKS, default=enact-agent-rag-chunks"`
+	Index string `env:"OPENSEARCH_INDEX_AGENTS, default=enact-agents"`
 }
 
 // Agent is a configured assistant: a user-facing friendly name, a model, a
@@ -38,6 +37,19 @@ type Agent struct {
 	// Tools names the MCP servers (by registry id) whose tools this agent
 	// may call during inference.
 	Tools []string `json:"tools"`
+	// RAGKnowledgeBaseID is the ONE retrieval knowledge base this agent draws
+	// passages from, or empty for none.
+	//
+	// One rather than many, deliberately. Retrieval ranks passages by distance
+	// within a single collection; searching several and merging their scores
+	// compares numbers that were never comparable, and the usual result is one
+	// corpus quietly crowding out another. A single collection keeps the
+	// ranking meaningful — combine sources by putting them in one knowledge
+	// base, where they are embedded the same way.
+	//
+	// Distinct from KnowledgeBaseIDs above, which are CONTEXT knowledge bases:
+	// those are loaded whole, and there is no ranking to confuse.
+	RAGKnowledgeBaseID string `json:"rag_knowledge_base_id,omitempty"`
 	// OutputSchema constrains the assistant's own reply to JSON matching this
 	// JSON Schema, via Bedrock's structured output. Absent — the default —
 	// means ordinary prose.

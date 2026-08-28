@@ -57,8 +57,8 @@ It can reach:
 
 - **Your profile** — `GET /auth/me` answers for a key, which is how a program
   checks that a key is still live and finds out whose it is
-- **Agents** — create, edit, delete, upload RAG documents
-- **Knowledge bases** — the same
+- **Agents** — create, edit, delete
+- **Knowledge bases** — the same, plus uploading and removing their documents
 - **MCP servers** — register, manage, and call their tools
 - **Inference** — with an agent or with a bare model
 - **Conversations** and the **model list**

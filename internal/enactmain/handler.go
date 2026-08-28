@@ -15,6 +15,7 @@ import (
 	"enact/internal/cloudfront"
 	"enact/internal/conversations"
 	"enact/internal/extidentities"
+	"enact/internal/files"
 	"enact/internal/inference"
 	"enact/internal/kb"
 	"enact/internal/logging"
@@ -35,7 +36,7 @@ const minPasswordLen = 8
 // accounts, and cookie sessions.
 type MainAPI struct {
 	users         *users.Repository
-	sessions      *SessionStore
+	sessions      SessionStore
 	google        *googleAuth
 	conversations *conversations.Repository
 	inference     *inference.Client
@@ -72,6 +73,10 @@ type MainAPI struct {
 	identities *extidentities.Client
 	// workflows fronts the workflow service for authoring and manual runs.
 	workflows *workflows.Client
+	// files serves the bytes a workflow step produced. The runner writes
+	// them; this reads the same store, which on more than one host means the
+	// store cannot be a local directory.
+	files files.Store
 	// apiKeys memoizes resolved API keys, so programmatic traffic does not
 	// cost one account lookup per request.
 	apiKeys *apiKeyCache
@@ -83,7 +88,7 @@ func (a *MainAPI) isAdmin(email string) bool {
 	return a.adminEmail != "" && users.NormalizeEmail(email) == a.adminEmail
 }
 
-func newMainAPI(userRepo *users.Repository, sessions *SessionStore, google *googleAuth, convRepo *conversations.Repository, inferenceClient *inference.Client, modelsClient *models.Client, agentsClient *agents.Client, kbClient *kb.Client, storage *s3.Client, cdn *cloudfront.Resolver, cookies cookieSettings, frontendURL string, logger *logging.Logger) *MainAPI {
+func newMainAPI(userRepo *users.Repository, sessions SessionStore, google *googleAuth, convRepo *conversations.Repository, inferenceClient *inference.Client, modelsClient *models.Client, agentsClient *agents.Client, kbClient *kb.Client, storage *s3.Client, cdn *cloudfront.Resolver, cookies cookieSettings, frontendURL string, logger *logging.Logger) *MainAPI {
 	return &MainAPI{
 		users:         userRepo,
 		sessions:      sessions,

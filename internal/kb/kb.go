@@ -20,6 +20,10 @@ import (
 type Config struct {
 	KnowledgeBasesIndex string `env:"OPENSEARCH_INDEX_KNOWLEDGE_BASES, default=enact-knowledge-bases"`
 	DocumentsIndex      string `env:"OPENSEARCH_INDEX_KB_DOCUMENTS, default=enact-kb-documents"`
+	// ChunksIndex holds the embedded passages of retrieval knowledge bases.
+	// The name is inherited from when a RAG collection belonged to an agent,
+	// and is kept so an existing deployment's data stays where it is.
+	ChunksIndex string `env:"OPENSEARCH_INDEX_AGENT_RAG_CHUNKS, default=enact-agent-rag-chunks"`
 }
 
 // KnowledgeBase is the metadata record for a knowledge base. The id is the
@@ -34,9 +38,62 @@ type KnowledgeBase struct {
 	// organization out of another's data.
 	OrganizationID string `json:"organization_id"`
 
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Name string `json:"name"`
+	// Kind decides what an upload to this knowledge base becomes.
+	//
+	// A context KB stores each document WHOLE, and an agent referencing it
+	// loads all of them into the model's context. A retrieval KB chunks and
+	// embeds each document, and an agent attached to it gets only the passages
+	// relevant to the question asked.
+	//
+	// Fixed once the KB holds documents: changing it would leave the existing
+	// ones stored in a form nothing reads, which is worse than refusing.
+	Kind string `json:"kind"`
+	// ChunkSize and ChunkOverlap are how a retrieval KB splits its documents,
+	// in runes. Absent (zero) on context knowledge bases, which store
+	// documents whole, and on retrieval ones created before this was
+	// settable — the indexer falls back to its configured default for those.
+	//
+	// Set at creation and never afterwards. Chunking happens at upload time,
+	// so a value changed mid-life would apply only to documents added after
+	// the change, leaving one knowledge base holding two incompatible
+	// chunkings with nothing recording which is which. Same reasoning as
+	// Kind above.
+	//
+	// Recorded concretely rather than left blank to mean "the default", so
+	// that moving the platform default later cannot silently re-chunk what
+	// somebody uploads to an existing knowledge base tomorrow.
+	ChunkSize    int       `json:"chunk_size,omitempty"`
+	ChunkOverlap int       `json:"chunk_overlap,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// The kinds a knowledge base can be.
+const (
+	// KindContext stores documents whole; every one is loaded into context.
+	KindContext = "context"
+	// KindRetrieval chunks and embeds documents; only the relevant passages
+	// reach the model. An agent may attach exactly one.
+	KindRetrieval = "rag"
+)
+
+// ValidKind reports whether a kind is one this platform knows.
+func ValidKind(kind string) bool {
+	return kind == KindContext || kind == KindRetrieval
+}
+
+// NormalizeKind fills in the default for a KB created before kinds existed,
+// or by a caller that did not say.
+//
+// Context is the default because that is what every KB was before this: an
+// existing record with no kind holds whole documents, and reading it as
+// anything else would silently change what an agent using it receives.
+func NormalizeKind(kind string) string {
+	if kind == "" {
+		return KindContext
+	}
+	return kind
 }
 
 // Repository persists knowledge-base metadata records in OpenSearch.

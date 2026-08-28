@@ -14,10 +14,6 @@ import (
 	"enact/internal/requesthelper"
 )
 
-// agentUploadMaxBytes caps RAG document uploads forwarded to the agent
-// service, matching its own limit.
-const agentUploadMaxBytes = 50 << 20
-
 // agentListItem is an agent plus what the caller may do with it. The agent's
 // own fields are embedded, so the JSON is the agent object with two extra
 // keys rather than a wrapper the UI has to unpack.
@@ -28,16 +24,6 @@ type agentListItem struct {
 
 type listAgentsResponse struct {
 	Agents []agentListItem `json:"agents"`
-}
-
-type listAgentRAGDocumentsResponse struct {
-	AgentID   string               `json:"agent_id"`
-	Documents []agents.RAGDocument `json:"documents"`
-}
-
-type queuedDeletionResponse struct {
-	DocumentID string `json:"document_id"`
-	Status     string `json:"status"`
 }
 
 // agentsWebService returns the session-guarded agent management routes: the
@@ -89,34 +75,12 @@ func (a *MainAPI) agentsWebService() *restful.WebService {
 	ws.Route(ws.DELETE("/{id}").
 		To(a.deleteAgent).
 		Param(ws.PathParameter("id", "agent id")).
-		Doc("Delete an agent and its RAG collection").
+		Doc("Delete an agent").
 		Returns(http.StatusNoContent, "Deleted", nil).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
-	ws.Route(ws.GET("/{id}/rag/documents").
-		To(a.listAgentRAGDocuments).
-		Param(ws.PathParameter("id", "agent id")).
-		Doc("List the documents of the agent's RAG configuration").
-		Returns(http.StatusOK, "OK", listAgentRAGDocumentsResponse{}).
-		Returns(http.StatusNotFound, "Not found", errorResponse{}))
-
-	ws.Route(ws.POST("/{id}/rag/documents").
-		To(a.uploadAgentRAGDocuments).
-		Consumes("multipart/form-data").
-		Param(ws.PathParameter("id", "agent id")).
-		Param(ws.FormParameter("file", "one or more document files (repeat the field per file)").DataType("file").Required(true).AllowMultiple(true)).
-		Doc("Upload documents to the agent's RAG configuration; indexing is asynchronous").
-		Returns(http.StatusAccepted, "Accepted for indexing", nil).
-		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
-		Returns(http.StatusNotFound, "Not found", errorResponse{}))
-
-	ws.Route(ws.DELETE("/{id}/rag/documents/{docId}").
-		To(a.deleteAgentRAGDocument).
-		Param(ws.PathParameter("id", "agent id")).
-		Param(ws.PathParameter("docId", "document id")).
-		Doc("Queue the removal of one RAG document; deletion is asynchronous").
-		Returns(http.StatusAccepted, "Accepted for deletion", queuedDeletionResponse{}).
-		Returns(http.StatusNotFound, "Not found", errorResponse{}))
+	// An agent's retrieval documents live in the knowledge base named by its
+	// rag_knowledge_base_id and are managed under /knowledge-bases/{id}.
 
 	return ws
 }
@@ -269,78 +233,6 @@ func (a *MainAPI) deleteAgent(req *restful.Request, resp *restful.Response) {
 	}
 	logger.Info("agent deleted")
 	resp.WriteHeader(http.StatusNoContent)
-}
-
-func (a *MainAPI) listAgentRAGDocuments(req *restful.Request, resp *restful.Response) {
-	sess := sessionAttr(req)
-	id := req.PathParameter("id")
-	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID, "agent_id", id)
-	logger.Info("list rag documents requested")
-
-	docs, found, err := a.agents.ListRAGDocuments(req.Request.Context(), id)
-	if err != nil {
-		logger.Error("failed to list rag documents", "err", err)
-		relayAgentErr(req, resp, err, "list RAG documents")
-		return
-	}
-	if !found {
-		logger.Warn("agent not found for rag listing")
-		requesthelper.WriteError(req, resp, http.StatusNotFound, "agent not found")
-		return
-	}
-	logger.Info("rag documents listed", "documents", len(docs))
-	requesthelper.WriteJSON(req, resp, http.StatusOK, listAgentRAGDocumentsResponse{AgentID: id, Documents: docs})
-}
-
-func (a *MainAPI) uploadAgentRAGDocuments(req *restful.Request, resp *restful.Response) {
-	sess := sessionAttr(req)
-	id := req.PathParameter("id")
-	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID, "agent_id", id)
-	logger.Info("rag upload requested")
-
-	files, status, msg := requesthelper.ReadUploadedFiles(req, resp, "file", agentUploadMaxBytes)
-	if status != 0 {
-		logger.Warn("invalid rag upload", "err", msg)
-		requesthelper.WriteError(req, resp, status, msg)
-		return
-	}
-	logger.Info("upload files read", "files", len(files))
-
-	body, found, err := a.agents.UploadRAGDocuments(req.Request.Context(), id, files)
-	if err != nil {
-		logger.Error("rag upload forward failed", "err", err)
-		relayAgentErr(req, resp, err, "upload RAG documents")
-		return
-	}
-	if !found {
-		logger.Warn("agent not found for rag upload")
-		requesthelper.WriteError(req, resp, http.StatusNotFound, "agent not found")
-		return
-	}
-	logger.Info("rag upload accepted", "files", len(files))
-	writeRawJSON(resp, http.StatusAccepted, body)
-}
-
-func (a *MainAPI) deleteAgentRAGDocument(req *restful.Request, resp *restful.Response) {
-	sess := sessionAttr(req)
-	id := req.PathParameter("id")
-	docID := req.PathParameter("docId")
-	logger := requesthelper.Logger(req, a.logger).WithFields("user_id", sess.UserID, "agent_id", id, "document_id", docID)
-	logger.Info("rag document deletion requested")
-
-	found, err := a.agents.DeleteRAGDocument(req.Request.Context(), id, docID)
-	if err != nil {
-		logger.Error("rag document deletion failed", "err", err)
-		relayAgentErr(req, resp, err, "delete RAG document")
-		return
-	}
-	if !found {
-		logger.Warn("agent not found for rag deletion")
-		requesthelper.WriteError(req, resp, http.StatusNotFound, "agent not found")
-		return
-	}
-	logger.Info("rag document deletion queued")
-	requesthelper.WriteJSON(req, resp, http.StatusAccepted, queuedDeletionResponse{DocumentID: docID, Status: "queued"})
 }
 
 // writeRawJSON relays a downstream JSON body verbatim (it already carries

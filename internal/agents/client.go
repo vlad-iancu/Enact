@@ -93,6 +93,8 @@ type CreateAgentRequest struct {
 	SystemPrompt     string   `json:"system_prompt"`
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
 	Tools            []string `json:"tools,omitempty"`
+	// RAGKnowledgeBaseID attaches the agent's one retrieval knowledge base.
+	RAGKnowledgeBaseID string `json:"rag_knowledge_base_id,omitempty"`
 	// OutputSchema is a JSON Schema the assistant's reply must match; omit
 	// for prose. Forwarded verbatim — enact-main does not interpret it, the
 	// agent API validates it.
@@ -193,32 +195,4 @@ func (c *Client) Update(ctx context.Context, id string, rawBody json.RawMessage)
 // boolean reports existence.
 func (c *Client) Delete(ctx context.Context, id string) (bool, error) {
 	return c.do(ctx, http.MethodDelete, c.baseURL+"/v1/agents/"+url.PathEscape(id), nil, http.StatusNoContent, nil)
-}
-
-// ListRAGDocuments returns the distinct documents of the agent's RAG
-// collection. The boolean reports the agent's existence.
-func (c *Client) ListRAGDocuments(ctx context.Context, id string) ([]RAGDocument, bool, error) {
-	var out struct {
-		Documents []RAGDocument `json:"documents"`
-	}
-	found, err := c.do(ctx, http.MethodGet, c.baseURL+"/v1/agents/"+url.PathEscape(id)+"/rag/documents", nil, http.StatusOK, &out)
-	if err != nil {
-		return nil, false, err
-	}
-	return out.Documents, found, nil
-}
-
-// DeleteRAGDocument queues the removal of one RAG document. The boolean
-// reports the agent's existence (deletion itself is asynchronous).
-func (c *Client) DeleteRAGDocument(ctx context.Context, agentID, docID string) (bool, error) {
-	endpoint := c.baseURL + "/v1/agents/" + url.PathEscape(agentID) + "/rag/documents/" + url.PathEscape(docID)
-	return c.do(ctx, http.MethodDelete, endpoint, nil, http.StatusAccepted, nil)
-}
-
-// UploadRAGDocuments forwards files to the agent's RAG collection as a
-// multipart upload. It returns the callee's 202 response body verbatim; the
-// boolean reports the agent's existence.
-func (c *Client) UploadRAGDocuments(ctx context.Context, id string, files []requesthelper.UploadedFile) (json.RawMessage, bool, error) {
-	endpoint := c.baseURL + "/v1/agents/" + url.PathEscape(id) + "/rag/documents"
-	return requesthelper.PostMultipart(ctx, c.http, "agents", endpoint, files)
 }

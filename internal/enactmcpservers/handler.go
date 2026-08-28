@@ -77,6 +77,11 @@ func (a *HostedAPI) serverNames() []string {
 	return names
 }
 
+// mountRoot is the WebService root every hosted server hangs under. It matches
+// the prefix the catalogue gives their paths (internal/builtinmcp), so the
+// served URL is unchanged.
+const mountRoot = "/mcp-servers"
+
 // WebService mounts every hosted server at the path the catalogue gives it.
 //
 // The MCP handler is a plain http.Handler, so the route delegates to it with
@@ -84,16 +89,26 @@ func (a *HostedAPI) serverNames() []string {
 // MCP traffic through go-restful.
 func (a *HostedAPI) WebService() *restful.WebService {
 	ws := new(restful.WebService)
-	ws.Produces(restful.MIME_JSON)
+	// The root path MUST be set, and must not be "/".
+	//
+	// go-restful's Container.Add calls os.Exit(1) — not an error, not a panic
+	// — when two WebServices share a root path, and the service runtime
+	// already registers the home page at "/". A WebService with no Path
+	// defaults to "/", so leaving it unset kills the process at startup with
+	// nothing logged but go-restful's own one-line warning.
+	ws.Path(mountRoot).Produces(restful.MIME_JSON)
 
 	for _, hosted := range a.servers {
 		server := hosted
+		// Routes are relative to the root, which go-restful joins back onto
+		// it — so the served path is still the catalogue's.
+		routePath := strings.TrimPrefix(server.definition.Path, mountRoot)
 		// GET and DELETE are registered even though a stateless handler
 		// answers them with 405: routing them here produces the transport's
 		// own answer rather than go-restful's 404, which is what an MCP
 		// client is written to expect.
 		for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
-			ws.Route(ws.Method(method).Path(server.definition.Path).
+			ws.Route(ws.Method(method).Path(routePath).
 				To(func(req *restful.Request, resp *restful.Response) {
 					a.serve(server, req, resp)
 				}).

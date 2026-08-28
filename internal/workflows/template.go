@@ -1,7 +1,9 @@
 package workflows
 
 import (
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"text/template"
 )
@@ -34,7 +36,7 @@ func RenderPrompt(name, prompt string, ctx Context) (string, error) {
 	}
 	var out strings.Builder
 	if err := tmpl.Execute(&out, ctx); err != nil {
-		return "", fmt.Errorf("workflows: render prompt of step %q: %w", name, err)
+		return "", fmt.Errorf("workflows: render prompt of step %q: %w%s", name, err, explainRenderFailure(ctx))
 	}
 	if out.Len() > maxPromptBytes {
 		return "", fmt.Errorf("workflows: step %q rendered a prompt of %d bytes; the limit is %d",
@@ -54,4 +56,58 @@ func newTemplate(name, prompt string) (*template.Template, error) {
 		return nil, fmt.Errorf("workflows: step %q has an invalid prompt template: %w", name, err)
 	}
 	return tmpl, nil
+}
+
+// explainRenderFailure adds what the template package cannot say.
+//
+// Its message for a field lookup on the wrong kind of value is
+// "can't evaluate field doc_id in type interface {}", which names neither the
+// value nor the mistake. By far the most common cause is a trigger sent as
+// {"input": "{…}"} — the payload JSON-encoded a second time, so what should be
+// an object arrives as a string. That is a one-character fix in the caller and
+// an impenetrable error without this.
+//
+// It only ever ANNOTATES a failure that already happened, so it cannot reject
+// anything legitimate: a workflow that genuinely wants a JSON-looking string
+// as its input keeps working, and only sees this if a template asks that
+// string for a field.
+func explainRenderFailure(ctx Context) string {
+	if hint := doubleEncoded("input", ctx.Input); hint != "" {
+		return hint
+	}
+	// Steps before Previous, and in name order. Previous is always ALSO the
+	// last successful step's output, so checking it first would report "the
+	// previous step" for something that has a name — and a name is what the
+	// author has to go and fix. Sorted so the message does not depend on map
+	// iteration order.
+	names := make([]string, 0, len(ctx.Steps))
+	for name := range ctx.Steps {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if hint := doubleEncoded("the output of step "+name, ctx.Steps[name]); hint != "" {
+			return hint
+		}
+	}
+	if hint := doubleEncoded("the previous step's output", ctx.Previous); hint != "" {
+		return hint
+	}
+	return ""
+}
+
+// doubleEncoded reports a value that is a string whose contents are themselves
+// a JSON object or array — the signature of one JSON encoding too many.
+func doubleEncoded(what string, value any) string {
+	text, isString := value.(string)
+	if !isString {
+		return ""
+	}
+	trimmed := strings.TrimSpace(text)
+	if !looksLikeJSON(trimmed) || !json.Valid([]byte(trimmed)) {
+		return ""
+	}
+	return fmt.Sprintf(
+		` (%s is a JSON string containing JSON, not an object — it looks like it was sent as {"input": "{…}"} rather than {"input": {…}}, so its fields cannot be addressed)`,
+		what)
 }

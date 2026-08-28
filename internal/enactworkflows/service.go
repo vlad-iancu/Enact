@@ -12,6 +12,8 @@ import (
 	restful "github.com/emicklei/go-restful/v3"
 
 	"enact/internal/agents"
+	"enact/internal/extidentities"
+	"enact/internal/files"
 	"enact/internal/logging"
 	"enact/internal/opensearch"
 	"enact/internal/queue"
@@ -30,7 +32,9 @@ type Config struct {
 	Queue      queue.Config
 	Workflows  workflows.Config
 	AgentAPI   agents.ClientConfig
+	Identities extidentities.ClientConfig
 	RBAC       rbac.ClientConfig
+	Files      files.Config
 	S2S        s2s.Config
 }
 
@@ -58,6 +62,7 @@ func Build(cfg *Config) service.Builder {
 			return nil, err
 		}
 		agentClient := agents.NewClient(cfg.AgentAPI, s2sRuntime.Transport(nil, "enact-agent-management-api"))
+		identitiesClient := extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities"))
 		// Authorization is this service's own job: it is reachable by any
 		// signed service caller, so a check that lives only in enact-main is a
 		// check a second caller walks around.
@@ -67,7 +72,13 @@ func Build(cfg *Config) service.Builder {
 		logger.Info("workflow api initialized", "stream", cfg.Queue.Stream,
 			"agent_api", cfg.AgentAPI.BaseURL, "rbac", cfg.RBAC.BaseURL, "s2s_key_id", cfg.S2S.KeyID)
 
-		ws := newWorkflowAPI(repo, executions, agentClient, producer, rbacClient, enforcer, logger).WebService()
+		fileStore, err := files.NewFS(cfg.Files)
+		if err != nil {
+			logger.Error("failed to open the workflow file store", "err", err)
+			return nil, err
+		}
+		logger.Info("workflow file store opened", "root", fileStore.Root(), "configured", cfg.Files.Root != "")
+		ws := newWorkflowAPI(repo, executions, agentClient, identitiesClient, producer, rbacClient, enforcer, fileStore, logger).WebService()
 		if s2sRuntime.Enabled() {
 			ws.Filter(s2sRuntime.Filter)
 		}

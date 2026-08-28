@@ -36,7 +36,7 @@ type Config struct {
 	service.Config
 	bedrock.ClientConfig
 	OpenSearch     opensearch.Config
-	Agents         agents.Config
+	KB             kb.Config
 	AgentAPI       agents.ClientConfig
 	KBAPI          kb.ClientConfig
 	ToolRegistry   tools.ClientConfig
@@ -67,15 +67,15 @@ func Build(cfg *Config) service.Builder {
 			logger.Error("failed to create opensearch client", "err", err)
 			return nil, err
 		}
-		rags := agents.NewRAGRepository(osClient, cfg.Agents)
+		chunks := kb.NewChunkRepository(osClient, cfg.KB)
 		s2sRuntime, err := s2s.Load(cfg.S2S, logger)
 		if err != nil {
 			logger.Error("failed to load s2s configuration", "err", err)
 			return nil, err
 		}
 		// Agent records and KB context documents come from their owning
-		// services over HTTP; this service reads no agent or KB indices
-		// directly. Only the RAG chunk index (vector retrieval) is local.
+		// services over HTTP; this service reads no agent or KB metadata
+		// indices directly. Only the chunk index (vector retrieval) is local.
 		agentClient := agents.NewClient(cfg.AgentAPI, s2sRuntime.Transport(nil, "enact-agent-management-api"))
 		kbClient := kb.NewClient(cfg.KBAPI, s2sRuntime.Transport(nil, "enact-kb-api"))
 		toolsClient := tools.NewClient(cfg.ToolRegistry, s2sRuntime.Transport(nil, "enact-tool-registry"))
@@ -91,7 +91,7 @@ func Build(cfg *Config) service.Builder {
 			"s2s_key_id", cfg.S2S.KeyID,
 		)
 		rbacClient := rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
-		api := newInferenceAPI(client, agentClient, rags, kbClient, toolsClient, toolAuth,
+		api := newInferenceAPI(client, agentClient, chunks, kbClient, toolsClient, toolAuth,
 			rbac.NewEnforcer(rbacClient, cfg.RBAC), cfg.EmbeddingModel, cfg.MaxTurns, logger)
 
 		ws := api.WebService()

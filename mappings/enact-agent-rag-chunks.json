@@ -2,7 +2,7 @@
   "index_patterns": ["enact-agent-rag-chunks"],
   "priority": 100,
   "_meta": {
-    "description": "Embedded document chunks of agent RAG configurations, retrieved via k-NN at inference time."
+    "description": "Embedded document chunks of retrieval knowledge bases, retrieved via k-NN at inference time. Scoped by kb_id; agent_id and user_id are legacy fields kept so pre-migration chunks stay readable."
   },
   "template": {
     "settings": {
@@ -12,6 +12,7 @@
     },
     "mappings": {
       "properties": {
+        "kb_id":       { "type": "keyword" },
         "user_id":     { "type": "keyword" },
         "agent_id":    { "type": "keyword" },
         "document_id": { "type": "keyword" },

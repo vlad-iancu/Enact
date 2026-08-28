@@ -18,6 +18,7 @@ import (
 	"enact/internal/cloudfront"
 	"enact/internal/conversations"
 	"enact/internal/extidentities"
+	"enact/internal/files"
 	"enact/internal/inference"
 	"enact/internal/kb"
 	"enact/internal/logging"
@@ -49,10 +50,12 @@ type Config struct {
 	RBAC          rbac.ClientConfig
 	Identities    extidentities.ClientConfig
 	Workflows     workflows.ClientConfig
+	Files         files.Config
 	S2S           s2s.Config
 	Storage       s3.Config
 	CDN           cloudfront.Config
 	SES           ses.Config
+	Sessions      SessionsConfig
 
 	// VerificationEnabled requires local accounts to verify their email
 	// before they can log in (unverified = unauthenticated). Requires
@@ -153,7 +156,24 @@ func Build(cfg *Config) service.Builder {
 			logger.Error("failed to initialize google auth", "err", err)
 			return nil, err
 		}
+		// Sessions live in Redis when an address is configured, so a restart
+		// or a deploy no longer logs everybody out and two replicas can share
+		// them. With no address they stay in the process, which keeps a bare
+		// checkout runnable.
 		sessions := NewSessionStore(cfg.SessionTTL)
+		sessionStore := "memory"
+		if cfg.Sessions.RedisAddr != "" {
+			redisSessions, err := NewRedisSessionStore(ctx, cfg.Sessions, cfg.SessionTTL, logger)
+			if err != nil {
+				// Fails closed. Quietly falling back to memory would restore
+				// the very behaviour this replaces, and look like a working
+				// deployment until the first restart.
+				logger.Error("failed to connect to the session store", "addr", cfg.Sessions.RedisAddr, "err", err)
+				return nil, err
+			}
+			sessions = redisSessions
+			sessionStore = "redis"
+		}
 		sameSite, secure, err := parseSameSite(cfg.CookieSameSite, cfg.SecureCookies)
 		if err != nil {
 			logger.Error("invalid cookie configuration", "err", err)
@@ -173,6 +193,7 @@ func Build(cfg *Config) service.Builder {
 			"frontend_url", cfg.FrontendURL,
 			"admin_email", cfg.AdminEmail,
 			"s2s_key_id", cfg.S2S.KeyID,
+			"session_store", sessionStore,
 		)
 		api := newMainAPI(userRepo, sessions, google, convRepo, inferenceClient, modelsClient, agentsClient, kbClient, storage, cdn,
 			cookieSettings{Secure: secure, SameSite: sameSite}, cfg.FrontendURL, logger)
@@ -195,6 +216,13 @@ func Build(cfg *Config) service.Builder {
 		api.rbac = rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
 		api.identities = extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities"))
 		api.workflows = workflows.NewClient(cfg.Workflows, s2sRuntime.Transport(nil, "enact-workflows"))
+		fileStore, err := files.NewFS(cfg.Files)
+		if err != nil {
+			logger.Error("failed to open the workflow file store", "err", err)
+			return nil, err
+		}
+		logger.Info("workflow file store opened", "root", fileStore.Root(), "configured", cfg.Files.Root != "")
+		api.files = fileStore
 		services := api.WebServices()
 		if s2sRuntime.Enabled() {
 			// Appended LAST, and that matters: go-restful runs a WebService's

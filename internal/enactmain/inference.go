@@ -18,9 +18,15 @@ import (
 // Unlike conversation messages, nothing is persisted — the UI uses this to
 // try an agent (or raw model) out.
 type testInferenceRequest struct {
-	AgentID       string                  `json:"agent_id,omitempty"`
-	Model         string                  `json:"model,omitempty"`
-	Messages      []inference.Message     `json:"messages"`
+	AgentID  string              `json:"agent_id,omitempty"`
+	Model    string              `json:"model,omitempty"`
+	Messages []inference.Message `json:"messages"`
+	// Temperature and TopP tune the sampling; RetrievalTopK tunes how much
+	// the agent's retrieval knowledge base contributes. All three are
+	// forwarded verbatim and validated downstream by the inference service,
+	// which is the authority on what the models accept.
+	Temperature   *float32                `json:"temperature,omitempty"`
+	TopP          *float32                `json:"top_p,omitempty"`
 	RetrievalTopK *int                    `json:"retrieval_top_k,omitempty"`
 	ContextFiles  []inference.ContextFile `json:"context_files,omitempty"`
 }
@@ -67,7 +73,8 @@ func (a *MainAPI) testInference(req *restful.Request, resp *restful.Response) {
 	}
 	logger.Info("test inference decoded",
 		"agent_id", body.AgentID, "model", body.Model, "messages", len(body.Messages),
-		"retrieval_top_k", body.RetrievalTopK, "attachments", attachments)
+		"retrieval_top_k", body.RetrievalTopK, "temperature", body.Temperature, "top_p", body.TopP,
+		"attachments", attachments)
 
 	if len(body.Messages) == 0 {
 		requesthelper.WriteError(req, resp, http.StatusBadRequest, "messages must not be empty")
@@ -97,6 +104,8 @@ func (a *MainAPI) testInference(req *restful.Request, resp *restful.Response) {
 		AgentID:       body.AgentID,
 		Model:         body.Model,
 		Messages:      body.Messages,
+		Temperature:   body.Temperature,
+		TopP:          body.TopP,
 		RetrievalTopK: body.RetrievalTopK,
 		ContextFiles:  body.ContextFiles,
 	}

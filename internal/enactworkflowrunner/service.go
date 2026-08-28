@@ -18,6 +18,8 @@ import (
 
 	restful "github.com/emicklei/go-restful/v3"
 
+	"enact/internal/extidentities"
+	"enact/internal/files"
 	"enact/internal/inference"
 	"enact/internal/logging"
 	"enact/internal/opensearch"
@@ -35,6 +37,8 @@ type Config struct {
 	Queue      queue.Config
 	Workflows  workflows.Config
 	Inference  inference.ClientConfig
+	Identities extidentities.ClientConfig
+	Files      files.Config
 	S2S        s2s.Config
 
 	// CodeTimeout bounds one code step's wall clock. The only thing standing
@@ -65,7 +69,20 @@ func Build(cfg *Config) service.Builder {
 			return nil, err
 		}
 		inferenceClient := inference.NewClient(cfg.Inference, s2sRuntime.Transport(nil, "enact-model-inference"))
-		runner := newRunner(executions, inferenceClient, cfg.CodeTimeout, cfg.StepTimeout, logger)
+		fileStore, err := files.NewFS(cfg.Files)
+		if err != nil {
+			logger.Error("failed to open the workflow file store", "err", err)
+			return nil, err
+		}
+		// Said out loud because three services must agree on it, and an
+		// unconfigured root silently becomes a temp directory the OS may prune.
+		logger.Info("workflow file store opened", "root", fileStore.Root(), "configured", cfg.Files.Root != "")
+		// Provider-backed steps act as the person who triggered the run, so the
+		// credential is fetched per step from the identities service rather than
+		// held anywhere here.
+		identitiesClient := extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities"))
+		runner := newRunner(executions, inferenceClient, fileStore, identitiesClient, nil,
+			cfg.CodeTimeout, cfg.StepTimeout, logger)
 
 		consumer := queue.NewConsumer(cfg.Queue)
 		consumer.Dropped = func(id string, deliveries int64) {

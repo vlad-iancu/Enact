@@ -29,6 +29,10 @@
           "type": "text",
           "index": false
         },
+        "input_schema": {
+          "type": "object",
+          "enabled": false
+        },
         "steps": {
           "type": "object",
           "enabled": false

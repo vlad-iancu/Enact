@@ -1,7 +1,6 @@
 package enactagentapi
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,22 +11,15 @@ import (
 	"github.com/google/uuid"
 
 	"enact/internal/agents"
+	"enact/internal/bedrock"
 	"enact/internal/identity"
 	"enact/internal/kb"
 	"enact/internal/logging"
 	"enact/internal/models"
-	"enact/internal/queue"
 	"enact/internal/rbac"
 	"enact/internal/requesthelper"
 	"enact/internal/tools"
 )
-
-// maxUploadBytes caps the size of a RAG document upload. Requests whose body
-// exceeds this are rejected before being read into memory.
-const maxUploadBytes = 50 << 20 // 50 MiB
-
-// fileFormField is the multipart form field carrying the document file.
-const fileFormField = "file"
 
 // maxOutputSchemaBytes caps an agent's output schema. It is stored on the
 // record and sent to Bedrock on every turn of every inference, so an
@@ -35,17 +27,18 @@ const fileFormField = "file"
 // this is far above anything legitimate and well below anything harmful.
 const maxOutputSchemaBytes = 64 << 10 // 64 KiB
 
-// AgentAPI exposes agent CRUD and RAG document upload. It uses the agent
-// repository for the CRUD, the KB service client to validate the knowledge
-// bases an agent references (a live call to enact-kb-api), the RAG repository
-// to cascade-delete an agent's RAG collection, and the queue producer to hand
-// RAG documents to the indexer.
+// AgentAPI exposes agent CRUD. It uses the agent repository for the CRUD and
+// the KB service client to validate the knowledge bases an agent references —
+// both the context ones it loads whole and the single retrieval one it draws
+// passages from (a live call to enact-kb-api).
+//
+// Documents are not uploaded here: a retrieval collection is a knowledge base
+// the agent points at, not something it owns, so its documents are managed
+// through the KB API like any other knowledge base's.
 type AgentAPI struct {
-	agents   *agents.Repository
-	rags     *agents.RAGRepository
-	kbs      *kb.Client
-	tools    *tools.Client
-	producer *queue.Producer
+	agents *agents.Repository
+	kbs    *kb.Client
+	tools  *tools.Client
 	// rbac records who owns what; enforcer answers whether the caller may
 	// act. Both are needed: creating a resource grants ownership of it, and
 	// every other path checks.
@@ -54,9 +47,9 @@ type AgentAPI struct {
 	logger   *logging.Logger
 }
 
-func newAgentAPI(agentRepo *agents.Repository, rags *agents.RAGRepository, kbs *kb.Client, toolsClient *tools.Client, producer *queue.Producer, rbacClient *rbac.Client, enforcer *rbac.Enforcer, logger *logging.Logger) *AgentAPI {
+func newAgentAPI(agentRepo *agents.Repository, kbs *kb.Client, toolsClient *tools.Client, rbacClient *rbac.Client, enforcer *rbac.Enforcer, logger *logging.Logger) *AgentAPI {
 	return &AgentAPI{
-		agents: agentRepo, rags: rags, kbs: kbs, tools: toolsClient, producer: producer,
+		agents: agentRepo, kbs: kbs, tools: toolsClient,
 		rbac: rbacClient, enforcer: enforcer, logger: logger,
 	}
 }
@@ -68,6 +61,9 @@ type agentRequest struct {
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
 	// Tools names registered MCP servers whose tools the agent may call.
 	Tools []string `json:"tools"`
+	// RAGKnowledgeBaseID names the one retrieval knowledge base the agent
+	// searches at inference time; empty for none.
+	RAGKnowledgeBaseID string `json:"rag_knowledge_base_id"`
 	// OutputSchema is a JSON Schema constraining the assistant's reply.
 	OutputSchema json.RawMessage `json:"output_schema"`
 }
@@ -82,6 +78,8 @@ type agentUpdateRequest struct {
 	SystemPrompt     *string   `json:"system_prompt"`
 	KnowledgeBaseIDs *[]string `json:"knowledge_base_ids"`
 	Tools            *[]string `json:"tools"`
+	// RAGKnowledgeBaseID follows the same rule; "" is the explicit detach.
+	RAGKnowledgeBaseID *string `json:"rag_knowledge_base_id"`
 	// OutputSchema follows the same rule, with one wrinkle: null means
 	// "unchanged" here as everywhere else, so it cannot also mean "remove".
 	// The empty object {} is the clear — a schema that constrains nothing is
@@ -98,44 +96,16 @@ type agentResponse struct {
 	KnowledgeBaseIDs []string        `json:"knowledge_base_ids"`
 	Tools            []string        `json:"tools"`
 	OutputSchema     json.RawMessage `json:"output_schema,omitempty"`
-	CreatedAt        time.Time       `json:"created_at"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+	// RAGKnowledgeBaseID is always present, empty when the agent has no
+	// retrieval knowledge base: the field is a UI control, and omitting it
+	// would make "none selected" indistinguishable from "not supported".
+	RAGKnowledgeBaseID string    `json:"rag_knowledge_base_id"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type listAgentsResponse struct {
 	Agents []agentResponse `json:"agents"`
-}
-
-// uploadRAGDocumentResponse acknowledges a multi-file upload: one entry per
-// file received, in upload order.
-type uploadRAGDocumentResponse struct {
-	AgentID   string           `json:"agent_id"`
-	Documents []queuedDocument `json:"documents"`
-}
-
-type queuedDocument struct {
-	DocumentID string `json:"document_id"`
-	Filename   string `json:"filename,omitempty"`
-	Status     string `json:"status"`
-}
-
-// ragDocumentResponse is one distinct document of an agent's RAG collection.
-type ragDocumentResponse struct {
-	DocumentID string `json:"document_id"`
-	Filename   string `json:"filename,omitempty"`
-	Chunks     int    `json:"chunks"`
-}
-
-type listRAGDocumentsResponse struct {
-	AgentID   string                `json:"agent_id"`
-	Documents []ragDocumentResponse `json:"documents"`
-}
-
-// deleteRAGDocumentResponse acknowledges an asynchronous document deletion.
-type deleteRAGDocumentResponse struct {
-	AgentID    string `json:"agent_id"`
-	DocumentID string `json:"document_id"`
-	Status     string `json:"status"`
 }
 
 type errorResponse struct {
@@ -191,34 +161,13 @@ func (a *AgentAPI) WebService() *restful.WebService {
 	ws.Route(ws.DELETE("/{id}").
 		To(a.delete).
 		Param(ws.PathParameter("id", "agent id")).
-		Doc("Delete an agent and its RAG collection").
+		Doc("Delete an agent").
 		Returns(http.StatusNoContent, "Deleted", nil).
 		Returns(http.StatusNotFound, "Not found", errorResponse{}))
 
-	ws.Route(ws.GET("/{id}/rag/documents").
-		To(a.listRAGDocuments).
-		Param(ws.PathParameter("id", "agent id")).
-		Doc("List the distinct documents of the agent's RAG collection (document id, filename, chunk count)").
-		Returns(http.StatusOK, "OK", listRAGDocumentsResponse{}).
-		Returns(http.StatusNotFound, "Agent not found", errorResponse{}))
-
-	ws.Route(ws.DELETE("/{id}/rag/documents/{docId}").
-		To(a.deleteRAGDocument).
-		Param(ws.PathParameter("id", "agent id")).
-		Param(ws.PathParameter("docId", "document id")).
-		Doc("Queue the removal of one RAG document's chunks; deletion is asynchronous (a nonexistent document id is still accepted)").
-		Returns(http.StatusAccepted, "Accepted for deletion", deleteRAGDocumentResponse{}).
-		Returns(http.StatusNotFound, "Agent not found", errorResponse{}))
-
-	ws.Route(ws.POST("/{id}/rag/documents").
-		To(a.uploadRAGDocument).
-		Consumes("multipart/form-data").
-		Param(ws.PathParameter("id", "agent id")).
-		Param(ws.FormParameter(fileFormField, "one or more document files to add to the agent's RAG collection (repeat the field per file)").DataType("file").Required(true).AllowMultiple(true)).
-		Doc("Upload one or more documents to the agent's RAG configuration; each is chunked and embedded asynchronously and retrieved at inference time").
-		Returns(http.StatusAccepted, "Accepted for indexing", uploadRAGDocumentResponse{}).
-		Returns(http.StatusBadRequest, "Invalid request", errorResponse{}).
-		Returns(http.StatusNotFound, "Agent not found", errorResponse{}))
+	// Retrieval documents are uploaded, listed and deleted through the KB API:
+	// a retrieval collection is a knowledge base an agent points at, not
+	// something the agent owns. See POST /v1/knowledge-bases/{id}/documents.
 
 	return ws
 }
@@ -245,17 +194,24 @@ func (a *AgentAPI) validate(req *restful.Request, logger *logging.Logger, body a
 	if msg, ok := a.validateKBs(req, logger, body.KnowledgeBaseIDs); !ok {
 		return msg, false
 	}
+	if msg, ok := a.validateRAGKB(req, logger, body.RAGKnowledgeBaseID); !ok {
+		return msg, false
+	}
 	return a.validateTools(req, logger, body.Tools)
 }
 
 // validateOutputSchema checks an agent's structured-output schema.
 //
-// It deliberately checks shape and size only, not JSON Schema semantics.
-// Bedrock is the authority on which keywords it honours and the models
-// disagree with each other about the fringes; re-implementing that judgement
-// here would mean rejecting schemas that work, which is worse than passing
-// through one that does not. What is checked is what we would otherwise only
-// discover mid-inference, far from the person who typed it.
+// It checks shape, size, and the one Bedrock rule that is otherwise
+// undiscoverable until a generation is under way — every object node must set
+// "additionalProperties": false (see bedrock.ValidateStructuredOutputSchema).
+//
+// It does NOT attempt JSON Schema semantics beyond that. Bedrock is the
+// authority on which keywords it honours and the models disagree about the
+// fringes; re-implementing that judgement would mean rejecting schemas that
+// work. The line is drawn at rules that fail EVERY time and surface far from
+// the person who typed them: those are worth catching here, where the fix is
+// obvious, rather than mid-stream in somebody else conversation.
 //
 // The empty object is accepted and normalized away by the caller: it is the
 // documented way to clear the field.
@@ -275,6 +231,11 @@ func validateOutputSchema(logger *logging.Logger, raw json.RawMessage) (string, 
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		logger.Warn("agent validation failed: output schema is not a json object", "err", err)
 		return "output_schema must be a JSON Schema object, for example {\"type\":\"object\",\"properties\":{…}}", false
+	}
+	// Bedrock's rule, checked here rather than left to fail mid-generation.
+	if err := bedrock.ValidateStructuredOutputSchema(raw); err != nil {
+		logger.Warn("agent validation failed: output schema is not usable by bedrock", "err", err)
+		return err.Error(), false
 	}
 	return "", true
 }
@@ -297,6 +258,41 @@ func normalizeOutputSchema(raw json.RawMessage) json.RawMessage {
 		return nil
 	}
 	return raw
+}
+
+// validateRAGKB checks the agent's retrieval knowledge base exists and is
+// actually of the retrieval kind.
+//
+// The kind check is the point. A context knowledge base holds whole documents
+// and no embeddings, so attaching one here would produce an agent that
+// retrieves nothing at all — silently, since an empty result set is
+// indistinguishable from "the corpus had no relevant passage". Failing at
+// save time turns that into a sentence the author can act on.
+//
+// The lookup goes through the KB service, so the caller's own permissions
+// apply: a knowledge base they cannot see is reported as not found, and they
+// cannot attach one they were never given.
+func (a *AgentAPI) validateRAGKB(req *restful.Request, logger *logging.Logger, kbID string) (string, bool) {
+	kbID = strings.TrimSpace(kbID)
+	if kbID == "" {
+		return "", true
+	}
+	record, found, err := a.kbs.Get(req.Request.Context(), kbID)
+	if err != nil {
+		logger.Error("failed to validate rag knowledge base", "kb_id", kbID, "err", err)
+		return "failed to validate the retrieval knowledge base", false
+	}
+	if !found {
+		logger.Warn("agent validation failed: rag knowledge base not found", "kb_id", kbID)
+		return fmt.Sprintf("knowledge base %q not found", kbID), false
+	}
+	if kb.NormalizeKind(record.Kind) != kb.KindRetrieval {
+		logger.Warn("agent validation failed: knowledge base is not a retrieval one",
+			"kb_id", kbID, "kind", record.Kind)
+		return fmt.Sprintf("knowledge base %q is a %s knowledge base; rag_knowledge_base_id needs one of kind %q",
+			kbID, kb.NormalizeKind(record.Kind), kb.KindRetrieval), false
+	}
+	return "", true
 }
 
 // validateTools checks that every referenced MCP server is registered,
@@ -323,11 +319,18 @@ func (a *AgentAPI) validateTools(req *restful.Request, logger *logging.Logger, s
 	return "", true
 }
 
-// validateKBs checks that every referenced knowledge base exists, asking the
-// KB service (the owner of that domain).
+// validateKBs checks that every context knowledge base exists and is actually
+// a context one, asking the KB service (the owner of that domain).
+//
+// The kind check is the mirror of validateRAGKB's, and matters for the same
+// reason. A retrieval knowledge base holds chunks, not whole documents, so
+// listing its documents returns an inventory with no text — and inference
+// would put a named but EMPTY file into the system prompt on every turn,
+// telling the model it has a document it can read and then handing it
+// nothing. Failing here names the mistake while the author is looking at it.
 func (a *AgentAPI) validateKBs(req *restful.Request, logger *logging.Logger, kbIDs []string) (string, bool) {
 	for _, kbID := range kbIDs {
-		_, found, err := a.kbs.Get(req.Request.Context(), kbID)
+		record, found, err := a.kbs.Get(req.Request.Context(), kbID)
 		if err != nil {
 			logger.Error("failed to validate knowledge base", "kb_id", kbID, "err", err)
 			return "failed to validate knowledge bases", false
@@ -335,6 +338,12 @@ func (a *AgentAPI) validateKBs(req *restful.Request, logger *logging.Logger, kbI
 		if !found {
 			logger.Warn("agent validation failed: knowledge base not found", "kb_id", kbID)
 			return fmt.Sprintf("knowledge base %q not found", kbID), false
+		}
+		if kind := kb.NormalizeKind(record.Kind); kind != kb.KindContext {
+			logger.Warn("agent validation failed: knowledge base is not a context one",
+				"kb_id", kbID, "kind", kind)
+			return fmt.Sprintf("knowledge base %q is a %s knowledge base; knowledge_base_ids takes ones of kind %q — attach a retrieval knowledge base with rag_knowledge_base_id instead",
+				kbID, kind, kb.KindContext), false
 		}
 	}
 	return "", true
@@ -366,17 +375,18 @@ func (a *AgentAPI) create(req *restful.Request, resp *restful.Response) {
 	}
 	now := time.Now().UTC()
 	agent := agents.Agent{
-		ID:               uuid.NewString(),
-		UserID:           userID,
-		OrganizationID:   organizationID,
-		Name:             strings.TrimSpace(body.Name),
-		Model:            body.Model,
-		SystemPrompt:     body.SystemPrompt,
-		KnowledgeBaseIDs: normalizeIDs(body.KnowledgeBaseIDs),
-		Tools:            normalizeIDs(body.Tools),
-		OutputSchema:     normalizeOutputSchema(body.OutputSchema),
-		CreatedAt:        now,
-		UpdatedAt:        now,
+		ID:                 uuid.NewString(),
+		UserID:             userID,
+		OrganizationID:     organizationID,
+		Name:               strings.TrimSpace(body.Name),
+		Model:              body.Model,
+		SystemPrompt:       body.SystemPrompt,
+		KnowledgeBaseIDs:   normalizeIDs(body.KnowledgeBaseIDs),
+		Tools:              normalizeIDs(body.Tools),
+		RAGKnowledgeBaseID: strings.TrimSpace(body.RAGKnowledgeBaseID),
+		OutputSchema:       normalizeOutputSchema(body.OutputSchema),
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if err := a.agents.Create(req.Request.Context(), agent); err != nil {
 		logger.Error("failed to create agent", "agent_id", agent.ID, "err", err)
@@ -505,6 +515,7 @@ func (a *AgentAPI) update(req *restful.Request, resp *restful.Response) {
 		"model_provided", body.Model != nil,
 		"system_prompt_provided", body.SystemPrompt != nil,
 		"knowledge_base_ids_provided", body.KnowledgeBaseIDs != nil,
+		"rag_knowledge_base_id_provided", body.RAGKnowledgeBaseID != nil,
 		"output_schema_provided", body.OutputSchema != nil,
 	)
 
@@ -543,6 +554,13 @@ func (a *AgentAPI) update(req *restful.Request, resp *restful.Response) {
 			return
 		}
 		existing.Tools = normalizeIDs(*body.Tools)
+	}
+	if body.RAGKnowledgeBaseID != nil {
+		if msg, valid := a.validateRAGKB(req, logger, *body.RAGKnowledgeBaseID); !valid {
+			writeError(req, resp, http.StatusBadRequest, msg)
+			return
+		}
+		existing.RAGKnowledgeBaseID = strings.TrimSpace(*body.RAGKnowledgeBaseID)
 	}
 	if body.OutputSchema != nil {
 		if msg, valid := validateOutputSchema(logger, *body.OutputSchema); !valid {
@@ -592,178 +610,13 @@ func (a *AgentAPI) delete(req *restful.Request, resp *restful.Response) {
 		writeError(req, resp, http.StatusInternalServerError, "failed to delete agent")
 		return
 	}
-	logger.Info("agent record deleted")
-	// Cascade: remove the agent's RAG collection.
-	if err := a.rags.DeleteByAgent(req.Request.Context(), id); err != nil {
-		logger.Error("failed to delete agent rag collection", "err", err)
-		writeError(req, resp, http.StatusInternalServerError, "failed to delete agent RAG documents")
-		return
-	}
+	// No cascade for the retrieval knowledge base: the agent referenced it,
+	// it did not own it. Another agent may point at the same one, and the
+	// knowledge base outlives every agent that used it — deleting it here
+	// would destroy a colleague's corpus as a side effect of deleting an
+	// assistant.
 	logger.Info("agent deleted")
 	resp.WriteHeader(http.StatusNoContent)
-}
-
-// uploadRAGDocument accepts a multipart file upload for the agent's RAG
-// configuration and enqueues it for asynchronous chunking and embedding.
-func (a *AgentAPI) uploadRAGDocument(req *restful.Request, resp *restful.Response) {
-	id := req.PathParameter("id")
-	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id)
-	logger.Info("rag upload requested")
-	// A RAG document belongs to its agent, so editing it is editing the agent.
-	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionEdit, id); err != nil {
-		logger.Warn("rag upload denied", "err", err)
-		rbac.WriteDenied(req, resp, err, "agent not found")
-		return
-	}
-
-	organizationID, ok := a.organization(req, resp, "agent not found")
-	if !ok {
-		return
-	}
-	agent, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
-	if err != nil {
-		logger.Error("failed to look up agent for rag upload", "err", err)
-		writeError(req, resp, http.StatusInternalServerError, "failed to look up agent")
-		return
-	}
-	if !found {
-		logger.Warn("agent not found for rag upload")
-		writeError(req, resp, http.StatusNotFound, "agent not found")
-		return
-	}
-	logger.Info("agent loaded")
-
-	// All files are read and validated up front, so a bad file rejects the
-	// whole request before anything is enqueued.
-	files, status, msg := requesthelper.ReadUploadedFiles(req, resp, fileFormField, maxUploadBytes)
-	if status != 0 {
-		logger.Warn("invalid rag upload", "err", msg)
-		writeError(req, resp, status, msg)
-		return
-	}
-	logger.Info("upload files read", "files", len(files))
-
-	queued := make([]queuedDocument, 0, len(files))
-	for _, f := range files {
-		docID := uuid.NewString()
-		message := queue.DocumentMessage{
-			Type:       queue.DocumentTypeAgentRAG,
-			UserID:     agent.UserID,
-			AgentID:    agent.ID,
-			DocumentID: docID,
-			Filename:   f.Filename,
-			// Content carries the raw document bytes base64-encoded; the indexer
-			// decodes them and hands the bytes to Tika for text extraction.
-			Content: base64.StdEncoding.EncodeToString(f.Content),
-		}
-		if err := a.producer.Publish(req.Request.Context(), message); err != nil {
-			logger.Error("failed to enqueue rag document for indexing",
-				"document_id", docID, "file_name", f.Filename, "queued", len(queued), "total", len(files), "err", err)
-			writeError(req, resp, http.StatusBadGateway,
-				fmt.Sprintf("failed to enqueue %q for indexing (%d of %d files were queued)", f.Filename, len(queued), len(files)))
-			return
-		}
-		logger.Info("rag document queued for indexing",
-			"document_id", docID, "file_name", f.Filename, "size_bytes", len(f.Content))
-		queued = append(queued, queuedDocument{DocumentID: docID, Filename: f.Filename, Status: "queued"})
-	}
-	logger.Info("rag upload accepted", "documents", len(queued))
-	requesthelper.WriteJSON(req, resp, http.StatusAccepted, uploadRAGDocumentResponse{
-		AgentID:   agent.ID,
-		Documents: queued,
-	})
-}
-
-// listRAGDocuments lists the distinct documents of an agent's RAG
-// collection, aggregated from its chunk index.
-func (a *AgentAPI) listRAGDocuments(req *restful.Request, resp *restful.Response) {
-	id := req.PathParameter("id")
-	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id)
-	logger.Info("rag document listing requested")
-	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionView, id); err != nil {
-		logger.Warn("rag listing denied", "err", err)
-		rbac.WriteDenied(req, resp, err, "agent not found")
-		return
-	}
-
-	organizationID, ok := a.organization(req, resp, "agent not found")
-	if !ok {
-		return
-	}
-	agent, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
-	if err != nil {
-		logger.Error("failed to look up agent for rag listing", "err", err)
-		writeError(req, resp, http.StatusInternalServerError, "failed to look up agent")
-		return
-	}
-	if !found {
-		logger.Warn("agent not found for rag listing")
-		writeError(req, resp, http.StatusNotFound, "agent not found")
-		return
-	}
-	logger.Info("agent loaded")
-
-	docs, err := a.rags.ListDocuments(req.Request.Context(), agent.UserID, agent.ID)
-	if err != nil {
-		logger.Error("failed to list rag documents", "err", err)
-		writeError(req, resp, http.StatusInternalServerError, "failed to list RAG documents")
-		return
-	}
-	out := make([]ragDocumentResponse, 0, len(docs))
-	for _, d := range docs {
-		out = append(out, ragDocumentResponse{DocumentID: d.DocumentID, Filename: d.Filename, Chunks: d.Chunks})
-	}
-	logger.Info("rag documents listed", "documents", len(out))
-	requesthelper.WriteJSON(req, resp, http.StatusOK, listRAGDocumentsResponse{AgentID: agent.ID, Documents: out})
-}
-
-// deleteRAGDocument queues the asynchronous removal of one RAG document's
-// chunks; the indexer performs the delete, scoped to this agent.
-func (a *AgentAPI) deleteRAGDocument(req *restful.Request, resp *restful.Response) {
-	id := req.PathParameter("id")
-	docID := req.PathParameter("docId")
-	logger := requesthelper.Logger(req, a.logger).WithFields("agent_id", id, "document_id", docID)
-	logger.Info("rag document deletion requested")
-	if err := a.enforcer.RequireResource(req.Request.Context(), rbac.ResourceAgent, rbac.ActionEdit, id); err != nil {
-		logger.Warn("rag deletion denied", "err", err)
-		rbac.WriteDenied(req, resp, err, "agent not found")
-		return
-	}
-
-	organizationID, ok := a.organization(req, resp, "agent not found")
-	if !ok {
-		return
-	}
-	agent, found, err := a.agents.Get(req.Request.Context(), organizationID, id)
-	if err != nil {
-		logger.Error("failed to look up agent for rag deletion", "err", err)
-		writeError(req, resp, http.StatusInternalServerError, "failed to look up agent")
-		return
-	}
-	if !found {
-		logger.Warn("agent not found for rag deletion")
-		writeError(req, resp, http.StatusNotFound, "agent not found")
-		return
-	}
-	logger.Info("agent loaded")
-
-	message := queue.DocumentMessage{
-		Type:       queue.DocumentTypeAgentRAGDelete,
-		UserID:     agent.UserID,
-		AgentID:    agent.ID,
-		DocumentID: docID,
-	}
-	if err := a.producer.Publish(req.Request.Context(), message); err != nil {
-		logger.Error("failed to enqueue rag document deletion", "err", err)
-		writeError(req, resp, http.StatusBadGateway, "failed to enqueue document deletion")
-		return
-	}
-	logger.Info("rag document deletion queued")
-	requesthelper.WriteJSON(req, resp, http.StatusAccepted, deleteRAGDocumentResponse{
-		AgentID:    agent.ID,
-		DocumentID: docID,
-		Status:     "queued",
-	})
 }
 
 func decode(req *restful.Request, resp *restful.Response, logger *logging.Logger) (agentRequest, bool) {
@@ -787,16 +640,17 @@ func normalizeIDs(ids []string) []string {
 
 func toAgentResponse(a agents.Agent) agentResponse {
 	return agentResponse{
-		ID:               a.ID,
-		UserID:           a.UserID,
-		Name:             a.Name,
-		Model:            a.Model,
-		SystemPrompt:     a.SystemPrompt,
-		KnowledgeBaseIDs: normalizeIDs(a.KnowledgeBaseIDs),
-		Tools:            normalizeIDs(a.Tools),
-		OutputSchema:     a.OutputSchema,
-		CreatedAt:        a.CreatedAt,
-		UpdatedAt:        a.UpdatedAt,
+		ID:                 a.ID,
+		UserID:             a.UserID,
+		Name:               a.Name,
+		Model:              a.Model,
+		SystemPrompt:       a.SystemPrompt,
+		KnowledgeBaseIDs:   normalizeIDs(a.KnowledgeBaseIDs),
+		Tools:              normalizeIDs(a.Tools),
+		OutputSchema:       a.OutputSchema,
+		RAGKnowledgeBaseID: a.RAGKnowledgeBaseID,
+		CreatedAt:          a.CreatedAt,
+		UpdatedAt:          a.UpdatedAt,
 	}
 }
 

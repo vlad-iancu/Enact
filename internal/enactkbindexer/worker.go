@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"enact/internal/agents"
 	"enact/internal/bedrock"
 	"enact/internal/kb"
 	"enact/internal/logging"
@@ -25,7 +24,7 @@ import (
 //     the agent's RAG chunk collection for k-NN retrieval.
 type worker struct {
 	documents    *kb.DocumentRepository
-	rags         *agents.RAGRepository
+	chunks       *kb.ChunkRepository
 	extractor    *tika.Client
 	embedder     *bedrock.Client
 	embedModel   string
@@ -53,7 +52,7 @@ func (w *worker) handle(ctx context.Context, msg queue.DocumentMessage) error {
 	switch msg.Type {
 	case queue.DocumentTypeKBContextDelete:
 		return w.deleteContextDocument(ctx, logger, msg)
-	case queue.DocumentTypeAgentRAGDelete:
+	case queue.DocumentTypeKBRetrievalDelete:
 		return w.deleteRAGDocument(ctx, logger, msg)
 	}
 
@@ -80,7 +79,7 @@ func (w *worker) handle(ctx context.Context, msg queue.DocumentMessage) error {
 	}
 
 	switch msg.Type {
-	case queue.DocumentTypeAgentRAG:
+	case queue.DocumentTypeKBRetrieval:
 		return w.indexRAGDocument(ctx, logger, msg, text)
 	case queue.DocumentTypeKBContext, "":
 		// An empty type is a message published before types existed; those
@@ -106,12 +105,12 @@ func (w *worker) deleteContextDocument(ctx context.Context, logger *logging.Logg
 	return nil
 }
 
-// deleteRAGDocument removes one document's chunks from an agent's RAG
+// deleteRAGDocument removes one document's chunks from a retrieval knowledge
 // collection. Idempotent; errors stay pending for retry.
 func (w *worker) deleteRAGDocument(ctx context.Context, logger *logging.Logger, msg queue.DocumentMessage) error {
-	logger = logger.WithFields("agent_id", msg.AgentID)
+	logger = logger.WithFields("kb_id", msg.KBID)
 	logger.Info("deleting rag document")
-	if err := w.rags.DeleteByDocument(ctx, msg.AgentID, msg.DocumentID); err != nil {
+	if err := w.chunks.DeleteByDocument(ctx, msg.KBID, msg.DocumentID); err != nil {
 		logger.Error("failed to delete rag document", "err", err)
 		return fmt.Errorf("indexer: delete rag doc %s: %w", msg.DocumentID, err)
 	}
@@ -139,12 +138,20 @@ func (w *worker) storeContextDocument(ctx context.Context, logger *logging.Logge
 	return nil
 }
 
-// indexRAGDocument chunks and embeds a document into the agent's RAG
+// indexRAGDocument chunks and embeds a document into a retrieval knowledge
 // collection.
 func (w *worker) indexRAGDocument(ctx context.Context, logger *logging.Logger, msg queue.DocumentMessage, text string) error {
-	logger = logger.WithFields("agent_id", msg.AgentID)
-	logger.Info("indexing rag document", "text_chars", len(text))
-	chunks := rag.Chunk(text, w.chunkSize, w.chunkOverlap)
+	logger = logger.WithFields("kb_id", msg.KBID)
+	// The knowledge base's own chunking, when the message carries it. The
+	// service-wide setting is only a fallback, for knowledge bases created
+	// before chunking was recorded on the record.
+	size, overlap := msg.ChunkSize, msg.ChunkOverlap
+	if size <= 0 {
+		size, overlap = w.chunkSize, w.chunkOverlap
+	}
+	logger.Info("indexing rag document", "text_chars", len(text),
+		"chunk_size", size, "chunk_overlap", overlap, "chunking_from_kb", msg.ChunkSize > 0)
+	chunks := rag.Chunk(text, size, overlap)
 	if len(chunks) == 0 {
 		logger.Warn("rag document produced no chunks; skipping")
 		return nil
@@ -156,16 +163,15 @@ func (w *worker) indexRAGDocument(ctx context.Context, logger *logging.Logger, m
 			logger.Error("failed to embed rag chunk", "chunk_index", i, "err", err)
 			return fmt.Errorf("indexer: embed chunk %d of doc %s: %w", i, msg.DocumentID, err)
 		}
-		c := agents.RAGChunk{
-			UserID:     msg.UserID,
-			AgentID:    msg.AgentID,
+		c := kb.Chunk{
+			KBID:       msg.KBID,
 			DocumentID: msg.DocumentID,
 			ChunkIndex: i,
 			Filename:   msg.Filename,
 			Text:       chunkText,
 			Embedding:  vector,
 		}
-		if err := w.rags.Index(ctx, c); err != nil {
+		if err := w.chunks.Index(ctx, c); err != nil {
 			logger.Error("failed to index rag chunk", "chunk_index", i, "err", err)
 			return fmt.Errorf("indexer: index chunk %d of doc %s: %w", i, msg.DocumentID, err)
 		}
