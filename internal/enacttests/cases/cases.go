@@ -42,6 +42,13 @@ func All() []utils.Factory {
 		NewWorkflowInheritsAgentPermission,
 		NewWorkflowSchemas,
 		NewWorkflowGoogleDocs,
+
+		// Focused crawls. The crawl LOOP is covered by internal/crawler's own
+		// tests against a local httptest site; these cover the service surface.
+		NewCrawlLifecycle,
+		NewCrawlValidation,
+		NewCrawlRunIntake,
+		NewCrawlIsolation,
 		NewMainAgentsCrudProxy,
 		NewMainKBCrudProxy,
 		NewMainConversationsLifecycle,

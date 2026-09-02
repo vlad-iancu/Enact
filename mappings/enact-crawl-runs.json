@@ -1,0 +1,66 @@
+{
+  "index_patterns": [
+    "enact-crawl-runs"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "One record per crawl run, carrying the report: the disambiguated and expanded query, and the graph of every document reached with its score and links. Everything report-shaped is stored but not indexed — a graph has hundreds of nodes of arbitrary shape, and indexing it would explode the mapping for data that is only ever read back whole."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id": {
+          "type": "keyword"
+        },
+        "crawl_id": {
+          "type": "keyword"
+        },
+        "user_id": {
+          "type": "keyword"
+        },
+        "organization_id": {
+          "type": "keyword"
+        },
+        "status": {
+          "type": "keyword"
+        },
+        "stop_reason": {
+          "type": "keyword"
+        },
+        "error": {
+          "type": "text",
+          "index": false
+        },
+        "analysis": {
+          "type": "object",
+          "enabled": false
+        },
+        "graph": {
+          "type": "object",
+          "enabled": false
+        },
+        "frontier": {
+          "type": "object",
+          "enabled": false
+        },
+        "stats": {
+          "type": "object",
+          "enabled": false
+        },
+        "queued_at": {
+          "type": "date"
+        },
+        "started_at": {
+          "type": "date"
+        },
+        "finished_at": {
+          "type": "date"
+        }
+      }
+    }
+  }
+}

@@ -33,7 +33,12 @@ const (
 	// ResourceWorkflow is a workflow definition. "use" means execute it —
 	// distinct from "view", because being able to read a chain of agent steps
 	// is not the same as being able to spend model calls running it.
-	ResourceWorkflow     = "workflow"
+	ResourceWorkflow = "workflow"
+	// ResourceCrawl is a focused-crawl definition. "use" means run it now —
+	// distinct from "view" for the same reason as a workflow, and more so:
+	// a run spends outbound requests against third-party sites under the
+	// platform's name, and embedding cost for every page it keeps.
+	ResourceCrawl        = "crawl"
 	ResourceMCPServer    = "mcp-server"
 	ResourceProvider     = "provider"
 	ResourceIdentity     = "identity"

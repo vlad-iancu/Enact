@@ -1,0 +1,7 @@
+# Access control list for enact-crawl-orchestrator.
+#
+# The orchestrator is a worker: it schedules and executes crawls, and serves
+# no API beyond the unfiltered health/home endpoints the runtime provides.
+# It is a CALLER of enact-kb-api, never a callee, so it needs no rules.
+service: enact-crawl-orchestrator
+rules: []

@@ -41,6 +41,8 @@ SERVICES=(
   enact-mcp-servers
   enact-workflows
   enact-workflow-runner
+  enact-crawls
+  enact-crawl-orchestrator
 )
 
 # Delve listen ports per service, index-aligned with SERVICES.
@@ -58,6 +60,8 @@ DEBUG_PORTS=(
   40011
   40012
   40013
+  40014
+  40015
 )
 
 # assemble_private_keys emits a YAML document with every service's private

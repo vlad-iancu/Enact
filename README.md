@@ -31,6 +31,8 @@ way (`enact:kb:…`), and independent of the agents that use them.
 | `enact-rbac`                    | Organizations, memberships, roles and the rules they grant. `GET /v1/effective` is the hot path — a user's organization and every rule they hold, which services cache and evaluate locally. Also organization requests and their approval, and `POST /v1/grants`, the ownership bookkeeping every service writes when it creates a resource. |
 | `enact-workflows`               | Workflow authoring and execution intake. A workflow-level `input_schema` is enforced at the trigger; a code step's `output_schema` is enforced by the runner (agent steps take their shape from the agent's own `output_schema`). `GET /v1/workflows/{id}/shapes` resolves both, plus the per-step context schema an editor completes `ctx` against. A workflow is an ordered list of **agent** steps (an existing agent, prompt templated with Go templates), **code** steps (JavaScript over the step context) and **google-docs** / **google-sheets** / **google-slides** steps (export to a file, create, and — for Sheets — append rows), the last three of which name an identity **provider** and act as the triggering user. `POST /v1/workflows/{id}/executions` validates `use`, writes an execution record and queues it — it never executes anything itself. |
 | `enact-workflow-runner`         | Consumes queued executions and runs their steps in order **as the triggering user**, updating the record after each. Agent steps call `enact-model-inference`, which re-checks `enact:agent:use:{id}` — so a workflow cannot run an agent its triggerer may not. Code steps run in goja with no host access and a wall-clock interrupt. No public API (health probe only). |
+| `enact-crawls`                  | Focused-crawl authoring and run intake. A crawl pairs a natural-language query with seed URLs and an **empty retrieval knowledge base** (checked at creation: a crawl becomes that KB's sole writer). `POST /v1/crawls/{id}/runs` writes a run record and queues it — it never crawls anything itself. |
+| `enact-crawl-orchestrator`      | Schedules and executes crawls. A ticker queues crawls whose `next_run_at` has passed; a consumer runs them. Each run disambiguates the query against BabelNet, expands it, then crawls best-first — scoring every page with the Mihalcea semantic measure blended with BM25 — and syncs what it keeps into the knowledge base incrementally. No public API (health probe only). |
 | `enact-tool-registry`           | MCP servers on the platform: register (`POST /v1/servers/create`, health-checked), partial update, list, and a cached tool catalogue (`GET /v1/servers/tools`, refreshed every `REFRESH_AT`). `/v1/servers/{id}/mcp` and `/{id}/sse` are spec-compliant MCP proxies to the underlying server. |
 
 Programmatic access: `POST /auth/keys` on enact-main issues a per-user API key (`enact_sk_…`, returned once, stored only as a SHA-256). Presented as `Authorization: Bearer` or `X-Enact-Api-Key` (the former is consumed and stripped by the auth filter so the S2S filter, which reads the same header, never sees it), it authenticates the agent, knowledge-base, MCP-server, conversation, model and inference routes as that user — organizations, identities/providers, admin and key management stay session-only, so a key can neither escalate nor mint another.
@@ -103,6 +105,16 @@ which is used to create the k-NN index mapping. Change both together.
 * `enact-agent-rag-chunks` — retrieval chunks with `embedding` (`knn_vector`),
   scoped by `kb_id`. The index name predates knowledge-base kinds and is kept
   so existing deployments' data stays where it is.
+* `enact-crawls` — focused-crawl definitions. `pages` (the URL-to-document
+  map that makes re-crawling incremental) is `enabled: false`: its keys are
+  arbitrary URLs and would otherwise create one mapping field per page ever
+  crawled.
+* `enact-crawl-runs` — one record per run, carrying the report: the
+  disambiguated query, its expansion, and the crawl graph. All `enabled: false`.
+* `enact-babelnet-cache` — cached sense lookups, and the per-day request
+  counter. Never expires and is **not** org-scoped: it holds public lexical
+  facts, and sharing one cache across every crawl is what makes a
+  1000-request daily allowance workable.
 * `enact-organizations`, `enact-organization-requests`, `enact-memberships`,
   `enact-roles` — the authorization model. A membership's document id is the
   user id, so belonging to exactly one organization is structural rather than
@@ -143,13 +155,25 @@ only models have friendly names (see `internal/models`).
    make infrastructure-up
    ```
 
+3. **Fetch WordNet** (only needed for focused crawls). `enact-crawl-orchestrator`
+   will not start without it — it backs Wu-Palmer similarity, lemmatisation and
+   page-side sense lookup. Downloads ~36 MB into `dist/` and is idempotent:
+
+   ```sh
+   make wordnet
+   ```
+
+   Crawls also want `BABELNET_API_KEY` in `.env` (a free key from
+   babelnet.org). Without one the orchestrator runs but every crawl fails at
+   query analysis.
+
    | Target                   | Effect |
    |--------------------------|--------|
    | `make infrastructure-up`    | Start containers; register index templates; create indices and the Redis stream/group if missing. |
    | `make infrastructure-down`  | Stop the containers (data is preserved). |
    | `make infrastructure-clean` | Delete the OpenSearch indices and the Redis stream, then recreate them empty (containers keep running). |
 
-3. **Build / vet / test:**
+4. **Build / vet / test:**
 
    ```sh
    go mod tidy      # fetches opensearch-go, go-redis, uuid, OpenTelemetry and fills go.sum
@@ -182,7 +206,7 @@ only models have friendly names (see `internal/models`).
 
    Requires Delve on your PATH: `go install github.com/go-delve/delve/cmd/dlv@latest`.
 
-4. **Run the services** (each on its own port; the queue/store defaults point
+5. **Run the services** (each on its own port; the queue/store defaults point
    at the compose services). The KB, indexer, and agent services verify their
    indices exist at startup, so run `make infrastructure-up` first:
 
@@ -678,9 +702,290 @@ All three travel through enact-main as well, on `POST /inference` and on
 they are set per call. `max_tokens` is accepted by the inference service
 directly but is not forwarded by enact-main.
 
+### Focused crawling
+
+A **crawl** fills a retrieval knowledge base from the web and keeps it current.
+It pairs a natural-language query with seed URLs and an empty retrieval KB, and
+walks outwards taking the most promising unvisited link first.
+
+Relevance is knowledge-based rather than statistical, and is computed per page:
+
+```
+score = alpha * semantic + (1 - alpha) * BM25
+```
+
+* **semantic** — Mihalcea, Corley & Strapparava (2006) text-to-text similarity
+  over Wu-Palmer concept distance, computed on **synsets**: the query is
+  POS-tagged, disambiguated, and expanded across the semantic graph with
+  decaying weights (synonym 1.0, one hop 0.6, two hops 0.3). Instance relations
+  are not followed — every named river is an instance of "river", and following
+  them turns a topical expansion into a gazetteer.
+
+The **query** is disambiguated by ant colony optimisation over the extended
+Lesk objective (Banerjee & Pedersen 2002), not by choosing each word's best
+sense in turn. Word-by-word Lesk has no way to notice that its answers
+contradict one another: measured on "opensearch indices, security, syntax and
+usage" it returned the software sense of `opensearch` beside the *semiotics*
+sense of `index` and the *collateral* sense of `security` — each defensible
+alone, together a reading of no text that exists. The colony scores a whole
+assignment at once (every pair of chosen senses, plus their agreement with the
+surrounding text), so senses that support one another win. It costs no extra
+BabelNet requests: the same glosses are fetched once and the search is
+arithmetic over them. Pages keep the greedy version — there are hundreds of
+them, and a page is its own context.
+
+The **starting pages are part of that context.** They are fetched before the
+query is read and their most characteristic lemmas join the context bag, which
+is the difference between disambiguating five words against each other and
+disambiguating them against the corpus they were written about. They are handed
+to the crawl afterwards through `Options.Prefetched`, so the site is asked for
+them once. `analysis.seed_context` in the report is the vocabulary that was
+used.
+* **BM25** — over the expanded query **and the query's own words**, normalised
+  against the query's ten strongest terms so the ceiling is one a real document
+  reaches. It covers what the sense inventory has never heard of: product
+  names, jargon, people.
+
+**Names are weighted above ordinary words** (`CRAWL_ENTITY_WEIGHT`, default 3).
+A term counts as a name on evidence from the text, never from a dictionary.
+Absence from WordNet used to stand in for "is a name" and it was a bad proxy:
+WordNet is a 2006 general-English lexicon, so it also lacks `rebalancing` and
+every typo — measured, it marked `documetation` and `databse` as products and
+gave them triple weight, and because that weight enters BM25's normalising
+ceiling a typo dragged down every page in the crawl. The signals now are:
+
+* prose's entity extractor found a name there;
+* the tagger called it a capitalised proper noun, away from the first token
+  where a capital means only that a sentence began;
+* it is **spelled** like one — a capital inside the word (`OpenSearch`,
+  `gRPC`), letters mixed with digits (`IPv6`, `S3`), or an all-capital run
+  (`ORM`, `CDC`). These are conventions the industry uses precisely because
+  they mark a name;
+* **a model says so.** Optional, off by default: a BERT token classifier
+  (`Xenova/bert-base-NER`, int8, ~109 MB) run through ONNX Runtime via
+  `onnxruntime_go`. `make ner-model` fetches it; `NER_ENABLED=true` turns it
+  on. It reads the seed pages, and what it finds joins the rules rather than
+  replacing them — it is cased and newswire-trained, with no software class, so
+  it misses names a capital letter in mid-word gives away for free. Its
+  measured advantage is **precision**: on a real crawled page it returned 7
+  names against the rules' 68, the extra 61 being page furniture that would
+  otherwise have been weighted as products in the query. This is the only
+  native dependency in the tree — the binary does not link against ONNX
+  Runtime, it opens it at runtime only when enabled, so a deployment that
+  leaves it off needs nothing installed;
+* **the seed pages say so.** None of the above fires on a lowercase query, and
+  people type `opensearch database documentation` in lowercase. The page the
+  crawl was pointed at writes it `OpenSearch`, where both extraction and
+  capitalisation work — so the query's names are read off the corpus the query
+  is about. `analysis.names` in the report is the result, and a crawl that
+  drifted onto a competitor's pages usually has a name missing from it.
+
+Extraction is on for queries **and** pages. It roughly doubles tagging (59ms to
+129ms on a 5kB page) and is invisible at crawl scale, where fetching dominates;
+it earns that because it is the only part of the pipeline that sees a name as a
+*unit*. `Amazon OpenSearch Service` is emitted as one term alongside its three
+words, on both sides, so a page about Amazon Web Services no longer matches it
+as well as a page about the thing being asked for. What extraction does **not**
+do is worth knowing: prose's model is driven by capitalisation, so on a
+lowercase query it finds nothing and the dictionary-absence rule is still what
+catches the name. The reasoning is structural rather than cosmetic: an ordinary word
+is scored twice, once through its synset and once lexically, while a name has
+no synset and is scored once, so equal lexical weight leaves it permanently
+behind. Measured on "opensearch database documentation, syntax and query
+language", a PostgreSQL article matched five of the six words and missed only
+the one that decided anything.
+
+**A page that mentions none of the query's names is halved**
+(`CRAWL_NAME_MISS_PENALTY`, 1 disables it). Weighting names is a nudge, not a
+filter — one name at weight 3 beside five ordinary words is 37% of the query,
+so a long page saturating the other 63% wins without it. Measured on
+"opensearch database documentation, syntax and query language", an article
+about building a document search tool with React and Supabase, never
+mentioning OpenSearch in its text, scored 0.706 lexically against 0.517 for a
+real OpenSearch article — on length alone. A query that names something is
+asking about that thing.
+
+The same fact corrects **coverage**. It measured the share of the query's
+*concepts* the semantic half could judge — but a word with no sense produces no
+concept, so it was absent from the fraction entirely and coverage read 1.00
+while the semantic half was blind to the subject of the query. It is now scaled
+by the share of the query's *weight* that resolved to a sense at all, which is
+what makes `wsd.Combine` hand the decision to BM25 when the answer is "almost
+none of it".
+
+The two sense inventories are deliberately different. The **query** is
+disambiguated against **BabelNet**, whose vocabulary includes named entities
+and domain jargon, and which is affordable because a query is short and its
+senses are cached forever. Every **page** is disambiguated against the local
+**WordNet**, because there are hundreds per run and the free BabelNet tier
+allows 1000 requests a day. They are comparable because a BabelNet sense
+derived from WordNet carries its original offset; a BabelNet-only sense scores
+0 semantically and is carried by BM25, with `coverage` on every score
+recording how much of the query the semantic half could judge.
+
+The score is not only a filter — it drives the search. Links are queued in a
+best-first frontier priority-ordered by their parent page's score, their anchor
+text and their URL path tokens; when the best remaining candidate falls below
+`score_threshold`, the crawl is finished. A run bounded out by pages, time or
+the daily sense allowance ends `partial` with its frontier persisted, and the
+next run resumes from it.
+
+**`DISABLE_BABELNET=true`** takes BabelNet out of the process entirely: the
+query is disambiguated against the same local WordNet the pages use, and
+nothing is ever sent to babelnet.io. Runs become free, offline and
+reproducible — useful for development, for air-gapped deployments, and while
+an allowance is spent. It is a configured mode, not a failure, so runs are
+**not** marked `degraded`; `degraded` keeps its meaning of "the rich inventory
+was expected and was unavailable".
+
+The cost is worth knowing before setting it. WordNet has no entry for
+*OpenSearch*, no database sense of *index* and no computing sense of
+*security*, so a query about named technology is read in whatever everyday
+senses exist — and no disambiguation algorithm can choose a sense it was never
+offered. Fine for topics in ordinary English, poor for jargon.
+
+When the BabelNet allowance is spent the **query** does not stop the run: it is
+re-analysed against the local WordNet, wholesale, and the run proceeds with
+`analysis.degraded` set in its report. The vocabulary is smaller — WordNet has
+no encyclopaedic senses, so a query naming a product loses it — but a crawl
+that runs on a poorer analysis beats one that does not run at all. Whatever the
+abandoned attempt did resolve stays cached for the next run.
+
+Every run produces a report: the disambiguated and expanded query, and a graph
+of every document reached with its score (semantic and lexical separately),
+its links, and the frontier nodes where the search stopped, each with a reason.
+
+#### Diagnosing a disambiguation
+
+```sh
+make wsd-diag ARGS='-query "opensearch indices, security, syntax and usage" \
+                    -seed https://dev.to/t/opensearch \
+                    -expect n06491786,n00823316'
+```
+
+`scripts/wsd-diag` reproduces the query analysis exactly — same context bag,
+same colony, same objective, calling into `wsd.Diagnose` rather than a copy —
+and adds the two things a running service cannot afford: an **exhaustive**
+search of every assignment, and a **decomposition** of the winning score into
+the sense pairs that produced it and the words they agreed on.
+
+That combination answers the only question worth asking about a wrong sense,
+which is not "is it wrong" but "which half is wrong":
+
+```
+=== SEARCH  (405 assignments)
+  colony F = 0.2203 == optimum 0.2203
+  THE SEARCH IS FINE. A wrong sense here is the objective's fault.
+
+=== WHAT THE SCORE IS MADE OF
+  security x usage = 0.0606  on: written
+  index    x syntax = 0.0476 on: relating,words
+  context 0.0000 (0%)   pairs 0.2203 (100%)
+```
+
+A colony that reaches the optimum and still returns nonsense cannot be fixed by
+tuning ants, cycles or evaporation, and the decomposition says what to fix
+instead. Every defect found this way so far has been in the objective:
+function words scoring as agreement, WordNet's example sentences leaking into
+the comparison, and long glosses winning on bulk. All three are pinned by tests
+in `internal/wsd/aco_test.go`.
+
+`-inventory babelnet` runs the same diagnosis against the metered inventory;
+the permanent cache means a query a real crawl already analysed costs nothing
+to re-examine.
+
+`-score <urls>` continues past disambiguation into scoring, which is a
+different failure: a query can be understood perfectly and still crawl badly,
+because the words the dictionary could not resolve are invisible to the
+semantic half. It prints the lexical vocabulary with each word's weight, how
+much of the query the semantic half cannot see, and — for every page given —
+the term counts behind the score, next to what the same page would have scored
+with names weighted like ordinary words:
+
+```
+   60% of the query's weight is INVISIBLE to the semantic half,
+   so coverage is scaled by 0.40 and BM25 carries that much more of the decision.
+
+   "OpenSearch isn't trying to be a better Elasticsearch anymore"
+     ** opensearch   x9    weight 3.0
+        database     x0    weight 1.0
+     semantic 0.468  lexical 0.163  TOTAL 0.224
+     with names weighted 1.0:       TOTAL 0.200  (+0.024)
+
+   "Inside PostgreSQL MATCH Queries: Syntax, Paths, and Parameters"
+     ** opensearch   x0    weight 3.0
+        database     x2    weight 1.0
+     semantic 0.511  lexical 0.121  TOTAL 0.199
+     with names weighted 1.0:       TOTAL 0.259  (-0.060)
+```
+
+That last pair is the whole argument for weighting names: unweighted, the
+PostgreSQL article outranks a page that says "OpenSearch" nine times, because
+it happens to say "database" twice and the OpenSearch page never does.
+
+Pages whose text the general-purpose extractor cannot find — a JIRA ticket, a
+wiki, anything built from `div`s with no `<main>` — are handled by per-crawl
+**extraction rules**: a URL wildcard and a set of CSS selectors, first match
+wins. They replace the TEXT only; links are still collected document-wide, so a
+selector chosen for a ticket's description does not also decide where the crawl
+may go. A rule that matches the URL but selects nothing falls back to the
+inferred text rather than emptying the page, and `selected` on each graph node
+says which pages a rule actually supplied. Selectors are compiled at creation,
+so a typo is a 400 rather than a week of silently empty documents.
+
+Re-crawling is incremental. The crawl keeps a URL-to-document map, so an
+unchanged page costs nothing, a changed one replaces its predecessor, and a
+page missing for several consecutive runs is removed.
+
+A crawl explores a **source**, not necessarily the web. `internal/source`
+defines `Reference` / `Retrieve` / `Allows` / `Parse`; `crawler.WebSource` and
+`jira.Source` implement it, and the loop cannot tell them apart — the test of
+that being that `Options` no longer mentions HTTP. JIRA references are issue
+keys, retrieval is `GET /rest/api/3/issue/{key}` with Basic `email:token`, and
+new references are the parent, subtasks and explicit issue links. Mentions in
+text are not followed. Traversal is bounded by `jira.max_depth` (default 2,
+ceiling 4) as well as the crawl's own depth: an issue graph fans out
+reciprocally, so each hop multiplies rather than adds, and that limit — not a
+rate cap — is what bounds a JIRA crawl.
+
+Crawls may carry **credentials**: per-crawl request headers, scoped to a URL
+pattern whose host must be concrete (`https://*` is refused at validation —
+a crawl follows links, and links leave sites). Values are sealed with
+AES-256-GCM under `CRAWL_ENCRYPTION_KEY`, separate from the identity service's
+key, blanked on every API response — there is no read path — and dropped on
+redirect hops that do not match the pattern. That last one is enforced in a
+`RoundTripper` rather than on the outgoing request, because `http.Client`
+copies headers onto redirect hops and strips only `Authorization`, `Cookie` and
+`WWW-Authenticate`, only across a different *domain*: a custom `X-Api-Token`
+is never stripped, and a hop between ports of one host is not a domain change.
+Measured with a plain client, both headers reached the redirect target.
+`User-Agent`, `Host` and the hop-by-hop headers cannot be set, so a crawl
+cannot disguise what it is after robots.txt was consulted for a crawler.
+
+Politeness is enforced rather than advisory, because requests go out under the
+platform's name: robots.txt (including `Crawl-delay`), a per-host delay, a
+concurrency cap, an identifying User-Agent, and same-registrable-domain
+scoping by default. Seed URLs are untrusted input fetched from the platform's
+own network position, so the fetcher refuses private, loopback and link-local
+addresses **in the dialer**, checking the resolved IP — a hostname check is
+defeated by a DNS record pointing at 127.0.0.1, and a pre-flight resolution is
+defeated by DNS rebinding.
+
 ## Notes & limitations
 
 * No auth: ownership is by `X-User-Id` header only.
+* Word sense disambiguation is still imperfect on short queries, even with the
+  colony and the seed pages behind it. A sense the dictionary does not have
+  cannot be chosen: WordNet has no database sense of `index` and no computing
+  sense of `security`, so on the WordNet fallback those words resolve to a
+  numeric scale and to collateral no matter how coherent the rest of the
+  reading is. That is what BabelNet is for, and it is the case to check when a
+  report looks wrong. The run report is the only place any of this is visible,
+  which is most of why it exists.
+* Crawls are English-only in practice: `prose`'s POS tagger is, even though
+  BabelNet is not.
+* The crawl scheduler assumes a single orchestrator replica — there is no
+  leader election, matching the platform's other background sweeps.
 * A knowledge base's `kind`, `chunk_size` and `chunk_overlap` are fixed at
   creation. Changing the kind would leave existing documents stored in a form
   nothing reads; changing the chunking would split later documents differently

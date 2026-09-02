@@ -17,6 +17,7 @@ import (
 	"enact/internal/agents"
 	"enact/internal/cloudfront"
 	"enact/internal/conversations"
+	"enact/internal/crawls"
 	"enact/internal/extidentities"
 	"enact/internal/files"
 	"enact/internal/inference"
@@ -50,6 +51,7 @@ type Config struct {
 	RBAC          rbac.ClientConfig
 	Identities    extidentities.ClientConfig
 	Workflows     workflows.ClientConfig
+	Crawls        crawls.ClientConfig
 	Files         files.Config
 	S2S           s2s.Config
 	Storage       s3.Config
@@ -216,6 +218,7 @@ func Build(cfg *Config) service.Builder {
 		api.rbac = rbac.NewClient(cfg.RBAC, s2sRuntime.Transport(nil, "enact-rbac"))
 		api.identities = extidentities.NewClient(cfg.Identities, s2sRuntime.Transport(nil, "enact-external-identities"))
 		api.workflows = workflows.NewClient(cfg.Workflows, s2sRuntime.Transport(nil, "enact-workflows"))
+		api.crawls = crawls.NewClient(cfg.Crawls, s2sRuntime.Transport(nil, "enact-crawls"))
 		fileStore, err := files.NewFS(cfg.Files)
 		if err != nil {
 			logger.Error("failed to open the workflow file store", "err", err)

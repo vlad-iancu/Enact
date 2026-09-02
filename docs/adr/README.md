@@ -26,3 +26,8 @@ See [template.md](template.md) to add one manually.
 | [0019](0019-organizations-as-the-isolation-boundary.md) | Organizations are the isolation boundary, and every resource stores which one it is in | accepted | 2026-08-16 |
 | [0020](0020-workflows-run-queued-with-a-copied-definition.md) | Workflows run on a queue, against a copy of their own definition | accepted | 2026-08-21 |
 | [0021](0021-retrieval-collections-are-knowledge-bases.md) | Retrieval collections are knowledge bases, and an agent attaches one | accepted | 2026-08-26 |
+| [0022](0022-focused-crawling-with-knowledge-based-relevance.md) | Focused crawling with knowledge-based relevance | accepted, partly superseded | 2026-08-30 |
+| [0023](0023-query-senses-are-chosen-jointly.md) | Query senses are chosen jointly, by ant colony optimisation | accepted | 2026-09-01 |
+| [0024](0024-names-are-recognised-from-evidence.md) | Names are recognised from evidence, and weighted above ordinary words | accepted | 2026-09-01 |
+| [0025](0025-crawl-sources-are-an-abstraction.md) | A crawl explores a source; the web is one implementation | accepted | 2026-09-01 |
+| [0026](0026-crawl-credentials-are-scoped-to-a-host.md) | Crawl credentials are sealed, unreadable, and scoped to a host | accepted | 2026-09-01 |

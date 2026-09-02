@@ -195,3 +195,22 @@ rules:
     allow: [anonymous, "*"]
   - route: "GET /workflows/executions/{executionId}"
     allow: [anonymous, "*"]
+  # Focused crawls: browser-facing, and script-drivable like workflows — an
+  # API key can start a run. The crawl service decides who may run what; this
+  # layer only admits the caller.
+  - route: "POST /crawls"
+    allow: [anonymous, "*"]
+  - route: "GET /crawls"
+    allow: [anonymous, "*"]
+  - route: "GET /crawls/{id}"
+    allow: [anonymous, "*"]
+  - route: "PUT /crawls/{id}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /crawls/{id}"
+    allow: [anonymous, "*"]
+  - route: "POST /crawls/{id}/runs"
+    allow: [anonymous, "*"]
+  - route: "GET /crawls/{id}/runs"
+    allow: [anonymous, "*"]
+  - route: "GET /crawls/runs/{runId}"
+    allow: [anonymous, "*"]

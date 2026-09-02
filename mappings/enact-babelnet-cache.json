@@ -1,0 +1,41 @@
+{
+  "index_patterns": [
+    "enact-babelnet-cache"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Permanent cache of BabelNet lookups, and the per-day request counter. Entries never expire — BabelNet changes only between releases — and are NOT scoped to an organization, because they hold public lexical facts rather than anybody's data. Sharing one cache across every crawl in the deployment is what makes a 1000-request daily allowance workable. Payloads are stored but not indexed: they are opaque API responses, only ever read back by key."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "key": {
+          "type": "keyword"
+        },
+        "kind": {
+          "type": "keyword"
+        },
+        "version": {
+          "type": "integer"
+        },
+        "payload": {
+          "type": "object",
+          "enabled": false
+        },
+        "cached_at": {
+          "type": "date"
+        },
+        "day": {
+          "type": "keyword"
+        },
+        "spent": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

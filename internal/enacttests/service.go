@@ -41,6 +41,7 @@ type Config struct {
 	InferenceAPIURL string `env:"INFERENCE_API_URL, default=http://localhost:8080"`
 	ModelsAPIURL    string `env:"MODELS_API_URL, default=http://localhost:8081"`
 	MainAPIURL      string `env:"MAIN_API_URL, default=http://localhost:8000"`
+	CrawlAPIURL     string `env:"CRAWL_API_URL, default=http://localhost:8013"`
 	ToolRegistryURL string `env:"TOOL_REGISTRY_API_URL, default=http://localhost:8007"`
 	IdentitiesURL   string `env:"EXTERNAL_IDENTITIES_API_URL, default=http://localhost:8008"`
 	RBACURL         string `env:"RBAC_API_URL, default=http://localhost:8009"`
@@ -77,6 +78,7 @@ func Build(cfg *Config) service.Builder {
 			InferenceAPIURL: cfg.InferenceAPIURL,
 			ModelsAPIURL:    cfg.ModelsAPIURL,
 			MainAPIURL:      cfg.MainAPIURL,
+			CrawlAPIURL:     cfg.CrawlAPIURL,
 			ToolRegistryURL: cfg.ToolRegistryURL,
 			IdentitiesURL:   cfg.IdentitiesURL,
 			RBACURL:         cfg.RBACURL,

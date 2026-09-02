@@ -36,6 +36,8 @@ var services = []string{
 	"enact-mcp-servers",
 	"enact-workflows",
 	"enact-workflow-runner",
+	"enact-crawls",
+	"enact-crawl-orchestrator",
 }
 
 func main() {

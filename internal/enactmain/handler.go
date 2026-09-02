@@ -14,6 +14,7 @@ import (
 	"enact/internal/agents"
 	"enact/internal/cloudfront"
 	"enact/internal/conversations"
+	"enact/internal/crawls"
 	"enact/internal/extidentities"
 	"enact/internal/files"
 	"enact/internal/inference"
@@ -73,6 +74,7 @@ type MainAPI struct {
 	identities *extidentities.Client
 	// workflows fronts the workflow service for authoring and manual runs.
 	workflows *workflows.Client
+	crawls    *crawls.Client
 	// files serves the bytes a workflow step produced. The runner writes
 	// them; this reads the same store, which on more than one host means the
 	// store cannot be a local directory.
@@ -315,6 +317,7 @@ func (a *MainAPI) WebServices() []*restful.WebService {
 		a.adminWebService(), a.mcpServersWebService(), a.identitiesWebService(),
 		a.organizationsWebService(), a.docsWebService(),
 		a.workflowsWebService(),
+		a.crawlsWebService(),
 	}
 }
 

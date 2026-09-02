@@ -30,7 +30,31 @@ INFRA := ./scripts/infrastructure.sh
 START := ./scripts/start-services.sh
 STOP  := ./scripts/stop-services.sh
 
-.PHONY: all build clean test vet tidy infrastructure-up infrastructure-down infrastructure-clean observability-up observability-down start stop restart s2s-keygen docker-build docker-build-local docker-push docker-deploy FORCE
+# WordNet 3.0, used by the crawl orchestrator. See the `wordnet` target.
+WORDNET_URL := https://wordnetcode.princeton.edu/3.0/WordNet-3.0.tar.gz
+WORDNET_DIR := $(DIST_DIR)/wordnet/WordNet-3.0/dict
+
+# Named-entity recognition for crawls: an int8-quantised BERT token classifier
+# plus the ONNX Runtime it needs. Both are optional — NER_ENABLED defaults to
+# false and the orchestrator runs without them — and far too large to keep in
+# the repository, so `make ner-model` fetches them the way `make wordnet` does.
+NER_DIR      := $(DIST_DIR)/models/bert-base-NER
+ORT_DIR      := $(DIST_DIR)/onnxruntime
+ORT_VERSION  := 1.29.0
+NER_REPO     := https://huggingface.co/Xenova/bert-base-NER/resolve/main
+ORT_URL      := https://github.com/microsoft/onnxruntime/releases/download/v$(ORT_VERSION)
+# The runtime is published per platform; pick by what we are building on.
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Darwin)
+ORT_PKG := onnxruntime-osx-arm64-$(ORT_VERSION)
+ORT_LIB := libonnxruntime.dylib
+else
+ORT_PKG := onnxruntime-linux-x64-$(ORT_VERSION)
+ORT_LIB := libonnxruntime.so
+endif
+
+.PHONY: all build clean test vet tidy wordnet ner-model infrastructure-up infrastructure-down infrastructure-clean observability-up observability-down start stop restart s2s-keygen wsd-diag docker-build docker-build-local docker-push docker-deploy FORCE
 
 LGTM := docker compose -f deploy/docker-compose.lgtm.yml
 
@@ -65,6 +89,26 @@ vet:
 
 tidy:
 	$(GO) mod tidy
+
+# Download the WordNet 3.0 database, which the crawl orchestrator needs for
+# the taxonomy behind Wu-Palmer similarity and for Morphy lemmatisation.
+#
+# Not vendored: it is 36 MB of third-party data that changes never, so it is
+# fetched once into dist/ (already gitignored) rather than committed or
+# embedded in every binary. WORDNET_DIR points the service at it.
+#
+# The full WordNet-3.0 tarball is used rather than the smaller WNdb-3.0,
+# because only the former carries the *.exc exception lists that irregular
+# forms (geese -> goose, ran -> run) are looked up in.
+wordnet: $(WORDNET_DIR)/data.noun
+
+$(WORDNET_DIR)/data.noun:
+	@echo "==> Downloading WordNet 3.0 to $(WORDNET_DIR)"
+	@mkdir -p $(DIST_DIR)/wordnet
+	@curl -fsSL -o $(DIST_DIR)/wordnet/WordNet-3.0.tar.gz $(WORDNET_URL)
+	@tar xzf $(DIST_DIR)/wordnet/WordNet-3.0.tar.gz -C $(DIST_DIR)/wordnet
+	@rm -f $(DIST_DIR)/wordnet/WordNet-3.0.tar.gz
+	@echo "==> WordNet ready at $(WORDNET_DIR)"
 
 # Start infra containers and create OpenSearch indices (from the mappings/
 # index templates) and the Redis stream/consumer group if they don't exist.
@@ -106,6 +150,32 @@ restart: stop build start
 # s2s/keys/ (gitignored) and the public JWKS at s2s/jwks.yaml. Idempotent.
 s2s-keygen:
 	go run ./scripts/s2s-keygen
+
+# Explain how a crawl query is disambiguated, and whether a wrong sense is the
+# ant colony's fault or the objective's. Needs WordNet; `make wordnet` fetches
+# it. Pass flags through ARGS, and see scripts/wsd-diag for what they do.
+#
+#   make wsd-diag ARGS='-query "opensearch indices and security" -seed https://dev.to/t/opensearch'
+ner-model: $(NER_DIR)/model_int8.onnx $(ORT_DIR)/$(ORT_LIB)
+
+$(NER_DIR)/model_int8.onnx:
+	@mkdir -p $(NER_DIR)
+	@echo "Fetching the NER model (~109 MB)..."
+	curl -fsSL -o $(NER_DIR)/model_int8.onnx "$(NER_REPO)/onnx/model_int8.onnx"
+	curl -fsSL -o $(NER_DIR)/vocab.txt       "$(NER_REPO)/vocab.txt"
+	curl -fsSL -o $(NER_DIR)/config.json     "$(NER_REPO)/config.json"
+
+$(ORT_DIR)/$(ORT_LIB):
+	@mkdir -p $(ORT_DIR)
+	@echo "Fetching ONNX Runtime $(ORT_VERSION) ($(ORT_PKG))..."
+	curl -fsSL -o $(DIST_DIR)/ort.tgz "$(ORT_URL)/$(ORT_PKG).tgz"
+	tar xzf $(DIST_DIR)/ort.tgz -C $(DIST_DIR)
+	cp $(DIST_DIR)/$(ORT_PKG)/lib/libonnxruntime*.dylib $(ORT_DIR)/ 2>/dev/null || \
+	  cp $(DIST_DIR)/$(ORT_PKG)/lib/libonnxruntime.so* $(ORT_DIR)/
+	rm -rf $(DIST_DIR)/ort.tgz $(DIST_DIR)/$(ORT_PKG)
+
+wsd-diag: $(WORDNET_DIR)/data.noun
+	WORDNET_DIR=$(WORDNET_DIR) go run ./scripts/wsd-diag $(ARGS)
 
 # --- Docker images ----------------------------------------------------------
 # One image per service from the single root Dockerfile (--build-arg SERVICE).

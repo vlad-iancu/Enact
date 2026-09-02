@@ -1,0 +1,24 @@
+# Access control list for enact-crawls.
+# See enact-kb-api.yaml for the schema. Unlisted routes deny everyone.
+#
+# Crawl management is a user-facing entry point reached through enact-main,
+# so its routes admit anonymous (untokened) callers; the service does its own
+# RBAC on every one of them.
+service: enact-crawls
+rules:
+  - route: "POST /v1/crawls"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/crawls"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/crawls/{id}"
+    allow: [anonymous, "*"]
+  - route: "PUT /v1/crawls/{id}"
+    allow: [anonymous, "*"]
+  - route: "DELETE /v1/crawls/{id}"
+    allow: [anonymous, "*"]
+  - route: "POST /v1/crawls/{id}/runs"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/crawls/{id}/runs"
+    allow: [anonymous, "*"]
+  - route: "GET /v1/runs/{id}"
+    allow: [anonymous, "*"]

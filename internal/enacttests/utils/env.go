@@ -14,6 +14,7 @@ type Env struct {
 	InferenceAPIURL string
 	ModelsAPIURL    string
 	MainAPIURL      string
+	CrawlAPIURL     string
 	ToolRegistryURL string
 	IdentitiesURL   string
 	RBACURL         string

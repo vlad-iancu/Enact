@@ -47,7 +47,7 @@ TIKA_URL="${TIKA_URL:-http://localhost:9998}"
 BEDROCK_EMBEDDING_DIM="${BEDROCK_EMBEDDING_DIM:-1024}"
 
 # Indices, paired with their template files in mappings/.
-INDICES=(enact-knowledge-bases enact-agents enact-kb-documents enact-agent-rag-chunks enact-users enact-conversations enact-tool-servers enact-tool-cache enact-identities enact-identity-providers enact-organizations enact-organization-requests enact-memberships enact-roles enact-workflows enact-workflow-executions)
+INDICES=(enact-knowledge-bases enact-agents enact-kb-documents enact-agent-rag-chunks enact-users enact-conversations enact-tool-servers enact-tool-cache enact-identities enact-identity-providers enact-organizations enact-organization-requests enact-memberships enact-roles enact-workflows enact-workflow-executions enact-crawls enact-crawl-runs enact-babelnet-cache)
 
 # --- helpers ---------------------------------------------------------------
 

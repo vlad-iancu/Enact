@@ -1,0 +1,92 @@
+{
+  "index_patterns": [
+    "enact-crawls"
+  ],
+  "priority": 100,
+  "_meta": {
+    "description": "Focused-crawl definitions: the query, seed URLs, target knowledge base, bounds and schedule. The scalar spine is indexed because the scheduler queries it (enabled + next_run_at); the URL-to-document page map is stored but not indexed, because its keys are arbitrary URLs and would otherwise create one mapping field per page crawled."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "id": {
+          "type": "keyword"
+        },
+        "user_id": {
+          "type": "keyword"
+        },
+        "organization_id": {
+          "type": "keyword"
+        },
+        "name": {
+          "type": "text"
+        },
+        "query": {
+          "type": "text"
+        },
+        "seed_urls": {
+          "type": "keyword"
+        },
+        "knowledge_base_id": {
+          "type": "keyword"
+        },
+        "allowed_domains": {
+          "type": "keyword"
+        },
+        "max_pages": {
+          "type": "integer"
+        },
+        "max_depth": {
+          "type": "integer"
+        },
+        "max_duration_seconds": {
+          "type": "integer"
+        },
+        "score_threshold": {
+          "type": "float"
+        },
+        "alpha": {
+          "type": "float"
+        },
+        "interval_minutes": {
+          "type": "integer"
+        },
+        "next_run_at": {
+          "type": "date"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "pages": {
+          "type": "object",
+          "enabled": false
+        },
+        "created_at": {
+          "type": "date"
+        },
+        "updated_at": {
+          "type": "date"
+        },
+        "extraction_rules": {
+          "type": "object",
+          "enabled": false
+        },
+        "credentials": {
+          "type": "object",
+          "enabled": false
+        },
+        "source": {
+          "type": "keyword"
+        },
+        "jira": {
+          "type": "object",
+          "enabled": false
+        }
+      }
+    }
+  }
+}
